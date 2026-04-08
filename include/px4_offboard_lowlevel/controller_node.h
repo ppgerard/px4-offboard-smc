@@ -81,6 +81,7 @@ private:
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_sub_;
     rclcpp::Subscription<rcl_interfaces::msg::ParameterEvent>::SharedPtr parameter_event_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr command_pose_sub_;
+    rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr command_trajectory_sub_;
     
     // Publishers
     rclcpp::Publisher<px4_msgs::msg::ActuatorMotors>::SharedPtr actuator_motors_publisher_;
@@ -126,12 +127,13 @@ private:
     Eigen::MatrixXd torques_and_thrust_to_rotor_velocities_;
     Eigen::MatrixXd throttles_to_normalized_torques_and_thrust_;
 
-    // Controller gains
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - REPLACED BY SMC PARAMETERS) =====
     Eigen::Vector3d position_gain_;
     Eigen::Vector3d velocity_gain_;
     Eigen::Vector3d attitude_gain_;
     Eigen::Vector3d ang_vel_gain_;
-
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
+    
     // Logic switches
     int control_mode_;
     bool in_sitl_mode_;
@@ -146,7 +148,7 @@ private:
 
     // CallBacks
     void commandPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr pose_msg);
-    void commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint::SharedPtr& traj_msg);
+    void commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint &msg);
     void vehicle_odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg);
     void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg);
 
@@ -213,38 +215,38 @@ private:
     }
 
     inline void eigenTrajectoryPointFromMsg(
-        const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint::SharedPtr& msg,
+        const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint& msg,
         Eigen::Vector3d& position_W, Eigen::Quaterniond& orientation_W_B,
         Eigen::Vector3d& velocity_W, Eigen::Vector3d& angular_velocity_W,
         Eigen::Vector3d& acceleration_W) {
         
-        if (msg->transforms.empty()) {
+        if (msg.transforms.empty()) {
             return;
         }
 
-        position_W << msg->transforms[0].translation.x,
-            msg->transforms[0].translation.y,
-            msg->transforms[0].translation.z;
-        Eigen::Quaterniond quaternion(msg->transforms[0].rotation.w,
-                                    msg->transforms[0].rotation.x,
-                                    msg->transforms[0].rotation.y,
-                                    msg->transforms[0].rotation.z);
+        position_W << msg.transforms[0].translation.x,
+            msg.transforms[0].translation.y,
+            msg.transforms[0].translation.z;
+        Eigen::Quaterniond quaternion(msg.transforms[0].rotation.w,
+                                    msg.transforms[0].rotation.x,
+                                    msg.transforms[0].rotation.y,
+                                    msg.transforms[0].rotation.z);
         orientation_W_B = quaternion;
-        if (msg->velocities.size() > 0) {
-            velocity_W << msg->velocities[0].linear.x,
-                msg->velocities[0].linear.y,
-                msg->velocities[0].linear.z;
-            angular_velocity_W << msg->velocities[0].angular.x,
-                msg->velocities[0].angular.y,
-                msg->velocities[0].angular.z;
+        if (msg.velocities.size() > 0) {
+            velocity_W << msg.velocities[0].linear.x,
+                msg.velocities[0].linear.y,
+                msg.velocities[0].linear.z;
+            angular_velocity_W << msg.velocities[0].angular.x,
+                msg.velocities[0].angular.y,
+                msg.velocities[0].angular.z;
         } else {
             velocity_W.setZero();
             angular_velocity_W.setZero();
         }
-        if (msg->accelerations.size() > 0) {
-            acceleration_W << msg->accelerations[0].linear.x,
-                msg->accelerations[0].linear.y,
-                msg->accelerations[0].linear.z;
+        if (msg.accelerations.size() > 0) {
+            acceleration_W << msg.accelerations[0].linear.x,
+                msg.accelerations[0].linear.y,
+                msg.accelerations[0].linear.z;
         } else {
             acceleration_W.setZero();
         }

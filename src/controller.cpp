@@ -45,9 +45,7 @@ void controller::calculateControllerOutput(
 
     controller_torque_thrust->resize(4);
 
-    // Geometric controller based on: 
-    // T. Lee, M. Leok and N. H. McClamroch, "Geometric tracking control of a quadrotor UAV on SE(3),
-    // " 49th IEEE Conference on Decision and Control (CDC), Atlanta, GA, USA, 2010.
+    // SMC Controller Implementation
 
 
     // Trajectory tracking.
@@ -60,10 +58,18 @@ void controller::calculateControllerOutput(
     
     const Eigen::Vector3d e_v = 
                 velocity_W_ - r_velocity_W_;
+        
+    const Eigen::Vector3d s = 
+                e_v + Lambda.cwiseProduct(e_p);
     
-    const Eigen::Vector3d I_a_d = -position_gain_.cwiseProduct(e_p)
-                                -velocity_gain_.cwiseProduct(e_v)
-                                +_uav_mass * _gravity * Eigen::Vector3d::UnitZ() + _uav_mass * r_acceleration_W_;
+    Eigen::Vector3d sat_vec = s.cwiseQuotient(phi);
+    sat_vec = sat_vec.cwiseMax(-1.0).cwiseMin(1.0);
+
+    const Eigen::Vector3d I_a_d = 
+                + _uav_mass * _gravity * Eigen::Vector3d::UnitZ() 
+                + _uav_mass * r_acceleration_W_
+                - K_s.cwiseProduct(sat_vec);
+
     thrust = I_a_d.dot(R_B_W_.col(2));
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
@@ -90,9 +96,21 @@ void controller::calculateControllerOutput(
     const Eigen::Vector3d omega_ref =
             r_yaw_rate * Eigen::Vector3d::UnitZ();
     const Eigen::Vector3d e_omega = angular_velocity_B_ - R_B_W_.transpose() * R_d_w * omega_ref;
+
+    Eigen::Vector3d s_R = e_omega + Lambda_R.cwiseProduct(e_R);
+    Eigen::Vector3d sat_vec_R = s_R.cwiseQuotient(phi_R);
+    sat_vec_R = sat_vec_R.cwiseMax(-1.0).cwiseMin(1.0);
+    
+    // SMC Controller
+    // tau =
+    //     -K_s_R.cwiseProduct(sat_vec_R)
+    //     + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
+    
+    // Lee's Geometric Controller
     tau = -attitude_gain_.cwiseProduct(e_R)
            - angular_rate_gain_.cwiseProduct(e_omega)
            + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
+
 
     // Output the wrench
     *controller_torque_thrust << tau, thrust;

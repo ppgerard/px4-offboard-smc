@@ -44,6 +44,7 @@ ament_target_dependencies(offboard_controller_node
 ament_target_dependencies(circle_trajectory_node
   rclcpp
   geometry_msgs
+  trajectory_msgs
 )
 
 install(TARGETS offboard_controller_node
@@ -54,6 +55,7 @@ install(TARGETS circle_trajectory_node
 
 install(PROGRAMS
   scripts/identification.py
+  scripts/visualizer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -65,6 +67,11 @@ install(DIRECTORY
 
 install(DIRECTORY
   config
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(DIRECTORY
+  resource
   DESTINATION share/${PROJECT_NAME}
 )
 

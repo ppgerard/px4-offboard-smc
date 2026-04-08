@@ -70,22 +70,6 @@ public:
         r_yaw_rate = 0.0;
     }
 
-    void setKPositionGain(const Eigen::Vector3d &PositionGain){
-        position_gain_ = PositionGain;
-    }
-
-    void setKVelocityGain(const Eigen::Vector3d &VelocityGain){
-        velocity_gain_ = VelocityGain;
-    }
-
-    void setKAttitudeGain(const Eigen::Vector3d &AttitudeGain){
-        attitude_gain_ = AttitudeGain;
-    }
-
-    void setKAngularRateGain(const Eigen::Vector3d AngularRateGain){
-        angular_rate_gain_ = AngularRateGain;
-    }
-
     void setUavMass(double uavMass) {
         _uav_mass = uavMass;
     }
@@ -98,6 +82,48 @@ public:
         _gravity = gravity;
     }
 
+    // SMC Controller Parameter Setters
+    void setLambda(const Eigen::Vector3d &lambda) {
+        Lambda = lambda;
+    }
+
+    void setKs(const Eigen::Vector3d &ks) {
+        K_s = ks;
+    }
+
+    void setPhi(const Eigen::Vector3d &phi_val) {
+        phi = phi_val;
+    }
+
+    void setLambdaR(const Eigen::Vector3d &lambda_r) {
+        Lambda_R = lambda_r;
+    }
+
+    void setKsR(const Eigen::Vector3d &ks_r) {
+        K_s_R = ks_r;
+    }
+
+    void setPhiR(const Eigen::Vector3d &phi_r) {
+        phi_R = phi_r;
+    }
+
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
+    void setKPositionGain(const Eigen::Vector3d &PositionGain){
+        position_gain_ = PositionGain;
+    }
+    
+    void setKVelocityGain(const Eigen::Vector3d &VelocityGain){
+        velocity_gain_ = VelocityGain;
+    }
+    
+    void setKAttitudeGain(const Eigen::Vector3d &AttitudeGain){
+        attitude_gain_ = AttitudeGain;
+    }
+    
+    void setKAngularRateGain(const Eigen::Vector3d &AngularRateGain){
+        angular_rate_gain_ = AngularRateGain;
+    }
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 private:
     // UAV Parameter
@@ -105,11 +131,13 @@ private:
     Eigen::Vector3d _inertia_matrix;
     double _gravity;
     
-    // Lee Controller Gains
-    Eigen::Vector3d position_gain_;
-    Eigen::Vector3d velocity_gain_;
-    Eigen::Vector3d attitude_gain_;
-    Eigen::Vector3d angular_rate_gain_;
+    // SMC Controller Gains
+    Eigen::Vector3d Lambda;
+    Eigen::Vector3d K_s;    
+    Eigen::Vector3d phi;        
+    Eigen::Vector3d Lambda_R;
+    Eigen::Vector3d K_s_R;  
+    Eigen::Vector3d phi_R;  
     
     // Current states
     Eigen::Vector3d position_W_;
@@ -123,6 +151,13 @@ private:
     Eigen::Matrix3d r_R_B_W_;
     double r_yaw;
     double r_yaw_rate;
+
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
+    Eigen::Vector3d position_gain_;
+    Eigen::Vector3d velocity_gain_;
+    Eigen::Vector3d attitude_gain_;
+    Eigen::Vector3d angular_rate_gain_;
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
 };
 
 #endif //CONTROLLER_CONTROLLER_H

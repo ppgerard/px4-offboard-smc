@@ -53,6 +53,8 @@ ControllerNode::ControllerNode()
             (status_topic_, qos, std::bind(&ControllerNode::vehicleStatusCallback, this, _1));
         command_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>
             (command_pose_topic_, 10, std::bind(&ControllerNode::commandPoseCallback, this, _1));
+        command_trajectory_sub_ = this->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>
+            (command_traj_topic_, 10, std::bind(&ControllerNode::commandTrajectoryCallback, this, _1));
 
         // Publishers
         attitude_setpoint_publisher_ = this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>
@@ -168,7 +170,65 @@ void ControllerNode::loadParams() {
     in_sitl_mode_ = this->get_parameter("sitl_mode").as_bool();
     control_mode_ = this->get_parameter("control_mode").as_int();
     
-    // Controller gains
+    // ===== SMC CONTROLLER GAINS =====
+    // Translational sliding mode control parameters
+    this->declare_parameter("control_gains.Lambda_x", 0.0);
+    this->declare_parameter("control_gains.Lambda_y", 0.0);
+    this->declare_parameter("control_gains.Lambda_z", 0.0);
+    this->declare_parameter("control_gains.K_s_x", 0.0);
+    this->declare_parameter("control_gains.K_s_y", 0.0);
+    this->declare_parameter("control_gains.K_s_z", 0.0);
+    this->declare_parameter("control_gains.Phi_x", 0.0);
+    this->declare_parameter("control_gains.Phi_y", 0.0);
+    this->declare_parameter("control_gains.Phi_z", 0.0);
+    // Rotational sliding mode control parameters
+    this->declare_parameter("control_gains.Lambda_R_x", 0.0);
+    this->declare_parameter("control_gains.Lambda_R_y", 0.0);
+    this->declare_parameter("control_gains.Lambda_R_z", 0.0);
+    this->declare_parameter("control_gains.K_s_R_x", 0.0);
+    this->declare_parameter("control_gains.K_s_R_y", 0.0);
+    this->declare_parameter("control_gains.K_s_R_z", 0.0);
+    this->declare_parameter("control_gains.Phi_R_x", 0.0);
+    this->declare_parameter("control_gains.Phi_R_y", 0.0);
+    this->declare_parameter("control_gains.Phi_R_z", 0.0);
+    
+    Eigen::Vector3d lambda, k_s, phi, lambda_r, k_s_r, phi_r;
+    
+    lambda << this->get_parameter("control_gains.Lambda_x").as_double(),
+              this->get_parameter("control_gains.Lambda_y").as_double(),
+              this->get_parameter("control_gains.Lambda_z").as_double();
+
+    k_s << this->get_parameter("control_gains.K_s_x").as_double(),
+           this->get_parameter("control_gains.K_s_y").as_double(),
+           this->get_parameter("control_gains.K_s_z").as_double();
+
+    phi << this->get_parameter("control_gains.Phi_x").as_double(),
+           this->get_parameter("control_gains.Phi_y").as_double(),
+           this->get_parameter("control_gains.Phi_z").as_double();
+
+    lambda_r << this->get_parameter("control_gains.Lambda_R_x").as_double(),
+                this->get_parameter("control_gains.Lambda_R_y").as_double(),
+                this->get_parameter("control_gains.Lambda_R_z").as_double();
+
+    k_s_r << this->get_parameter("control_gains.K_s_R_x").as_double(),
+             this->get_parameter("control_gains.K_s_R_y").as_double(),
+             this->get_parameter("control_gains.K_s_R_z").as_double();
+
+    phi_r << this->get_parameter("control_gains.Phi_R_x").as_double(),
+             this->get_parameter("control_gains.Phi_R_y").as_double(),
+             this->get_parameter("control_gains.Phi_R_z").as_double();
+    
+    // Debug: Print loaded SMC parameters
+    RCLCPP_INFO(this->get_logger(), "===== SMC PARAMETERS LOADED =====");
+    RCLCPP_INFO(this->get_logger(), "Lambda: [%.2f, %.2f, %.2f]", lambda(0), lambda(1), lambda(2));
+    RCLCPP_INFO(this->get_logger(), "K_s:    [%.2f, %.2f, %.2f]", k_s(0), k_s(1), k_s(2));
+    RCLCPP_INFO(this->get_logger(), "Phi:    [%.2f, %.2f, %.2f]", phi(0), phi(1), phi(2));
+    RCLCPP_INFO(this->get_logger(), "Lambda_R: [%.2f, %.2f, %.2f]", lambda_r(0), lambda_r(1), lambda_r(2));
+    RCLCPP_INFO(this->get_logger(), "K_s_R:    [%.2f, %.2f, %.2f]", k_s_r(0), k_s_r(1), k_s_r(2));
+    RCLCPP_INFO(this->get_logger(), "Phi_R:    [%.2f, %.2f, %.2f]", phi_r(0), phi_r(1), phi_r(2));
+    RCLCPP_INFO(this->get_logger(), "==================================");
+    
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
     this->declare_parameter("control_gains.K_p_x", 0.0);
     this->declare_parameter("control_gains.K_p_y", 0.0);
     this->declare_parameter("control_gains.K_p_z", 0.0);
@@ -185,28 +245,37 @@ void ControllerNode::loadParams() {
     position_gain_ << this->get_parameter("control_gains.K_p_x").as_double(),
                       this->get_parameter("control_gains.K_p_y").as_double(),
                       this->get_parameter("control_gains.K_p_z").as_double();
-
+    
     velocity_gain_ << this->get_parameter("control_gains.K_v_x").as_double(),
                       this->get_parameter("control_gains.K_v_y").as_double(),
                       this->get_parameter("control_gains.K_v_z").as_double();
-
+    
     attitude_gain_ << this->get_parameter("control_gains.K_R_x").as_double(),
                       this->get_parameter("control_gains.K_R_y").as_double(),
                       this->get_parameter("control_gains.K_R_z").as_double();
-
+    
     ang_vel_gain_ << this->get_parameter("control_gains.K_w_x").as_double(),
                      this->get_parameter("control_gains.K_w_y").as_double(),
                      this->get_parameter("control_gains.K_w_z").as_double();
-
-    // pass the UAV Parameters and controller gains to the controller
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
+    // pass UAV parameters and SMC controller gains to the controller
     controller_.setUavMass(_uav_mass);
     controller_.setInertiaMatrix(_inertia_matrix);
     controller_.setGravity(_gravity);
+    controller_.setLambda(lambda);
+    controller_.setKs(k_s);
+    controller_.setPhi(phi);
+    controller_.setLambdaR(lambda_r);
+    controller_.setKsR(k_s_r);
+    controller_.setPhiR(phi_r);
+    
+    // ===== OLD LEE CONTROLLER GAINS SETTERS (COMMENTED OUT - NO LONGER USED) =====
     controller_.setKPositionGain(position_gain_);
     controller_.setKVelocityGain(velocity_gain_);
     controller_.setKAttitudeGain(attitude_gain_);
     controller_.setKAngularRateGain(ang_vel_gain_);
 }
+    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
 
 void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices() {
     const double kDegToRad = M_PI / 180.0;
@@ -317,6 +386,12 @@ void ControllerNode::px4InverseSITL
     }
     // Control allocation: Wrench to Rotational velocities (omega)
     omega = torques_and_thrust_to_rotor_velocities_ * (*wrench);
+    // Safety: Clamp negative rotor velocities to zero (prevents NaN from sqrt of negative)
+    for (int i = 0; i < omega.size(); i++){
+        if (omega[i] <= 0){
+            omega[i] = 0.0;
+        }
+    }
     omega = omega.cwiseSqrt();
     *throttles = (omega - (_SIM_GZ_EC_MIN * ones_temp));
     *throttles /= (_SIM_GZ_EC_MAX - _SIM_GZ_EC_MIN);
@@ -396,14 +471,14 @@ void ControllerNode::commandPoseCallback(const geometry_msgs::msg::PoseStamped::
     controller_.setTrajectoryPoint(position, orientation);          // Send the command to controller_ obj
 }
 
-void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint::SharedPtr& traj_msg) {                   // When a command is received
+void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint &msg) {                   // When a command is received
     // initialize vectors
     Eigen::Vector3d position;
     Eigen::Vector3d velocity; 
     Eigen::Quaterniond orientation;
     Eigen::Vector3d angular_velocity;
     Eigen::Vector3d acceleration;
-    eigenTrajectoryPointFromMsg( traj_msg, position, orientation, velocity, angular_velocity, acceleration);
+    eigenTrajectoryPointFromMsg(msg, position, orientation, velocity, angular_velocity, acceleration);
     controller_.setTrajectoryPoint(position, velocity, acceleration, orientation, angular_velocity);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
 }
@@ -425,18 +500,18 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
 
 void ControllerNode::vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg){
     current_status_ = *status_msg;
-    if (current_status_.arming_state ==2){
-        RCLCPP_INFO_ONCE(get_logger(),"ARMED - vehicle_status_msg.");
-    }
-    else {
-        RCLCPP_INFO(get_logger(),"NOT ARMED - vehicle_status_msg.");
-    }
-    if (current_status_.nav_state == 14){
-        RCLCPP_INFO_ONCE(get_logger(),"OFFBOARD - vehicle_status_msg.");
-    }
-    else {
-        RCLCPP_INFO(get_logger(),"NOT OFFBOARD - vehicle_status_msg.");
-    }
+    // if (current_status_.arming_state ==2){
+    //     RCLCPP_INFO_ONCE(get_logger(),"ARMED - vehicle_status_msg.");
+    // }
+    // else {
+    //     RCLCPP_INFO(get_logger(),"NOT ARMED - vehicle_status_msg.");
+    // }
+    // if (current_status_.nav_state == 14){
+    //     RCLCPP_INFO_ONCE(get_logger(),"OFFBOARD - vehicle_status_msg.");
+    // }
+    // else {
+    //     RCLCPP_INFO(get_logger(),"NOT OFFBOARD - vehicle_status_msg.");
+    // }
 }
 
 void ControllerNode::publishActuatorMotorsMsg(const Eigen::VectorXd& throttles) {
@@ -463,6 +538,7 @@ void ControllerNode::publishThrustTorqueMsg(const Eigen::Vector4d& controller_ou
     torque_sp_msg.timestamp_sample = thrust_sp_msg.timestamp_sample ;
     thrust_sp_msg.timestamp = thrust_sp_msg.timestamp_sample ;
     torque_sp_msg.timestamp = thrust_sp_msg.timestamp_sample ;
+    
     // Fill thrust setpoint msg
     thrust_sp_msg.xyz[0] = 0.0;
     thrust_sp_msg.xyz[1] = 0.0;
@@ -472,9 +548,25 @@ void ControllerNode::publishThrustTorqueMsg(const Eigen::Vector4d& controller_ou
     else {
         thrust_sp_msg.xyz[2] = -0.1;
     }
+    
     // Rotate torque setpoints from FLU to FRD and fill the msg
     Eigen::Vector3d rotated_torque_sp;
     rotated_torque_sp = rotateVectorFromToFRD_FLU(Eigen::Vector3d(controller_output[0], controller_output[1], controller_output[2]));
+    
+    // Safety: Check for NaN/Inf values
+    if (std::isnan(rotated_torque_sp[0]) || std::isinf(rotated_torque_sp[0])) {
+        RCLCPP_WARN(this->get_logger(), "NaN/Inf in torque X: %.6f", rotated_torque_sp[0]);
+        rotated_torque_sp[0] = 0.0;
+    }
+    if (std::isnan(rotated_torque_sp[1]) || std::isinf(rotated_torque_sp[1])) {
+        RCLCPP_WARN(this->get_logger(), "NaN/Inf in torque Y: %.6f", rotated_torque_sp[1]);
+        rotated_torque_sp[1] = 0.0;
+    }
+    if (std::isnan(rotated_torque_sp[2]) || std::isinf(rotated_torque_sp[2])) {
+        RCLCPP_WARN(this->get_logger(), "NaN/Inf in torque Z: %.6f", rotated_torque_sp[2]);
+        rotated_torque_sp[2] = 0.0;
+    }
+    
     torque_sp_msg.xyz[0] = rotated_torque_sp[0];
     torque_sp_msg.xyz[1] = rotated_torque_sp[1];
     torque_sp_msg.xyz[2] = rotated_torque_sp[2];
@@ -511,6 +603,15 @@ void ControllerNode::updateControllerOutput() {
     Eigen::VectorXd controller_output;
     Eigen::Quaterniond desired_quaternion;
     controller_.calculateControllerOutput(&controller_output, &desired_quaternion);
+    
+    // Debug: Log the controller output (only once per second to avoid spam)
+    static int iteration_count = 0;
+    if (iteration_count++ % 100 == 0) {
+        RCLCPP_INFO(this->get_logger(), "Controller output [tau_x, tau_y, tau_z, thrust]: [%.3f, %.3f, %.3f, %.3f]",
+                    controller_output(0), controller_output(1), controller_output(2), controller_output(3));
+        RCLCPP_INFO(this->get_logger(), "Vehicle nav_state: %d (Offboard=%d)", 
+                    current_status_.nav_state, px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+    }
     
     // Normalize the controller output
     Eigen::Vector4d normalized_torque_thrust;

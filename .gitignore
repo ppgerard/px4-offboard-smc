@@ -1,2 +1,50 @@
-.vscode/
+# ======================
+# ROS 2 / colcon
+# ======================
 build/
+install/
+log/
+
+# ======================
+# CMake
+# ======================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# ======================
+# Python
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+
+# ======================
+# VSCode / éditeurs
+# ======================
+.vscode/
+.history/
+
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# Logs / data
+# ======================
+*.log
+
+# ======================
+# Backup / temporaires
+# ======================
+*~
+*.bak
+*.swp
+
+# ======================
+# Spécifique au  projet
+# ======================
+src/controller_backup.cpp
