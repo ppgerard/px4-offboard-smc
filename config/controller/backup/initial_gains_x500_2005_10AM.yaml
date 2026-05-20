@@ -22,11 +22,11 @@
         # K_s_R: Rotational sliding mode gain
         K_s_R_x: 0.2
         K_s_R_y: 0.2
-        K_s_R_z: 0.0
+        K_s_R_z: 0.2
         # Phi_R: Saturation layer for rotational control
         Phi_R_x: 0.3
         Phi_R_y: 0.3
-        Phi_R_z: 0.8
+        Phi_R_z: 0.3
         # ===== OLD LEE CONTROLLER GAINS (NOW USED FOR TORQUE CALCULATION) =====
         K_p_x: 7.00
         K_p_y: 7.00

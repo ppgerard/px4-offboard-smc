@@ -59,6 +59,15 @@ void controller::calculateControllerOutput(
 
     Eigen::Vector3d omega_ref = Eigen::Vector3d::Zero();
 
+    // For tuning only :
+    // r_position_W_(0) = position_W_(0);
+    // r_position_W_(1) = position_W_(1);
+    // r_velocity_W_(0) = velocity_W_(0);
+    // r_velocity_W_(1) = velocity_W_(1);
+    // r_acceleration_W_ = Eigen::Vector3d::Zero();
+    // r_yaw = 0.5;
+    // r_acceleration_W_ << 0, 0, 0;
+
 
     // Compute translational tracking errors.
     const Eigen::Vector3d e_p =
@@ -85,6 +94,7 @@ void controller::calculateControllerOutput(
                 - K_s.cwiseProduct(sat_vec);
 
     thrust = I_a_d.dot(R_B_W_.col(2));
+    // thrust = I_a_d.norm();
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
     B_z_d.normalize();

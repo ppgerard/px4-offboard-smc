@@ -59,7 +59,7 @@ private:
     double z_step = 3.0;  // m
     double pitch_step = 0.0; // rad
     double roll_step = 0.0;  // rad
-    double yaw_step = 0.0;   // rad
+    double yaw_step = 1.0;   // rad
 
     // Convert Euler angles to quaternion
     tf2::Quaternion q;
@@ -71,7 +71,7 @@ private:
 
     // Resize vectors for single DOF
     traj_point.transforms.resize(1);
-    // traj_point.velocities.resize(1);
+    traj_point.velocities.resize(1);
     // traj_point.accelerations.resize(1);
 
     // Position
@@ -86,9 +86,9 @@ private:
     traj_point.transforms[0].rotation.w = q.w();
 
     // Velocity
-    // traj_point.velocities[0].linear.x = 0.0;
-    // traj_point.velocities[0].linear.y = 0.0;
-    // traj_point.velocities[0].linear.z = 0.0;
+    traj_point.velocities[0].linear.x = 0.0;
+    traj_point.velocities[0].linear.y = 0.0;
+    traj_point.velocities[0].linear.z = 0.0;
     // traj_point.velocities[0].angular.x = 0.0;
     // traj_point.velocities[0].angular.y = 0.0;
     // traj_point.velocities[0].angular.z = 0.0;

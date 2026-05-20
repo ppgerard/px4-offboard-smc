@@ -57,7 +57,7 @@ private:
     // Trajectory parameters
     double radius = 2.0;        // meters
     double altitude = 2.0;      // meters
-    double angle_rate = 1.0;    // rad/s (angular velocity)
+    double angle_rate = 0.3;    // rad/s (angular velocity)
     double dt = 0.01;           // seconds (100 Hz publishing rate)
     
     // Derived quantities (dependent on above)

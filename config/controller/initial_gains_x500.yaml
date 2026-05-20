@@ -3,30 +3,30 @@
     control_gains:
         # SMC Translational Control Parameters
         # Lambda: Natural frequency parameters for position/velocity dynamics
-        Lambda_x: 2.5
-        Lambda_y: 2.5
-        Lambda_z: 4.0
+        Lambda_x: 1.5
+        Lambda_y: 1.5
+        Lambda_z: 3.0
         # K_s: Sliding mode gain - increase for faster convergence/disturbance rejection
-        K_s_x: 3.5
-        K_s_y: 3.5
-        K_s_z: 4.0
+        K_s_x: 2.5
+        K_s_y: 2.5
+        K_s_z: 3.5
         # Phi: Saturation layer thickness - prevents chattering
-        Phi_x: 0.5
-        Phi_y: 0.5
-        Phi_z: 0.2
+        Phi_x: 0.25
+        Phi_y: 0.25
+        Phi_z: 0.1
         # SMC Rotational Control Parameters
         # Lambda_R: Natural frequency for attitude dynamics
-        Lambda_R_x: 1.0
-        Lambda_R_y: 1.0
-        Lambda_R_z: 0.8
+        Lambda_R_x: 5.0
+        Lambda_R_y: 5.0
+        Lambda_R_z: 2.0
         # K_s_R: Rotational sliding mode gain
-        K_s_R_x: 0.2
-        K_s_R_y: 0.2
-        K_s_R_z: 0.0
+        K_s_R_x: 0.15
+        K_s_R_y: 0.15
+        K_s_R_z: 0.2
         # Phi_R: Saturation layer for rotational control
-        Phi_R_x: 0.3
-        Phi_R_y: 0.3
-        Phi_R_z: 0.8
+        Phi_R_x: 0.35
+        Phi_R_y: 0.35
+        Phi_R_z: 0.3
         # ===== OLD LEE CONTROLLER GAINS (NOW USED FOR TORQUE CALCULATION) =====
         K_p_x: 7.00
         K_p_y: 7.00
