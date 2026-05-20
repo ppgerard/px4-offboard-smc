@@ -15,6 +15,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(tf2 REQUIRED)
 
 # Specify additional locations of header files
 include_directories(
@@ -29,6 +30,10 @@ add_executable(offboard_controller_node
 
 add_executable(circle_trajectory_node 
   src/TrajectoryPublishers/circle_trajectory_node.cpp
+)
+
+add_executable(steps_publisher_node 
+  src/TrajectoryPublishers/tuning_node.cpp
 )
 
 # Add dependencies for the executables
@@ -47,10 +52,19 @@ ament_target_dependencies(circle_trajectory_node
   trajectory_msgs
 )
 
+ament_target_dependencies(steps_publisher_node
+  rclcpp
+  trajectory_msgs
+  tf2
+)
+
 install(TARGETS offboard_controller_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS circle_trajectory_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS steps_publisher_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS

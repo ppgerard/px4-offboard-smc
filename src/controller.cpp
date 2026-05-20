@@ -33,6 +33,7 @@
  ****************************************************************************/
 
 #include "../include/px4_offboard_lowlevel/controller.h"
+#include "rclcpp/rclcpp.hpp"
 
 
 controller::controller(){
@@ -45,12 +46,19 @@ void controller::calculateControllerOutput(
 
     controller_torque_thrust->resize(4);
 
-    // SMC Controller Implementation
-
+    const double dt = 0.01;
 
     // Trajectory tracking.
     double thrust;
     Eigen::Matrix3d R_d_w;
+
+    static Eigen::Matrix3d R_d_prev =
+    Eigen::Matrix3d::Identity();
+
+    static bool first_iteration = true;
+
+    Eigen::Vector3d omega_ref = Eigen::Vector3d::Zero();
+
 
     // Compute translational tracking errors.
     const Eigen::Vector3d e_p =
@@ -65,9 +73,15 @@ void controller::calculateControllerOutput(
     Eigen::Vector3d sat_vec = s.cwiseQuotient(phi);
     sat_vec = sat_vec.cwiseMax(-1.0).cwiseMin(1.0);
 
+//     const Eigen::Vector3d I_a_d = 
+//                 -position_gain_.cwiseProduct(e_p)
+//                 -velocity_gain_.cwiseProduct(e_v)
+//                 +_uav_mass * _gravity * Eigen::Vector3d::UnitZ() + _uav_mass * r_acceleration_W_;
+
     const Eigen::Vector3d I_a_d = 
                 + _uav_mass * _gravity * Eigen::Vector3d::UnitZ() 
                 + _uav_mass * r_acceleration_W_
+                - _uav_mass * Lambda.cwiseProduct(e_v)
                 - K_s.cwiseProduct(sat_vec);
 
     thrust = I_a_d.dot(R_B_W_.col(2));
@@ -82,6 +96,30 @@ void controller::calculateControllerOutput(
     R_d_w.col(0) = B_y_d.cross(B_z_d);
     R_d_w.col(1) = B_y_d;
     R_d_w.col(2) = B_z_d;
+
+    if (!first_iteration)
+    {
+        Eigen::Matrix3d R_d_dot =
+            (R_d_w - R_d_prev) / dt;
+
+        Eigen::Matrix3d omega_hat =
+            0.5 * (
+                R_d_w.transpose() * R_d_dot
+                - R_d_dot.transpose() * R_d_w
+            );
+
+        omega_ref <<
+            omega_hat(2,1),
+            omega_hat(0,2),
+            omega_hat(1,0);
+    }
+    else
+    {
+        first_iteration = false;
+    }
+
+    R_d_prev = R_d_w;
+
     
     Eigen::Quaterniond q_temp(R_d_w);
     *desired_quaternion = q_temp;
@@ -93,23 +131,37 @@ void controller::calculateControllerOutput(
             0.5 * (R_d_w.transpose() * R_B_W_ - R_B_W_.transpose() * R_d_w)   ;
     Eigen::Vector3d e_R;
     e_R << e_R_matrix(2, 1), e_R_matrix(0, 2), e_R_matrix(1, 0);
-    const Eigen::Vector3d omega_ref =
-            r_yaw_rate * Eigen::Vector3d::UnitZ();
+    // const Eigen::Vector3d omega_ref =
+    //         r_yaw_rate * Eigen::Vector3d::UnitZ();
     const Eigen::Vector3d e_omega = angular_velocity_B_ - R_B_W_.transpose() * R_d_w * omega_ref;
+    
+    Eigen::Matrix3d Q = R_B_W_.transpose() * R_d_w;
+    Eigen::Matrix3d E = 0.5 * ( Q.trace() * Eigen::Matrix3d::Identity() - Q);
+    Eigen::Vector3d e_R_dot = E * e_omega;
+
+    // Eigen::Vector3d e_R_dot = 0.5 * (Eigen::Matrix3d::Identity() + R_B_W_.transpose() * R_d_w) * e_omega;
+
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_omega: [" << e_omega.transpose() << "]");
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_R: [" << e_R.transpose() << "]");
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_R_dot: [" << e_R_dot.transpose() << "]");
+    
 
     Eigen::Vector3d s_R = e_omega + Lambda_R.cwiseProduct(e_R);
     Eigen::Vector3d sat_vec_R = s_R.cwiseQuotient(phi_R);
     sat_vec_R = sat_vec_R.cwiseMax(-1.0).cwiseMin(1.0);
     
     // SMC Controller
-    // tau =
-    //     -K_s_R.cwiseProduct(sat_vec_R)
-    //     + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
+    // Missing the desired angular acceleration term.
+    tau =
+        angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_)
+        - _inertia_matrix.asDiagonal() * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
+        - _inertia_matrix.asDiagonal() * Lambda_R.cwiseProduct(e_R_dot)
+        - K_s_R.cwiseProduct(sat_vec_R);
     
     // Lee's Geometric Controller
-    tau = -attitude_gain_.cwiseProduct(e_R)
-           - angular_rate_gain_.cwiseProduct(e_omega)
-           + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
+    // tau = -attitude_gain_.cwiseProduct(e_R)
+    //        - angular_rate_gain_.cwiseProduct(e_omega)
+    //        + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
 
 
     // Output the wrench
