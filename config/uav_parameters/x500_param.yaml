@@ -5,12 +5,15 @@
       arm_length: 0.25             # m
       num_of_arms: 4
       inertia:                     # Kg.m^2
-        # x: 0.08612 # D'rorigine
-        # y: 0.08962
-        # z: 0.16088
-        x: 0.0216
-        y: 0.0216
-        z: 0.040
+        # ixx: 0.08612 # D'origine
+        # iyy: 0.08962
+        # izz: 0.16088
+        ixx: 0.0216
+        iyy: 0.0216
+        izz: 0.040
+        ixy: 0.0
+        ixz: 0.0
+        iyz: 0.0
       moment_constant: 0.016     # m
       thrust_constant: 8.54858e-06   # N.s^2/rad^2
       max_rotor_speed: 1000         # rad/s

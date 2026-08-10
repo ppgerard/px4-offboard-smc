@@ -15,7 +15,10 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 # Specify additional locations of header files
 include_directories(
@@ -34,6 +37,14 @@ add_executable(circle_trajectory_node
 
 add_executable(steps_publisher_node 
   src/TrajectoryPublishers/tuning_node.cpp
+)
+
+add_executable(landing_trajectory_node
+  src/TrajectoryPublishers/landing_trajectory_node.cpp
+)
+
+add_executable(px4_offboard_landing_node
+  src/TrajectoryPublishers/px4_offboard_landing_node.cpp
 )
 
 # Add dependencies for the executables
@@ -58,6 +69,28 @@ ament_target_dependencies(steps_publisher_node
   tf2
 )
 
+ament_target_dependencies(landing_trajectory_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  trajectory_msgs
+  px4_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  Eigen3
+)
+
+ament_target_dependencies(px4_offboard_landing_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  trajectory_msgs
+  px4_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  Eigen3
+)
+
 install(TARGETS offboard_controller_node
   DESTINATION lib/${PROJECT_NAME})
 
@@ -65,6 +98,12 @@ install(TARGETS circle_trajectory_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS steps_publisher_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS landing_trajectory_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS px4_offboard_landing_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS

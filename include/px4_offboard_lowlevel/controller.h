@@ -74,7 +74,7 @@ public:
         _uav_mass = uavMass;
     }
 
-    void setInertiaMatrix(const Eigen::Vector3d &inertiaMatrix) {
+    void setInertiaMatrix(const Eigen::Matrix3d &inertiaMatrix) {
         _inertia_matrix = inertiaMatrix;
     }
 
@@ -107,6 +107,10 @@ public:
         phi_R = phi_r;
     }
 
+    // void setActualPosition(const Eigen::Vector3d &position_W) {
+    //     position_W_ = position_W;
+    // }
+
     // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
     void setKPositionGain(const Eigen::Vector3d &PositionGain){
         position_gain_ = PositionGain;
@@ -128,7 +132,7 @@ public:
 private:
     // UAV Parameter
     double _uav_mass;
-    Eigen::Vector3d _inertia_matrix;
+    Eigen::Matrix3d _inertia_matrix;
     double _gravity;
     
     // SMC Controller Gains

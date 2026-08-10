@@ -54,12 +54,12 @@ public:
 private:
   void publishTuningSteps() {
     
-    double x_step = 0.0;  // m
+    double x_step = 1.5;  // m
     double y_step = 0.0;  // m
     double z_step = 3.0;  // m
     double pitch_step = 0.0; // rad
     double roll_step = 0.0;  // rad
-    double yaw_step = 1.0;   // rad
+    double yaw_step = 0.0;   // rad
 
     // Convert Euler angles to quaternion
     tf2::Quaternion q;

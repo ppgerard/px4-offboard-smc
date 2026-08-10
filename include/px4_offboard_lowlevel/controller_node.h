@@ -36,21 +36,19 @@
 #define CONTROLLER_CONTROLLER_NODE_H
 
 #include "rclcpp/rclcpp.hpp"
-#include "rcl_interfaces/msg/set_parameters_result.hpp"
 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
-#include <px4_msgs/msg/vehicle_attitude_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <px4_msgs/msg/actuator_motors.hpp>
-#include <px4_msgs/msg/vehicle_attitude_setpoint.hpp>
-#include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
-#include <px4_msgs/msg/vehicle_torque_setpoint.hpp>
+#include <px4_msgs/msg/actuator_servos.hpp>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp>
+#include "geometry_msgs/msg/wrench_stamped.hpp"
 
 #include <string>
 
@@ -75,43 +73,35 @@ private:
     // Timers
     rclcpp::TimerBase::SharedPtr controllerTimer;
     rclcpp::TimerBase::SharedPtr offboardTimer;
+    uint64_t last_odometry_timestamp_ = 0;
 
     // subscribers
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_sub_;
-    rclcpp::Subscription<rcl_interfaces::msg::ParameterEvent>::SharedPtr parameter_event_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr command_pose_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr command_trajectory_sub_;
+    rclcpp::Subscription<px4_msgs::msg::ActuatorServos>::SharedPtr servos_status_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr platform_position_sub_;
     
     // Publishers
     rclcpp::Publisher<px4_msgs::msg::ActuatorMotors>::SharedPtr actuator_motors_publisher_;
-    rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr attitude_setpoint_publisher_;
-    rclcpp::Publisher<px4_msgs::msg::VehicleThrustSetpoint>::SharedPtr thrust_setpoint_publisher_;
-    rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_setpoint_publisher_;
+    rclcpp::Publisher<px4_msgs::msg::ActuatorServos>::SharedPtr actuator_servos_publisher_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_publisher_;
-
-    // Services
-    rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &parameters);
-    OnSetParametersCallbackHandle::SharedPtr callback_handle_;
+    rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_publisher_;
     
-    // Messages
-    px4_msgs::msg::VehicleAttitudeSetpoint attitude_setpoint_msg;
-    px4_msgs::msg::ActuatorMotors actuator_motors_msg;
-
-    // Topics namescontroller_
+    // Topic names
     std::string command_pose_topic_;
     std::string command_traj_topic_;
     std::string odometry_topic_;
     std::string status_topic_;
     std::string battery_status_topic_;
-    std::string actuator_status_topic;
+    std::string actuator_status_topic_;
+    std::string servos_status_topic_;
     std::string offboard_control_topic_;
     std::string vehicle_command_topic_;
-    std::string attitude_setpoint_topic_;
-    std::string thrust_setpoint_topic_;
-    std::string torque_setpoint_topic_;
     std::string actuator_control_topic_;
+    std::string servos_control_topic_;
 
     // UAV Parameters
     double _arm_length;
@@ -124,18 +114,22 @@ private:
     int _PWM_MAX;
     int _SIM_GZ_EC_MAX;
     int _SIM_GZ_EC_MIN;
+    // commanded tilt angles (radians) computed by the controller and published
+    double tilt_1_rad_ = 0.0;
+    double tilt_2_rad_ = 0.0;
+    // measured tilt angles (radians) read from servos feedback, used for allocation
+    double measured_tilt_1_rad_ = 0.0;
+    double measured_tilt_2_rad_ = 0.0;
     Eigen::MatrixXd torques_and_thrust_to_rotor_velocities_;
-    Eigen::MatrixXd throttles_to_normalized_torques_and_thrust_;
 
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - REPLACED BY SMC PARAMETERS) =====
+    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
     Eigen::Vector3d position_gain_;
     Eigen::Vector3d velocity_gain_;
     Eigen::Vector3d attitude_gain_;
     Eigen::Vector3d ang_vel_gain_;
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
-    
+    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
+
     // Logic switches
-    int control_mode_;
     bool in_sitl_mode_;
     
     px4_msgs::msg::VehicleStatus current_status_;
@@ -151,16 +145,19 @@ private:
     void commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint &msg);
     void vehicle_odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg);
     void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg);
+    void servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg);
+    void platformPositionCallback(const geometry_msgs::msg::Vector3::SharedPtr pos_msg);
 
     void publishActuatorMotorsMsg(const Eigen::VectorXd& throttles);
-    void publishThrustTorqueMsg(const Eigen::Vector4d& controller_output);
-    void publishAttitudeSetpointMsg(const Eigen::Vector4d& controller_output, const Eigen::Quaterniond& desired_quaternion);
+    void publishActuatorServosMsg(double tilt_1_rad, double tilt_2_rad);
     void publishOffboardControlModeMsg();
     void publish_vehicle_command(uint16_t command, float param1 =0.0, float param2 = 0.0);   
+    void publishWrenchMsg(const Eigen::VectorXd& wrench, uint64_t timestamp);
 
-    void compute_ControlAllocation_and_ActuatorEffect_matrices();
-    void px4Inverse (Eigen::Vector4d *normalized_torque_and_thrust, Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
-    void px4InverseSITL (Eigen::Vector4d *normalized_torque_and_thrust, Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
+    void compute_ControlAllocation_and_ActuatorEffect_matrices(double tilt_1_rad = 0.0,
+                                                               double tilt_2_rad = 0.0);
+    void px4Inverse (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
+    void px4InverseSITL (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
 
     inline Eigen::Vector3d rotateVectorFromToENU_NED(const Eigen::Vector3d& vec_in) {
         // NED (X North, Y East, Z Down) & ENU (X East, Y North, Z Up)

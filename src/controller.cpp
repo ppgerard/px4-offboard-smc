@@ -34,6 +34,8 @@
 
 #include "../include/px4_offboard_lowlevel/controller.h"
 #include "rclcpp/rclcpp.hpp"
+#include <cmath>
+#include <eigen3/Eigen/Geometry>
 
 
 controller::controller(){
@@ -82,10 +84,10 @@ void controller::calculateControllerOutput(
     Eigen::Vector3d sat_vec = s.cwiseQuotient(phi);
     sat_vec = sat_vec.cwiseMax(-1.0).cwiseMin(1.0);
 
-//     const Eigen::Vector3d I_a_d = 
-//                 -position_gain_.cwiseProduct(e_p)
-//                 -velocity_gain_.cwiseProduct(e_v)
-//                 +_uav_mass * _gravity * Eigen::Vector3d::UnitZ() + _uav_mass * r_acceleration_W_;
+    // const Eigen::Vector3d I_a_d = 
+    //             -position_gain_.cwiseProduct(e_p)
+    //             -velocity_gain_.cwiseProduct(e_v)
+    //             +_uav_mass * _gravity * Eigen::Vector3d::UnitZ() + _uav_mass * r_acceleration_W_;
 
     const Eigen::Vector3d I_a_d = 
                 + _uav_mass * _gravity * Eigen::Vector3d::UnitZ() 
@@ -93,8 +95,8 @@ void controller::calculateControllerOutput(
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 - K_s.cwiseProduct(sat_vec);
 
-    thrust = I_a_d.dot(R_B_W_.col(2));
-    // thrust = I_a_d.norm();
+    // thrust = I_a_d.dot(R_B_W_.col(2));
+    thrust = I_a_d.norm();
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
     B_z_d.normalize();
@@ -106,6 +108,12 @@ void controller::calculateControllerOutput(
     R_d_w.col(0) = B_y_d.cross(B_z_d);
     R_d_w.col(1) = B_y_d;
     R_d_w.col(2) = B_z_d;
+
+    // Apply a small fixed pitch trim (positive = nose up) to the desired attitude
+    // For tiltrotor only
+    const double pitch_trim_rad = -4.1 * M_PI / 180.0;
+    const Eigen::Matrix3d R_pitch = Eigen::AngleAxisd(pitch_trim_rad, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    R_d_w = R_d_w * R_pitch;
 
     if (!first_iteration)
     {
@@ -154,7 +162,10 @@ void controller::calculateControllerOutput(
     // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_omega: [" << e_omega.transpose() << "]");
     // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_R: [" << e_R.transpose() << "]");
     // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_R_dot: [" << e_R_dot.transpose() << "]");
-    
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_p: [" << e_p.transpose() << "]");
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "e_v: [" << e_v.transpose() << "]");
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "b_3: [" << R_B_W_.col(2).transpose() << "]");
+    // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "d_3: [" << B_z_d.transpose() << "]");
 
     Eigen::Vector3d s_R = e_omega + Lambda_R.cwiseProduct(e_R);
     Eigen::Vector3d sat_vec_R = s_R.cwiseQuotient(phi_R);
@@ -163,15 +174,15 @@ void controller::calculateControllerOutput(
     // SMC Controller
     // Missing the desired angular acceleration term.
     tau =
-        angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_)
-        - _inertia_matrix.asDiagonal() * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
-        - _inertia_matrix.asDiagonal() * Lambda_R.cwiseProduct(e_R_dot)
+        angular_velocity_B_.cross(_inertia_matrix * angular_velocity_B_)
+        - _inertia_matrix * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
+        - _inertia_matrix * Lambda_R.cwiseProduct(e_R_dot)
         - K_s_R.cwiseProduct(sat_vec_R);
     
     // Lee's Geometric Controller
     // tau = -attitude_gain_.cwiseProduct(e_R)
     //        - angular_rate_gain_.cwiseProduct(e_omega)
-    //        + angular_velocity_B_.cross(_inertia_matrix.asDiagonal() * angular_velocity_B_);
+    //        + angular_velocity_B_.cross(_inertia_matrix * angular_velocity_B_);
 
 
     // Output the wrench
