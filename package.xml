@@ -3,7 +3,7 @@
 <package format="3">
   <name>px4_offboard_lowlevel</name>
   <version>1.0.0</version>
-  <description>Low-level control of PX4 Multi-rotor vehicles in Offboard mode</description>
+  <description>Low-level SMC control of PX4 multi-rotor and VTOL vehicles in Offboard mode</description>
   <maintainer email="a.alharbat@saxion.nl">Ayham Alharbat</maintainer>
   <license>BSD 3-Clause License</license>
 

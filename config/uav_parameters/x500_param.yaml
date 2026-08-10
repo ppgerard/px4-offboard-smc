@@ -26,3 +26,11 @@
       PWM_MAX: 1950
       SIM_GZ_EC_MAX: 1000        # rad/s, corresponds to SIM_GZ_EC_MAX from PX4 parameters
       SIM_GZ_EC_MIN: 150         # rad/s, corresponds to SIM_GZ_EC_MIN from PX4 parameters
+    landing_parameters:
+      camera_frame_id: "x500_mono_cam_0/camera_link/imager"
+      platform_frame_id: "platform"
+      world_frame_id: "world"
+      camera_offset_body:        # position of camera in body frame [m]
+        x: 0.0
+        y: 0.0
+        z: -0.1
