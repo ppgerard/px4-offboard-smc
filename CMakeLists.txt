@@ -28,6 +28,7 @@ include_directories(
 
 add_executable(offboard_controller_node
   src/smc_controller.cpp
+  src/st_smc_controller.cpp
   src/controller_node.cpp
 )
 
