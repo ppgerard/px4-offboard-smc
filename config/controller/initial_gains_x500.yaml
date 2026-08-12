@@ -41,3 +41,28 @@
         K_w_y: 0.5
         K_w_z: 0.1
         # ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
+
+        # ===== STSMC (super-twisting) gains, only read when controller_type:=stsmc =====
+        # UNTUNED starting point, deliberately conservative. Tune before real flight.
+        # STA_Lambda: sliding surface slope (same role as Lambda above)
+        STA_Lambda_x: 1.5
+        STA_Lambda_y: 1.5
+        STA_Lambda_z: 3.0
+        # STA_K1/K2: super-twisting reaching-law gains (u = -K1*sqrt(|s|)*sign(s) + w, w_dot = -K2*sign(s))
+        STA_K1_x: 1.0
+        STA_K1_y: 1.0
+        STA_K1_z: 1.2
+        STA_K2_x: 0.5
+        STA_K2_y: 0.5
+        STA_K2_z: 0.6
+        # STA_Lambda_R: rotational sliding surface slope (same role as Lambda_R above)
+        STA_Lambda_R_x: 5.0
+        STA_Lambda_R_y: 5.0
+        STA_Lambda_R_z: 2.0
+        # STA_K1_R/K2_R: rotational super-twisting reaching-law gains
+        STA_K1_R_x: 0.3
+        STA_K1_R_y: 0.3
+        STA_K1_R_z: 0.15
+        STA_K2_R_x: 0.05
+        STA_K2_R_y: 0.05
+        STA_K2_R_z: 0.03

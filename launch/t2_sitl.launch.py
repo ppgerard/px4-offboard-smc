@@ -36,15 +36,23 @@ def generate_launch_description():
    )
    trajectory = LaunchConfiguration('trajectory')
 
+   controller_type_arg = DeclareLaunchArgument(
+      'controller_type',
+      default_value='smc',
+      description='Control law used by offboard_controller_node: smc or stsmc'
+   )
+   controller_type = LaunchConfiguration('controller_type')
+
    return LaunchDescription([
       trajectory_arg,
-      # SMC controller. Not launched for 'px4_landing', which bypasses it and
+      controller_type_arg,
+      # Controller. Not launched for 'px4_landing', which bypasses it and
       # sends setpoints straight to PX4 (running both would fight for control).
       Node(
          package='px4_offboard_lowlevel',
          executable='offboard_controller_node',
          name='offboard_controller',
-         parameters=[config_1, config_2, config_3],
+         parameters=[config_1, config_2, config_3, {'controller_type': controller_type}],
          condition=IfCondition(NotEqualsSubstitution(trajectory, 'px4_landing')),
       ),
       Node(

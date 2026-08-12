@@ -63,9 +63,18 @@ double tiltRadToServoNorm(double tilt_rad)
 ControllerNode::ControllerNode()
     : Node("controller_node")
     {
-        // Only control law implemented so far; a controller_type parameter
-        // will pick between implementations once STSMC is added.
-        controller_ = std::make_unique<SmcController>();
+        this->declare_parameter<std::string>("controller_type", "smc");
+        controller_type_ = this->get_parameter("controller_type").as_string();
+        if (controller_type_ == "stsmc") {
+            controller_ = std::make_unique<StSmcController>();
+        } else {
+            if (controller_type_ != "smc") {
+                RCLCPP_WARN(this->get_logger(),
+                    "Unknown controller_type '%s', falling back to 'smc'.", controller_type_.c_str());
+                controller_type_ = "smc";
+            }
+            controller_ = std::make_unique<SmcController>();
+        }
 
         loadParams();
         compute_ControlAllocation_and_ActuatorEffect_matrices();
@@ -192,6 +201,78 @@ void ControllerNode::loadParams() {
 
     in_sitl_mode_ = this->get_parameter("sitl_mode").as_bool();
     
+    // pass UAV parameters to the controller (shared by every control law)
+    controller_->setUavMass(_uav_mass);
+    controller_->setInertiaMatrix(_inertia_matrix);
+    controller_->setGravity(_gravity);
+    controller_->setPitchTrim(_pitch_trim_rad);
+
+    if (controller_type_ == "stsmc") {
+        // ===== STSMC CONTROLLER GAINS (fully independent from the SMC gains below) =====
+        this->declare_parameter("control_gains.STA_Lambda_x", 0.0);
+        this->declare_parameter("control_gains.STA_Lambda_y", 0.0);
+        this->declare_parameter("control_gains.STA_Lambda_z", 0.0);
+        this->declare_parameter("control_gains.STA_K1_x", 0.0);
+        this->declare_parameter("control_gains.STA_K1_y", 0.0);
+        this->declare_parameter("control_gains.STA_K1_z", 0.0);
+        this->declare_parameter("control_gains.STA_K2_x", 0.0);
+        this->declare_parameter("control_gains.STA_K2_y", 0.0);
+        this->declare_parameter("control_gains.STA_K2_z", 0.0);
+        this->declare_parameter("control_gains.STA_Lambda_R_x", 0.0);
+        this->declare_parameter("control_gains.STA_Lambda_R_y", 0.0);
+        this->declare_parameter("control_gains.STA_Lambda_R_z", 0.0);
+        this->declare_parameter("control_gains.STA_K1_R_x", 0.0);
+        this->declare_parameter("control_gains.STA_K1_R_y", 0.0);
+        this->declare_parameter("control_gains.STA_K1_R_z", 0.0);
+        this->declare_parameter("control_gains.STA_K2_R_x", 0.0);
+        this->declare_parameter("control_gains.STA_K2_R_y", 0.0);
+        this->declare_parameter("control_gains.STA_K2_R_z", 0.0);
+
+        Eigen::Vector3d lambda, k1, k2, lambda_r, k1_r, k2_r;
+
+        lambda << this->get_parameter("control_gains.STA_Lambda_x").as_double(),
+                  this->get_parameter("control_gains.STA_Lambda_y").as_double(),
+                  this->get_parameter("control_gains.STA_Lambda_z").as_double();
+
+        k1 << this->get_parameter("control_gains.STA_K1_x").as_double(),
+              this->get_parameter("control_gains.STA_K1_y").as_double(),
+              this->get_parameter("control_gains.STA_K1_z").as_double();
+
+        k2 << this->get_parameter("control_gains.STA_K2_x").as_double(),
+              this->get_parameter("control_gains.STA_K2_y").as_double(),
+              this->get_parameter("control_gains.STA_K2_z").as_double();
+
+        lambda_r << this->get_parameter("control_gains.STA_Lambda_R_x").as_double(),
+                    this->get_parameter("control_gains.STA_Lambda_R_y").as_double(),
+                    this->get_parameter("control_gains.STA_Lambda_R_z").as_double();
+
+        k1_r << this->get_parameter("control_gains.STA_K1_R_x").as_double(),
+                this->get_parameter("control_gains.STA_K1_R_y").as_double(),
+                this->get_parameter("control_gains.STA_K1_R_z").as_double();
+
+        k2_r << this->get_parameter("control_gains.STA_K2_R_x").as_double(),
+                this->get_parameter("control_gains.STA_K2_R_y").as_double(),
+                this->get_parameter("control_gains.STA_K2_R_z").as_double();
+
+        RCLCPP_INFO(this->get_logger(), "===== STSMC PARAMETERS LOADED =====");
+        RCLCPP_INFO(this->get_logger(), "Lambda:   [%.2f, %.2f, %.2f]", lambda(0), lambda(1), lambda(2));
+        RCLCPP_INFO(this->get_logger(), "K1:       [%.2f, %.2f, %.2f]", k1(0), k1(1), k1(2));
+        RCLCPP_INFO(this->get_logger(), "K2:       [%.2f, %.2f, %.2f]", k2(0), k2(1), k2(2));
+        RCLCPP_INFO(this->get_logger(), "Lambda_R: [%.2f, %.2f, %.2f]", lambda_r(0), lambda_r(1), lambda_r(2));
+        RCLCPP_INFO(this->get_logger(), "K1_R:     [%.2f, %.2f, %.2f]", k1_r(0), k1_r(1), k1_r(2));
+        RCLCPP_INFO(this->get_logger(), "K2_R:     [%.2f, %.2f, %.2f]", k2_r(0), k2_r(1), k2_r(2));
+        RCLCPP_INFO(this->get_logger(), "==================================");
+
+        auto* stsmc_controller = static_cast<StSmcController*>(controller_.get());
+        stsmc_controller->setLambda(lambda);
+        stsmc_controller->setLambdaR(lambda_r);
+        stsmc_controller->setK1(k1);
+        stsmc_controller->setK2(k2);
+        stsmc_controller->setK1R(k1_r);
+        stsmc_controller->setK2R(k2_r);
+        return;
+    }
+
     // ===== SMC CONTROLLER GAINS =====
     // Translational sliding mode control parameters
     this->declare_parameter("control_gains.Lambda_x", 0.0);
@@ -213,9 +294,9 @@ void ControllerNode::loadParams() {
     this->declare_parameter("control_gains.Phi_R_x", 0.0);
     this->declare_parameter("control_gains.Phi_R_y", 0.0);
     this->declare_parameter("control_gains.Phi_R_z", 0.0);
-    
+
     Eigen::Vector3d lambda, k_s, phi, lambda_r, k_s_r, phi_r;
-    
+
     lambda << this->get_parameter("control_gains.Lambda_x").as_double(),
               this->get_parameter("control_gains.Lambda_y").as_double(),
               this->get_parameter("control_gains.Lambda_z").as_double();
@@ -239,7 +320,7 @@ void ControllerNode::loadParams() {
     phi_r << this->get_parameter("control_gains.Phi_R_x").as_double(),
              this->get_parameter("control_gains.Phi_R_y").as_double(),
              this->get_parameter("control_gains.Phi_R_z").as_double();
-    
+
     // Debug: Print loaded SMC parameters
     RCLCPP_INFO(this->get_logger(), "===== SMC PARAMETERS LOADED =====");
     RCLCPP_INFO(this->get_logger(), "Lambda: [%.2f, %.2f, %.2f]", lambda(0), lambda(1), lambda(2));
@@ -249,7 +330,7 @@ void ControllerNode::loadParams() {
     RCLCPP_INFO(this->get_logger(), "K_s_R:    [%.2f, %.2f, %.2f]", k_s_r(0), k_s_r(1), k_s_r(2));
     RCLCPP_INFO(this->get_logger(), "Phi_R:    [%.2f, %.2f, %.2f]", phi_r(0), phi_r(1), phi_r(2));
     RCLCPP_INFO(this->get_logger(), "==================================");
-    
+
     // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
     this->declare_parameter("control_gains.K_p_x", 0.0);
     this->declare_parameter("control_gains.K_p_y", 0.0);
@@ -280,12 +361,6 @@ void ControllerNode::loadParams() {
                      this->get_parameter("control_gains.K_w_y").as_double(),
                      this->get_parameter("control_gains.K_w_z").as_double();
     // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
-
-    // pass UAV parameters and SMC controller gains to the controller
-    controller_->setUavMass(_uav_mass);
-    controller_->setInertiaMatrix(_inertia_matrix);
-    controller_->setGravity(_gravity);
-    controller_->setPitchTrim(_pitch_trim_rad);
 
     // Gains below are specific to the SMC control law.
     auto* smc_controller = static_cast<SmcController*>(controller_.get());

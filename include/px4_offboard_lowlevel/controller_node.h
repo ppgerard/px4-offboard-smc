@@ -55,6 +55,7 @@
 
 #include "px4_offboard_lowlevel/controller_base.h"
 #include "px4_offboard_lowlevel/smc_controller.h"
+#include "px4_offboard_lowlevel/st_smc_controller.h"
 
 #include <chrono>
 using namespace std::chrono_literals;
@@ -71,6 +72,7 @@ public:
 private:
 
     std::unique_ptr<ControllerBase> controller_;
+    std::string controller_type_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr controllerTimer;
