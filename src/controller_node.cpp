@@ -60,9 +60,13 @@ double tiltRadToServoNorm(double tilt_rad)
 
 
 
-ControllerNode::ControllerNode() 
+ControllerNode::ControllerNode()
     : Node("controller_node")
     {
+        // Only control law implemented so far; a controller_type parameter
+        // will pick between implementations once STSMC is added.
+        controller_ = std::make_unique<SmcController>();
+
         loadParams();
         compute_ControlAllocation_and_ActuatorEffect_matrices();
 
@@ -278,21 +282,24 @@ void ControllerNode::loadParams() {
     // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
 
     // pass UAV parameters and SMC controller gains to the controller
-    controller_.setUavMass(_uav_mass);
-    controller_.setInertiaMatrix(_inertia_matrix);
-    controller_.setGravity(_gravity);
-    controller_.setPitchTrim(_pitch_trim_rad);
-    controller_.setLambda(lambda);
-    controller_.setKs(k_s);
-    controller_.setPhi(phi);
-    controller_.setLambdaR(lambda_r);
-    controller_.setKsR(k_s_r);
-    controller_.setPhiR(phi_r);
+    controller_->setUavMass(_uav_mass);
+    controller_->setInertiaMatrix(_inertia_matrix);
+    controller_->setGravity(_gravity);
+    controller_->setPitchTrim(_pitch_trim_rad);
 
-    controller_.setKPositionGain(position_gain_);
-    controller_.setKVelocityGain(velocity_gain_);
-    controller_.setKAttitudeGain(attitude_gain_);
-    controller_.setKAngularRateGain(ang_vel_gain_);
+    // Gains below are specific to the SMC control law.
+    auto* smc_controller = static_cast<SmcController*>(controller_.get());
+    smc_controller->setLambda(lambda);
+    smc_controller->setKs(k_s);
+    smc_controller->setPhi(phi);
+    smc_controller->setLambdaR(lambda_r);
+    smc_controller->setKsR(k_s_r);
+    smc_controller->setPhiR(phi_r);
+
+    smc_controller->setKPositionGain(position_gain_);
+    smc_controller->setKVelocityGain(velocity_gain_);
+    smc_controller->setKAttitudeGain(attitude_gain_);
+    smc_controller->setKAngularRateGain(ang_vel_gain_);
 }
 
 void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(double tilt_1_rad, double tilt_2_rad) {
@@ -581,7 +588,7 @@ void ControllerNode::commandPoseCallback(const geometry_msgs::msg::PoseStamped::
     Eigen::Quaterniond orientation;
     eigenTrajectoryPointFromPoseMsg(pose_msg, position, orientation);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
-    controller_.setTrajectoryPoint(position, orientation);          // Send the command to controller_ obj
+    controller_->setTrajectoryPoint(position, orientation);          // Send the command to controller_ obj
 }
 
 void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint &msg) {                   // When a command is received
@@ -592,7 +599,7 @@ void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::Multi
     Eigen::Vector3d angular_velocity;
     Eigen::Vector3d acceleration;
     eigenTrajectoryPointFromMsg(msg, position, orientation, velocity, angular_velocity, acceleration);
-    controller_.setTrajectoryPoint(position, velocity, acceleration, orientation, angular_velocity);
+    controller_->setTrajectoryPoint(position, velocity, acceleration, orientation, angular_velocity);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
 }
 
@@ -619,7 +626,7 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
         eigenOdometryFromPX4Msg(odom_msg,
                                 position, orientation, velocity, angular_velocity);
 
-        controller_.setOdometry(position, orientation, velocity, angular_velocity);
+        controller_->setOdometry(position, orientation, velocity, angular_velocity);
 }
 
 void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg) {
@@ -726,7 +733,7 @@ void ControllerNode::updateControllerOutput() {
     //  calculate controller output
     Eigen::VectorXd controller_output;
     Eigen::Quaterniond desired_quaternion;
-    controller_.calculateControllerOutput(&controller_output, &desired_quaternion);
+    controller_->calculateControllerOutput(&controller_output, &desired_quaternion);
     publishWrenchMsg(controller_output, last_odometry_timestamp_);
     
     // Debug: Log the controller output (only once per second to avoid spam)

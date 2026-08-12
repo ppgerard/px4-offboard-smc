@@ -51,8 +51,10 @@
 #include "geometry_msgs/msg/wrench_stamped.hpp"
 
 #include <string>
+#include <memory>
 
-#include "px4_offboard_lowlevel/controller.h"
+#include "px4_offboard_lowlevel/controller_base.h"
+#include "px4_offboard_lowlevel/smc_controller.h"
 
 #include <chrono>
 using namespace std::chrono_literals;
@@ -68,7 +70,7 @@ public:
 
 private:
 
-    controller controller_;
+    std::unique_ptr<ControllerBase> controller_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr controllerTimer;

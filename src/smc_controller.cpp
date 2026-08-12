@@ -32,17 +32,17 @@
  *
  ****************************************************************************/
 
-#include "../include/px4_offboard_lowlevel/controller.h"
+#include "../include/px4_offboard_lowlevel/smc_controller.h"
 #include "rclcpp/rclcpp.hpp"
 #include <cmath>
 #include <eigen3/Eigen/Geometry>
 
 
-controller::controller(){
+SmcController::SmcController(){
 
 }
 
-void controller::calculateControllerOutput(
+void SmcController::calculateControllerOutput(
         Eigen::VectorXd *controller_torque_thrust, Eigen::Quaterniond *desired_quaternion) {
     assert(controller_torque_thrust);
 

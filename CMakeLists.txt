@@ -26,8 +26,8 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}  # Use EIGEN3_INCLUDE_DIR instead of EIGEN3_DIR
 )
 
-add_executable(offboard_controller_node 
-  src/controller.cpp
+add_executable(offboard_controller_node
+  src/smc_controller.cpp
   src/controller_node.cpp
 )
 
