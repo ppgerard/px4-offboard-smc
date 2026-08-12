@@ -82,6 +82,13 @@ public:
         _gravity = gravity;
     }
 
+    // Fixed pitch trim applied to the desired attitude, to compensate a
+    // vehicle's natural mounting tilt (e.g. the t2 tiltrotor). Leave at the
+    // default 0.0 for airframes that don't need it (e.g. x500).
+    void setPitchTrim(double pitchTrimRad) {
+        _pitch_trim_rad = pitchTrimRad;
+    }
+
     // SMC Controller Parameter Setters
     void setLambda(const Eigen::Vector3d &lambda) {
         Lambda = lambda;
@@ -134,7 +141,8 @@ private:
     double _uav_mass;
     Eigen::Matrix3d _inertia_matrix;
     double _gravity;
-    
+    double _pitch_trim_rad = 0.0;
+
     // SMC Controller Gains
     Eigen::Vector3d Lambda;
     Eigen::Vector3d K_s;    

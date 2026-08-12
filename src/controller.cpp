@@ -109,11 +109,13 @@ void controller::calculateControllerOutput(
     R_d_w.col(1) = B_y_d;
     R_d_w.col(2) = B_z_d;
 
-    // Apply a small fixed pitch trim (positive = nose up) to the desired attitude
-    // For tiltrotor only
-    const double pitch_trim_rad = -4.1 * M_PI / 180.0;
-    const Eigen::Matrix3d R_pitch = Eigen::AngleAxisd(pitch_trim_rad, Eigen::Vector3d::UnitY()).toRotationMatrix();
-    R_d_w = R_d_w * R_pitch;
+    // Apply the vehicle's fixed pitch trim (positive = nose up) to the desired
+    // attitude, compensating a natural mounting tilt (e.g. the t2 tiltrotor).
+    // Zero for airframes that don't set uav_parameters.pitch_trim_deg.
+    if (_pitch_trim_rad != 0.0) {
+        const Eigen::Matrix3d R_pitch = Eigen::AngleAxisd(_pitch_trim_rad, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        R_d_w = R_d_w * R_pitch;
+    }
 
     if (!first_iteration)
     {

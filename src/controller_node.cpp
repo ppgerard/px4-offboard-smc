@@ -113,6 +113,7 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.thrust_constant", 0.0);
     this->declare_parameter("uav_parameters.max_rotor_speed", 0);
     this->declare_parameter("uav_parameters.gravity", 0.0);
+    this->declare_parameter("uav_parameters.pitch_trim_deg", 0.0);
     this->declare_parameter("uav_parameters.PWM_MIN", 0);
     this->declare_parameter("uav_parameters.PWM_MAX", 0);
     this->declare_parameter("uav_parameters.SIM_GZ_EC_MAX", 0);
@@ -134,6 +135,10 @@ void ControllerNode::loadParams() {
     _thrust_constant = this->get_parameter("uav_parameters.thrust_constant").as_double();
     _max_rotor_speed = this->get_parameter("uav_parameters.max_rotor_speed").as_int();
     double _gravity = this->get_parameter("uav_parameters.gravity").as_double();
+    // Fixed pitch trim compensating a vehicle's natural mounting tilt (e.g. the
+    // t2 tiltrotor). Zero by default so airframes that don't need it (e.g.
+    // x500) are unaffected.
+    double _pitch_trim_rad = this->get_parameter("uav_parameters.pitch_trim_deg").as_double() * M_PI / 180.0;
     _PWM_MIN = this->get_parameter("uav_parameters.PWM_MIN").as_int();
     _PWM_MAX = this->get_parameter("uav_parameters.PWM_MAX").as_int();
     _SIM_GZ_EC_MAX = this->get_parameter("uav_parameters.SIM_GZ_EC_MAX").as_int();
@@ -276,6 +281,7 @@ void ControllerNode::loadParams() {
     controller_.setUavMass(_uav_mass);
     controller_.setInertiaMatrix(_inertia_matrix);
     controller_.setGravity(_gravity);
+    controller_.setPitchTrim(_pitch_trim_rad);
     controller_.setLambda(lambda);
     controller_.setKs(k_s);
     controller_.setPhi(phi);
