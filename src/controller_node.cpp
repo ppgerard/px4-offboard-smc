@@ -578,6 +578,7 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
                                             position, orientation, velocity, angular_velocity);
 
         controller_->setOdometry(position, orientation, velocity, angular_velocity);
+        odometry_received_ = true;
 }
 
 void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg) {
@@ -669,6 +670,16 @@ void ControllerNode::publishWrenchMsg(const Eigen::VectorXd& wrench, uint64_t ti
 }
 
 void ControllerNode::updateControllerOutput() {
+    // Nothing to track until the vehicle state is known: evaluating the control
+    // law before the first odometry message would act on the initial state
+    // rather than on the vehicle's.
+    if (!odometry_received_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "Waiting for the first odometry message on '%s' before running the controller.",
+            odometry_topic_.c_str());
+        return;
+    }
+
     //  calculate controller output
     Eigen::VectorXd controller_output;
     Eigen::Quaterniond desired_quaternion;

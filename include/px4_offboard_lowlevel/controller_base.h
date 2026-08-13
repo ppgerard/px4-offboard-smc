@@ -107,23 +107,25 @@ protected:
     bool first_iteration_ = true;
 
     // UAV Parameter
-    double _uav_mass;
-    Eigen::Matrix3d _inertia_matrix;
-    double _gravity;
+    double _uav_mass = 0.0;
+    Eigen::Matrix3d _inertia_matrix = Eigen::Matrix3d::Zero();
+    double _gravity = 0.0;
     double _pitch_trim_rad = 0.0;
 
-    // Current states
-    Eigen::Vector3d position_W_;
-    Eigen::Vector3d velocity_W_;
-    Eigen::Matrix3d R_B_W_;
-    Eigen::Vector3d angular_velocity_B_;
+    // Current states. Initialised so that a control law evaluated before the
+    // first odometry message operates on a defined state rather than on
+    // whatever happened to be in memory.
+    Eigen::Vector3d position_W_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d velocity_W_ = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d R_B_W_ = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d angular_velocity_B_ = Eigen::Vector3d::Zero();
     // References
-    Eigen::Vector3d r_position_W_;
-    Eigen::Vector3d r_velocity_W_;
-    Eigen::Vector3d r_acceleration_W_;
-    Eigen::Matrix3d r_R_B_W_;
-    double r_yaw;
-    double r_yaw_rate;
+    Eigen::Vector3d r_position_W_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d r_velocity_W_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d r_acceleration_W_ = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d r_R_B_W_ = Eigen::Matrix3d::Identity();
+    double r_yaw = 0.0;
+    double r_yaw_rate = 0.0;
 };
 
 #endif //CONTROLLER_CONTROLLER_BASE_H

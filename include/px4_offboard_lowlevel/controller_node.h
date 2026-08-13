@@ -79,6 +79,7 @@ private:
     rclcpp::TimerBase::SharedPtr controllerTimer;
     rclcpp::TimerBase::SharedPtr offboardTimer;
     uint64_t last_odometry_timestamp_ = 0;
+    bool odometry_received_ = false;
 
     // subscribers
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
