@@ -695,7 +695,7 @@ void ControllerNode::publishActuatorMotorsMsg(const Eigen::VectorXd& throttles) 
                                         std::nanf("1"), std::nanf("1"), std::nanf("1"), std::nanf("1") };
     }
 	actuator_motors_msg.reversible_flags = 0;
-	actuator_motors_msg.timestamp = this->get_clock()->make_shared()->now().nanoseconds() / 1000;
+	actuator_motors_msg.timestamp = this->now().nanoseconds() / 1000;
 	actuator_motors_msg.timestamp_sample = actuator_motors_msg.timestamp;
 
 	actuator_motors_publisher_->publish(actuator_motors_msg);
@@ -715,7 +715,7 @@ void ControllerNode::publishActuatorServosMsg(double tilt_1_rad, double tilt_2_r
                                     safe_servo(tilt_1_norm),
                                     safe_servo(tilt_2_norm),
                                     std::nanf("1"), std::nanf("1") };
-    actuator_servos_msg.timestamp = this->get_clock()->make_shared()->now().nanoseconds() / 1000;
+    actuator_servos_msg.timestamp = this->now().nanoseconds() / 1000;
     actuator_servos_publisher_->publish(actuator_servos_msg);
 }
 void ControllerNode::publishWrenchMsg(const Eigen::VectorXd& wrench, uint64_t timestamp){
@@ -747,8 +747,7 @@ void ControllerNode::updateControllerOutput() {
     publishWrenchMsg(controller_output, last_odometry_timestamp_);
     
     // Debug: Log the controller output (only once per second to avoid spam)
-    static int iteration_count = 0;
-    if (iteration_count++ % 100 == 0) {
+    if (iteration_count_++ % 100 == 0) {
         RCLCPP_INFO(this->get_logger(), "Controller output [tau_x, tau_y, tau_z, thrust]: [%.3f, %.3f, %.3f, %.3f]",
                     controller_output(0), controller_output(1), controller_output(2), controller_output(3));
         RCLCPP_INFO(this->get_logger(), "Vehicle nav_state: %d (Offboard=%d)", 

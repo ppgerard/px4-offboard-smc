@@ -125,6 +125,9 @@ private:
 
     // Logic switches
     bool in_sitl_mode_;
+
+    // Throttled logging counter for updateControllerOutput()
+    int iteration_count_ = 0;
     
     px4_msgs::msg::VehicleStatus current_status_;
     bool connected_ = false;
