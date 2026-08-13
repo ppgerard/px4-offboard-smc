@@ -25,6 +25,7 @@
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
+#include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
 
 using namespace std::chrono_literals;
@@ -224,46 +225,6 @@ protected:
 
   // Raw tag position (unfiltered)
   Eigen::Vector3d position_W_raw_;
-
-  // ============ Helper Functions: Frame Conversions ============
-  Eigen::Vector3d rotateVectorFromToENU_NED(const Eigen::Vector3d& vec_in) {
-    // NED (X North, Y East, Z Down) & ENU (X East, Y North, Z Up)
-    Eigen::Vector3d vec_out;
-    vec_out << vec_in[1], vec_in[0], -vec_in[2];
-    return vec_out;
-  }
-
-  Eigen::Vector3d rotateVectorFromToFRD_FLU(const Eigen::Vector3d& vec_in) {
-    // FRD (X Forward, Y Right, Z Down) & FLU (X Forward, Y Left, Z Up)
-    Eigen::Vector3d vec_out;
-    vec_out << vec_in[0], -vec_in[1], -vec_in[2];
-    return vec_out;
-  }
-
-  Eigen::Quaterniond rotateQuaternionFromToENU_NED(const Eigen::Quaterniond& quat_in) {
-    // Transform from orientation represented in ROS format to PX4 format and back
-    Eigen::Vector3d euler_1(M_PI, 0.0, M_PI_2);
-    Eigen::Quaterniond NED_ENU_Q(Eigen::AngleAxisd(euler_1.z(), Eigen::Vector3d::UnitZ()) *
-        Eigen::AngleAxisd(euler_1.y(), Eigen::Vector3d::UnitY()) *
-        Eigen::AngleAxisd(euler_1.x(), Eigen::Vector3d::UnitX()));
-
-    Eigen::Vector3d euler_2(M_PI, 0.0, 0.0);
-    Eigen::Quaterniond AIRCRAFT_BASELINK_Q(Eigen::AngleAxisd(euler_2.z(), Eigen::Vector3d::UnitZ()) *
-        Eigen::AngleAxisd(euler_2.y(), Eigen::Vector3d::UnitY()) *
-        Eigen::AngleAxisd(euler_2.x(), Eigen::Vector3d::UnitX()));
-
-    return (NED_ENU_Q*quat_in)*AIRCRAFT_BASELINK_Q;
-  }
-
-  void eigenOdometryFromPX4Msg(const px4_msgs::msg::VehicleOdometry::SharedPtr msg,
-                      Eigen::Vector3d& position_W, Eigen::Quaterniond& orientation_B_W,
-                      Eigen::Vector3d& velocity_B, Eigen::Vector3d& angular_velocity_B) {
-    position_W = rotateVectorFromToENU_NED(Eigen::Vector3d(msg->position[0], msg->position[1], msg->position[2]));
-    Eigen::Quaterniond quaternion(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
-    orientation_B_W = rotateQuaternionFromToENU_NED(quaternion);
-    velocity_B = rotateVectorFromToENU_NED(Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]));
-    angular_velocity_B = rotateVectorFromToFRD_FLU(Eigen::Vector3d(msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]));
-  }
 
   // ============ Helper Functions: Saturation & Filtering ============
   void saturateXY(Eigen::Vector3d& vector, double max_norm) {
@@ -629,7 +590,7 @@ protected:
     Eigen::Quaterniond orientation;
     Eigen::Vector3d angular_velocity;
 
-    eigenOdometryFromPX4Msg(odom_msg, position, orientation, velocity, angular_velocity);
+    px4_frames::eigenOdometryFromPX4Msg(odom_msg, position, orientation, velocity, angular_velocity);
 
     // Always update current drone state for later use
     Eigen::Vector3d delta_position = position - drone_position_W_;
@@ -670,8 +631,8 @@ protected:
     Eigen::Vector3d gt_position(gt_msg->x, gt_msg->y, gt_msg->z);
     Eigen::Vector3d gt_velocity(gt_msg->vx, gt_msg->vy, gt_msg->vz);
 
-    groundtruth_position_W_ = rotateVectorFromToENU_NED(gt_position);
-    groundtruth_velocity_W_ = rotateVectorFromToENU_NED(gt_velocity);
+    groundtruth_position_W_ = px4_frames::rotateVectorFromToENU_NED(gt_position);
+    groundtruth_velocity_W_ = px4_frames::rotateVectorFromToENU_NED(gt_velocity);
   }
 };
 

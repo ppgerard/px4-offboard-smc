@@ -54,6 +54,7 @@
 #include <memory>
 
 #include "px4_offboard_lowlevel/controller_base.h"
+#include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "px4_offboard_lowlevel/smc_controller.h"
 #include "px4_offboard_lowlevel/st_smc_controller.h"
 
@@ -162,58 +163,6 @@ private:
                                                                double tilt_2_rad = 0.0);
     void px4Inverse (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
     void px4InverseSITL (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
-
-    inline Eigen::Vector3d rotateVectorFromToENU_NED(const Eigen::Vector3d& vec_in) {
-        // NED (X North, Y East, Z Down) & ENU (X East, Y North, Z Up)
-        Eigen::Vector3d vec_out;
-        vec_out << vec_in[1], vec_in[0], -vec_in[2];
-        return vec_out;
-    }
-
-    inline Eigen::Vector3d rotateVectorFromToFRD_FLU(const Eigen::Vector3d& vec_in) {
-        // FRD (X Forward, Y Right, Z Down) & FLU (X Forward, Y Left, Z Up)
-        Eigen::Vector3d vec_out;
-        vec_out << vec_in[0], -vec_in[1], -vec_in[2];
-        return vec_out;
-    }
-
-    inline Eigen::Quaterniond rotateQuaternionFromToENU_NED(const Eigen::Quaterniond& quat_in) {
-        // Transform from orientation represented in ROS format to PX4 format and back
-        //  * Two steps conversion:
-        //  * 1. aircraft to NED is converted to aircraft to ENU (NED_to_ENU conversion)
-        //  * 2. aircraft to ENU is converted to baselink to ENU (baselink_to_aircraft conversion)
-        // OR 
-        //  * 1. baselink to ENU is converted to baselink to NED (ENU_to_NED conversion)
-        //  * 2. baselink to NED is converted to aircraft to NED (aircraft_to_baselink conversion
-        // NED_ENU_Q Static quaternion needed for rotating between ENU and NED frames
-        Eigen::Vector3d euler_1(M_PI, 0.0, M_PI_2);
-        Eigen::Quaterniond NED_ENU_Q(Eigen::AngleAxisd(euler_1.z(), Eigen::Vector3d::UnitZ()) *
-            Eigen::AngleAxisd(euler_1.y(), Eigen::Vector3d::UnitY()) *
-            Eigen::AngleAxisd(euler_1.x(), Eigen::Vector3d::UnitX()));
-        
-        // AIRCRAFT_BASELINK_Q Static quaternion needed for rotating between aircraft and base_link frames
-        Eigen::Vector3d euler_2(M_PI, 0.0, 0.0);
-        Eigen::Quaterniond AIRCRAFT_BASELINK_Q(Eigen::AngleAxisd(euler_2.z(), Eigen::Vector3d::UnitZ()) *
-            Eigen::AngleAxisd(euler_2.y(), Eigen::Vector3d::UnitY()) *
-            Eigen::AngleAxisd(euler_2.x(), Eigen::Vector3d::UnitX()));
-        
-        return (NED_ENU_Q*quat_in)*AIRCRAFT_BASELINK_Q;
-    }
-
-    inline void eigenOdometryFromPX4Msg(const px4_msgs::msg::VehicleOdometry::SharedPtr msg,
-                                Eigen::Vector3d& position_W, Eigen::Quaterniond& orientation_B_W,
-                                Eigen::Vector3d& velocity_B, Eigen::Vector3d& angular_velocity_B) {
-
-        position_W = rotateVectorFromToENU_NED(Eigen::Vector3d(msg->position[0], msg->position[1], msg->position[2]));
-
-        Eigen::Quaterniond quaternion(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
-        orientation_B_W = rotateQuaternionFromToENU_NED(quaternion);
-
-        velocity_B = rotateVectorFromToENU_NED(Eigen::Vector3d(msg->velocity[0], msg->velocity[1], msg->velocity[2]));
-
-        angular_velocity_B = rotateVectorFromToFRD_FLU
-                                (Eigen::Vector3d(msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]));
-    }
 
     inline void eigenTrajectoryPointFromMsg(
         const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint& msg,

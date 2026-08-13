@@ -698,8 +698,8 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
         Eigen::Quaterniond orientation;
         Eigen::Vector3d angular_velocity;
         
-        eigenOdometryFromPX4Msg(odom_msg,
-                                position, orientation, velocity, angular_velocity);
+        px4_frames::eigenOdometryFromPX4Msg(odom_msg,
+                                            position, orientation, velocity, angular_velocity);
 
         controller_->setOdometry(position, orientation, velocity, angular_velocity);
 }

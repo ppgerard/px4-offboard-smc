@@ -43,9 +43,9 @@ private:
     // Publish the current trajectory setpoint (position, velocity, acceleration) to PX4 in NED frame
     px4_msgs::msg::TrajectorySetpoint setpoint{};
 
-    Eigen::Vector3d position_NED = rotateVectorFromToENU_NED(r_position_W_);
-    Eigen::Vector3d velocity_NED = rotateVectorFromToENU_NED(r_velocity_W_);
-    Eigen::Vector3d acceleration_NED = rotateVectorFromToENU_NED(r_acceleration_W_);
+    Eigen::Vector3d position_NED = px4_frames::rotateVectorFromToENU_NED(r_position_W_);
+    Eigen::Vector3d velocity_NED = px4_frames::rotateVectorFromToENU_NED(r_velocity_W_);
+    Eigen::Vector3d acceleration_NED = px4_frames::rotateVectorFromToENU_NED(r_acceleration_W_);
 
     setpoint.position[0] = position_NED(0);
     setpoint.position[1] = position_NED(1);
