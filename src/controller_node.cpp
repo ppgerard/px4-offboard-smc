@@ -548,7 +548,6 @@ void ControllerNode::commandPoseCallback(const geometry_msgs::msg::PoseStamped::
     Eigen::Quaterniond orientation;
     eigenTrajectoryPointFromPoseMsg(pose_msg, position, orientation);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
-    trajectory_received_ = true;
     controller_->setTrajectoryPoint(position, orientation);          // Send the command to controller_ obj
 }
 
@@ -560,7 +559,6 @@ void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::Multi
     Eigen::Vector3d angular_velocity;
     Eigen::Vector3d acceleration;
     eigenTrajectoryPointFromMsg(msg, position, orientation, velocity, angular_velocity, acceleration);
-    trajectory_received_ = true;
     controller_->setTrajectoryPoint(position, velocity, acceleration, orientation, angular_velocity);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
 }
@@ -581,14 +579,6 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
 
         controller_->setOdometry(position, orientation, velocity, angular_velocity);
         odometry_received_ = true;
-
-        // With no trajectory setpoint to track, hold the vehicle's own pose. The
-        // hold reference keeps following the vehicle until offboard is engaged,
-        // so that engaging offboard holds the pose the vehicle is at that moment
-        // rather than wherever it happened to be when this node started.
-        if (!trajectory_received_ && !inOffboardMode()) {
-            controller_->setTrajectoryPoint(position, orientation);
-        }
 }
 
 void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg) {
@@ -688,12 +678,6 @@ void ControllerNode::updateControllerOutput() {
             "Waiting for the first odometry message on '%s' before running the controller.",
             odometry_topic_.c_str());
         return;
-    }
-
-    if (!trajectory_received_) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-            "No trajectory setpoint received on '%s' yet: holding current pose.",
-            command_traj_topic_.c_str());
     }
 
     //  calculate controller output

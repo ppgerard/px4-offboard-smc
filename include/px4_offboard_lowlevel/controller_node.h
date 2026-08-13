@@ -80,7 +80,6 @@ private:
     rclcpp::TimerBase::SharedPtr offboardTimer;
     uint64_t last_odometry_timestamp_ = 0;
     bool odometry_received_ = false;
-    bool trajectory_received_ = false;
 
     // subscribers
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
@@ -135,10 +134,6 @@ private:
     
     px4_msgs::msg::VehicleStatus current_status_;
     bool connected_ = false;
-
-    inline bool inOffboardMode() const {
-        return current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD;
-    }
 
     void loadParams();
     void arm();
