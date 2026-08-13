@@ -67,27 +67,6 @@ public:
         phi_R = phi_r;
     }
 
-    // void setActualPosition(const Eigen::Vector3d &position_W) {
-    //     position_W_ = position_W;
-    // }
-
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
-    void setKPositionGain(const Eigen::Vector3d &PositionGain){
-        position_gain_ = PositionGain;
-    }
-    
-    void setKVelocityGain(const Eigen::Vector3d &VelocityGain){
-        velocity_gain_ = VelocityGain;
-    }
-    
-    void setKAttitudeGain(const Eigen::Vector3d &AttitudeGain){
-        attitude_gain_ = AttitudeGain;
-    }
-    
-    void setKAngularRateGain(const Eigen::Vector3d &AngularRateGain){
-        angular_rate_gain_ = AngularRateGain;
-    }
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 private:
     // SMC Controller Gains
@@ -97,13 +76,6 @@ private:
     Eigen::Vector3d Lambda_R;
     Eigen::Vector3d K_s_R;
     Eigen::Vector3d phi_R;
-
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
-    Eigen::Vector3d position_gain_;
-    Eigen::Vector3d velocity_gain_;
-    Eigen::Vector3d attitude_gain_;
-    Eigen::Vector3d angular_rate_gain_;
-    // ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
 };
 
 #endif //CONTROLLER_SMC_CONTROLLER_H

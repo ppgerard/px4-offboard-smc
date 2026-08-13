@@ -94,8 +94,6 @@ ControllerNode::ControllerNode()
             (command_traj_topic_, 10, std::bind(&ControllerNode::commandTrajectoryCallback, this, _1));
         servos_status_sub_ = this->create_subscription<px4_msgs::msg::ActuatorServos>
             (servos_status_topic_, qos, std::bind(&ControllerNode::servosStatusCallback, this, _1));
-        // platform_position_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>
-        //     ("landing/platform_position", 10, std::bind(&ControllerNode::platformPositionCallback, this, _1));
 
         // Publishers
         actuator_motors_publisher_ = this->create_publisher<px4_msgs::msg::ActuatorMotors>
@@ -124,7 +122,6 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.num_of_arms", 4);
     this->declare_parameter("uav_parameters.moment_constant", 0.0);
     this->declare_parameter("uav_parameters.thrust_constant", 0.0);
-    this->declare_parameter("uav_parameters.max_rotor_speed", 0);
     this->declare_parameter("uav_parameters.gravity", 0.0);
     this->declare_parameter("uav_parameters.pitch_trim_deg", 0.0);
     this->declare_parameter("uav_parameters.PWM_MIN", 0);
@@ -146,7 +143,6 @@ void ControllerNode::loadParams() {
     _num_of_arms = this->get_parameter("uav_parameters.num_of_arms").as_int();
     _moment_constant = this->get_parameter("uav_parameters.moment_constant").as_double();
     _thrust_constant = this->get_parameter("uav_parameters.thrust_constant").as_double();
-    _max_rotor_speed = this->get_parameter("uav_parameters.max_rotor_speed").as_int();
     double _gravity = this->get_parameter("uav_parameters.gravity").as_double();
     // Fixed pitch trim compensating a vehicle's natural mounting tilt (e.g. the
     // t2 tiltrotor). Zero by default so airframes that don't need it (e.g.
@@ -176,8 +172,6 @@ void ControllerNode::loadParams() {
     this->declare_parameter("topics_names.command_traj_topic", "default");
     this->declare_parameter("topics_names.odometry_topic", "default");
     this->declare_parameter("topics_names.status_topic", "default");
-    this->declare_parameter("topics_names.battery_status_topic", "default");
-    this->declare_parameter("topics_names.actuator_status_topic", "default");
     this->declare_parameter("topics_names.offboard_control_topic", "default");
     this->declare_parameter("topics_names.vehicle_command_topic", "default");
     this->declare_parameter("topics_names.actuator_control_topic", "default");
@@ -188,8 +182,6 @@ void ControllerNode::loadParams() {
     command_traj_topic_ = this->get_parameter("topics_names.command_traj_topic").as_string();
     odometry_topic_ = this->get_parameter("topics_names.odometry_topic").as_string();
     status_topic_ = this->get_parameter("topics_names.status_topic").as_string();
-    battery_status_topic_ = this->get_parameter("topics_names.battery_status_topic").as_string();
-    actuator_status_topic_ = this->get_parameter("topics_names.actuator_status_topic").as_string();
     offboard_control_topic_ = this->get_parameter("topics_names.offboard_control_topic").as_string();
     vehicle_command_topic_ = this->get_parameter("topics_names.vehicle_command_topic").as_string();
     actuator_control_topic_ = this->get_parameter("topics_names.actuator_control_topic").as_string();
@@ -331,37 +323,6 @@ void ControllerNode::loadParams() {
     RCLCPP_INFO(this->get_logger(), "Phi_R:    [%.2f, %.2f, %.2f]", phi_r(0), phi_r(1), phi_r(2));
     RCLCPP_INFO(this->get_logger(), "==================================");
 
-    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
-    this->declare_parameter("control_gains.K_p_x", 0.0);
-    this->declare_parameter("control_gains.K_p_y", 0.0);
-    this->declare_parameter("control_gains.K_p_z", 0.0);
-    this->declare_parameter("control_gains.K_v_x", 0.0);
-    this->declare_parameter("control_gains.K_v_y", 0.0);
-    this->declare_parameter("control_gains.K_v_z", 0.0);
-    this->declare_parameter("control_gains.K_R_x", 0.0);
-    this->declare_parameter("control_gains.K_R_y", 0.0);
-    this->declare_parameter("control_gains.K_R_z", 0.0);
-    this->declare_parameter("control_gains.K_w_x", 0.0);
-    this->declare_parameter("control_gains.K_w_y", 0.0);
-    this->declare_parameter("control_gains.K_w_z", 0.0);
-
-    position_gain_ << this->get_parameter("control_gains.K_p_x").as_double(),
-                      this->get_parameter("control_gains.K_p_y").as_double(),
-                      this->get_parameter("control_gains.K_p_z").as_double();
-
-    velocity_gain_ << this->get_parameter("control_gains.K_v_x").as_double(),
-                      this->get_parameter("control_gains.K_v_y").as_double(),
-                      this->get_parameter("control_gains.K_v_z").as_double();
-
-    attitude_gain_ << this->get_parameter("control_gains.K_R_x").as_double(),
-                      this->get_parameter("control_gains.K_R_y").as_double(),
-                      this->get_parameter("control_gains.K_R_z").as_double();
-
-    ang_vel_gain_ << this->get_parameter("control_gains.K_w_x").as_double(),
-                     this->get_parameter("control_gains.K_w_y").as_double(),
-                     this->get_parameter("control_gains.K_w_z").as_double();
-    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
-
     // Gains below are specific to the SMC control law.
     auto* smc_controller = static_cast<SmcController*>(controller_.get());
     smc_controller->setLambda(lambda);
@@ -370,11 +331,6 @@ void ControllerNode::loadParams() {
     smc_controller->setLambdaR(lambda_r);
     smc_controller->setKsR(k_s_r);
     smc_controller->setPhiR(phi_r);
-
-    smc_controller->setKPositionGain(position_gain_);
-    smc_controller->setKVelocityGain(velocity_gain_);
-    smc_controller->setKAttitudeGain(attitude_gain_);
-    smc_controller->setKAngularRateGain(ang_vel_gain_);
 }
 
 void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(double tilt_1_rad, double tilt_2_rad) {
@@ -678,15 +634,6 @@ void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::Multi
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
 }
 
-// void ControllerNode::platformPositionCallback(const geometry_msgs::msg::Vector3::SharedPtr pos_msg) {
-//     // Receive platform position feedback from landing_trajectory_node (Phase 2 only)
-//     // This is the estimated position of the platform in world frame, obtained from TF
-//     Eigen::Vector3d platform_position(pos_msg->x, pos_msg->y, pos_msg->z);
-//     controller_.setActualPosition(platform_position);
-//     RCLCPP_DEBUG(get_logger(), "Received platform position feedback: [%.3f, %.3f, %.3f]",
-//                  platform_position(0), platform_position(1), platform_position(2));
-// }
-
 void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg){
         //  Debug message
         RCLCPP_INFO_ONCE(get_logger(),"Controller got first odometry message.");
@@ -727,18 +674,6 @@ void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::S
 
 void ControllerNode::vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg){
     current_status_ = *status_msg;
-    // if (current_status_.arming_state ==2){
-    //     RCLCPP_INFO_ONCE(get_logger(),"ARMED - vehicle_status_msg.");
-    // }
-    // else {
-    //     RCLCPP_INFO(get_logger(),"NOT ARMED - vehicle_status_msg.");
-    // }
-    // if (current_status_.nav_state == 14){
-    //     RCLCPP_INFO_ONCE(get_logger(),"OFFBOARD - vehicle_status_msg.");
-    // }
-    // else {
-    //     RCLCPP_INFO(get_logger(),"NOT OFFBOARD - vehicle_status_msg.");
-    // }
 }
 
 void ControllerNode::publishActuatorMotorsMsg(const Eigen::VectorXd& throttles) {

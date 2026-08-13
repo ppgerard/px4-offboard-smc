@@ -86,8 +86,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr command_pose_sub_;
     rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr command_trajectory_sub_;
     rclcpp::Subscription<px4_msgs::msg::ActuatorServos>::SharedPtr servos_status_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr platform_position_sub_;
-    
+
     // Publishers
     rclcpp::Publisher<px4_msgs::msg::ActuatorMotors>::SharedPtr actuator_motors_publisher_;
     rclcpp::Publisher<px4_msgs::msg::ActuatorServos>::SharedPtr actuator_servos_publisher_;
@@ -100,8 +99,6 @@ private:
     std::string command_traj_topic_;
     std::string odometry_topic_;
     std::string status_topic_;
-    std::string battery_status_topic_;
-    std::string actuator_status_topic_;
     std::string servos_status_topic_;
     std::string offboard_control_topic_;
     std::string vehicle_command_topic_;
@@ -113,7 +110,6 @@ private:
     int _num_of_arms;
     double _moment_constant;
     double _thrust_constant;
-    double _max_rotor_speed;
     Eigen::Vector3d _omega_to_pwm_coefficients;
     int _PWM_MIN;
     int _PWM_MAX;
@@ -127,13 +123,6 @@ private:
     double measured_tilt_2_rad_ = 0.0;
     Eigen::MatrixXd torques_and_thrust_to_rotor_velocities_;
 
-    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
-    Eigen::Vector3d position_gain_;
-    Eigen::Vector3d velocity_gain_;
-    Eigen::Vector3d attitude_gain_;
-    Eigen::Vector3d ang_vel_gain_;
-    // ===== OLD LEE CONTROLLER GAINS (KEPT FOR SMC TUNING) =====
-
     // Logic switches
     bool in_sitl_mode_;
     
@@ -141,7 +130,6 @@ private:
     bool connected_ = false;
 
     void loadParams();
-    void secureConnection();
     void arm();
     void disarm();
 
@@ -151,7 +139,6 @@ private:
     void vehicle_odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg);
     void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg);
     void servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg);
-    void platformPositionCallback(const geometry_msgs::msg::Vector3::SharedPtr pos_msg);
 
     void publishActuatorMotorsMsg(const Eigen::VectorXd& throttles);
     void publishActuatorServosMsg(double tilt_1_rad, double tilt_2_rad);

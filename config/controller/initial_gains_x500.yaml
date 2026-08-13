@@ -27,20 +27,6 @@
         Phi_R_x: 0.35
         Phi_R_y: 0.35
         Phi_R_z: 0.3
-        # ===== OLD LEE CONTROLLER GAINS (NOW USED FOR TORQUE CALCULATION) =====
-        K_p_x: 7.00
-        K_p_y: 7.00
-        K_p_z: 6.00
-        K_v_x: 6.00
-        K_v_y: 6.00
-        K_v_z: 3.00
-        K_R_x: 3.5
-        K_R_y: 3.5
-        K_R_z: 0.3
-        K_w_x: 0.5
-        K_w_y: 0.5
-        K_w_z: 0.1
-        # ===== OLD LEE CONTROLLER GAINS (COMMENTED OUT - NO LONGER USED) =====
 
         # ===== STSMC (super-twisting) gains, only read when controller_type:=stsmc =====
         # UNTUNED starting point, deliberately conservative. Tune before real flight.
