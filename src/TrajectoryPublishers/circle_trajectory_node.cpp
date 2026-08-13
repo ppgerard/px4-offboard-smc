@@ -39,6 +39,7 @@
 #include <cmath>
 #include "rclcpp/rclcpp.hpp"
 #include "trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp"
+#include "px4_offboard_lowlevel/control_config.h"
 
 using namespace std::chrono_literals;
 
@@ -47,7 +48,8 @@ public:
   CirclePublisherNode() : Node("circle_publisher") {
     publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>("command/trajectory", 10);
 
-    timer_ = this->create_wall_timer(0.01s, std::bind(&CirclePublisherNode::publishCircleTrajectory, this));
+    timer_ = this->create_wall_timer(std::chrono::duration<double>(px4_offboard::kControlPeriodSeconds),
+                                     std::bind(&CirclePublisherNode::publishCircleTrajectory, this));
   }
 
 private:
@@ -58,7 +60,7 @@ private:
     double radius = 2.0;        // meters
     double altitude = 2.0;      // meters
     double angle_rate = 0.3;    // rad/s (angular velocity)
-    double dt = 0.01;           // seconds (100 Hz publishing rate)
+    double dt = px4_offboard::kControlPeriodSeconds;  // seconds (publishing rate)
     
     // Derived quantities (dependent on above)
     double angle_increment = angle_rate * dt;  // rad per step

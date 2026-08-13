@@ -48,16 +48,9 @@ void SmcController::calculateControllerOutput(
 
     controller_torque_thrust->resize(4);
 
-    const double dt = 0.01;
-
     // Trajectory tracking.
     double thrust;
     Eigen::Matrix3d R_d_w;
-
-    static Eigen::Matrix3d R_d_prev =
-    Eigen::Matrix3d::Identity();
-
-    static bool first_iteration = true;
 
     Eigen::Vector3d omega_ref = Eigen::Vector3d::Zero();
 
@@ -117,10 +110,10 @@ void SmcController::calculateControllerOutput(
         R_d_w = R_d_w * R_pitch;
     }
 
-    if (!first_iteration)
+    if (!first_iteration_)
     {
         Eigen::Matrix3d R_d_dot =
-            (R_d_w - R_d_prev) / dt;
+            (R_d_w - R_d_prev_) / dt_;
 
         Eigen::Matrix3d omega_hat =
             0.5 * (
@@ -135,10 +128,10 @@ void SmcController::calculateControllerOutput(
     }
     else
     {
-        first_iteration = false;
+        first_iteration_ = false;
     }
 
-    R_d_prev = R_d_w;
+    R_d_prev_ = R_d_w;
 
     
     Eigen::Quaterniond q_temp(R_d_w);

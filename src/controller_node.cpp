@@ -41,7 +41,8 @@ constexpr double kTiltMinDeg = -7.0;
 constexpr double kTiltMaxDeg = 90.0;
 constexpr double kDegToRad = M_PI / 180.0;
 constexpr double kRadToDeg = 180.0 / M_PI;
-constexpr double kTiltRateLimitRadPerStep = 90.0 * kDegToRad * 0.01;  // 90°/s at 100Hz
+constexpr double kTiltRateLimitRadPerStep =
+    90.0 * kDegToRad * px4_offboard::kControlPeriodSeconds;  // 90°/s
 
 // Tricopter (t2) arm geometry [m]. Shared by the allocation matrix and the
 // tau_z -> front-tilt computation, which must stay consistent with each other.
@@ -119,8 +120,8 @@ ControllerNode::ControllerNode()
             ("/landing/wrench", 10);
 
         // Timers
-        std::chrono::duration<double> offboard_period(0.33);        
-        std::chrono::duration<double> controller_period(0.01);        
+        std::chrono::duration<double> offboard_period(0.33);
+        std::chrono::duration<double> controller_period(px4_offboard::kControlPeriodSeconds);
         offboardTimer = this->create_wall_timer(offboard_period, [=]() {publishOffboardControlModeMsg();});
         controllerTimer = this->create_wall_timer(controller_period, [=]() {updateControllerOutput();});
     }

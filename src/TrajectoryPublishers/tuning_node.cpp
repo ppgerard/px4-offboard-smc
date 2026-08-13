@@ -39,6 +39,7 @@
 #include <cmath>
 #include "rclcpp/rclcpp.hpp"
 #include "trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp"
+#include "px4_offboard_lowlevel/control_config.h"
 #include <tf2/LinearMath/Quaternion.h>
 
 using namespace std::chrono_literals;
@@ -48,7 +49,8 @@ public:
   StepsPublisherNode() : Node("steps_publisher") {
     publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>("command/trajectory", 10);
 
-    timer_ = this->create_wall_timer(0.01s, std::bind(&StepsPublisherNode::publishTuningSteps, this));
+    timer_ = this->create_wall_timer(std::chrono::duration<double>(px4_offboard::kControlPeriodSeconds),
+                                     std::bind(&StepsPublisherNode::publishTuningSteps, this));
   }
 
 private:

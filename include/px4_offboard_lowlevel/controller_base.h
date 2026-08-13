@@ -37,6 +37,8 @@
 
 #include <eigen3/Eigen/Eigen>
 
+#include "px4_offboard_lowlevel/control_config.h"
+
 // Common interface for the position/attitude control laws (SMC, STSMC, ...).
 // Holds the vehicle parameters and current/reference state shared by every
 // control law; each law implements calculateControllerOutput() on top of it.
@@ -95,6 +97,15 @@ public:
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 protected:
+    // Control loop period, used for the numerical derivatives in the laws.
+    double dt_ = px4_offboard::kControlPeriodSeconds;
+
+    // Previous desired attitude and first-call guard, used to differentiate the
+    // desired attitude into a reference angular velocity. Per-instance so that
+    // several controllers can coexist (e.g. in tests) without sharing state.
+    Eigen::Matrix3d R_d_prev_ = Eigen::Matrix3d::Identity();
+    bool first_iteration_ = true;
+
     // UAV Parameter
     double _uav_mass;
     Eigen::Matrix3d _inertia_matrix;

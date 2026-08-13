@@ -53,16 +53,9 @@ void StSmcController::calculateControllerOutput(
 
     controller_torque_thrust->resize(4);
 
-    const double dt = 0.01;
-
     // Trajectory tracking.
     double thrust;
     Eigen::Matrix3d R_d_w;
-
-    static Eigen::Matrix3d R_d_prev =
-    Eigen::Matrix3d::Identity();
-
-    static bool first_iteration = true;
 
     Eigen::Vector3d omega_ref = Eigen::Vector3d::Zero();
 
@@ -88,7 +81,7 @@ void StSmcController::calculateControllerOutput(
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 + u_sta;
 
-    w_ += -K2.cwiseProduct(sign_s) * dt;
+    w_ += -K2.cwiseProduct(sign_s) * dt_;
 
     thrust = I_a_d.norm();
     Eigen::Vector3d B_z_d;
@@ -111,10 +104,10 @@ void StSmcController::calculateControllerOutput(
         R_d_w = R_d_w * R_pitch;
     }
 
-    if (!first_iteration)
+    if (!first_iteration_)
     {
         Eigen::Matrix3d R_d_dot =
-            (R_d_w - R_d_prev) / dt;
+            (R_d_w - R_d_prev_) / dt_;
 
         Eigen::Matrix3d omega_hat =
             0.5 * (
@@ -129,10 +122,10 @@ void StSmcController::calculateControllerOutput(
     }
     else
     {
-        first_iteration = false;
+        first_iteration_ = false;
     }
 
-    R_d_prev = R_d_w;
+    R_d_prev_ = R_d_w;
 
 
     Eigen::Quaterniond q_temp(R_d_w);
@@ -165,7 +158,7 @@ void StSmcController::calculateControllerOutput(
         - _inertia_matrix * Lambda_R.cwiseProduct(e_R_dot)
         + u_sta_R;
 
-    w_R_ += -K2_R.cwiseProduct(sign_sR) * dt;
+    w_R_ += -K2_R.cwiseProduct(sign_sR) * dt_;
 
     // Output the wrench
     *controller_torque_thrust << tau, thrust;

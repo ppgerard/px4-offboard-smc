@@ -25,6 +25,7 @@
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
+#include "px4_offboard_lowlevel/control_config.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
 
@@ -79,7 +80,8 @@ public:
     diagnostics_ = std::make_unique<DiagnosticsPublisher>(this);
 
     // Timer: 100 Hz (0.01 s)
-    timer_ = this->create_wall_timer(0.01s, std::bind(&LandingTrajectoryNodeBase::publishLandingTrajectory, this));
+    timer_ = this->create_wall_timer(std::chrono::duration<double>(px4_offboard::kControlPeriodSeconds),
+                                     std::bind(&LandingTrajectoryNodeBase::publishLandingTrajectory, this));
 
     // Initialize frequency monitoring
     last_callback_time_ = std::chrono::high_resolution_clock::now();
@@ -125,7 +127,7 @@ protected:
 
   // Control parameters
   const double K_p_ = 1.0;              // Position gain
-  const double dt_ = 0.01;              // Time step (seconds)
+  const double dt_ = px4_offboard::kControlPeriodSeconds;  // Time step (seconds)
   const double xy_error_threshold_ = 0.3; // 30cm threshold for XY error
   const double tag_visibility_min_time_ = 0.5; // 0.5s minimum tag visibility
   const double xy_error_min_time_ = 0.5;      // 0.5s minimum XY error below threshold
