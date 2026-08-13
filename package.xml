@@ -9,14 +9,16 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>trajectory_msgs</build_depend>
   <build_depend>rclcpp</build_depend>
   <build_depend>std_msgs</build_depend>
-  <build_depend>dynamic_reconfigure</build_depend>
   <build_depend>tf2</build_depend>
   <build_depend>tf2_ros</build_depend>
   <build_depend>px4_msgs</build_depend>
+  <depend>eigen</depend>
+  <depend>tf2_geometry_msgs</depend>
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
   <depend>visualization_msgs</depend>
