@@ -43,6 +43,16 @@ constexpr double kDegToRad = M_PI / 180.0;
 constexpr double kRadToDeg = 180.0 / M_PI;
 constexpr double kTiltRateLimitRadPerStep = 90.0 * kDegToRad * 0.01;  // 90°/s at 100Hz
 
+// Tricopter (t2) arm geometry [m]. Shared by the allocation matrix and the
+// tau_z -> front-tilt computation, which must stay consistent with each other.
+constexpr double kTricopterArm1X = 0.1815;
+constexpr double kTricopterArm1Y = 0.22;
+constexpr double kTricopterArm2X = 0.1815;
+constexpr double kTricopterArm2Y = 0.22;
+constexpr double kTricopterArm3X = 0.4185;
+constexpr double kTricopterArm1Z = 0.0;
+constexpr double kTricopterArm2Z = 0.0;
+
 double servoNormToTiltRad(double norm)
 {
     const double clamped_norm = std::clamp(norm, -1.0, 1.0);
@@ -341,13 +351,13 @@ void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(doubl
         // Tau_z is intentionally handled by a separate loop.
         rotor_velocities_to_torques_and_thrust.resize(3, 3);
 
-        double l_1_x = 0.1815;
-        double l_1_y = 0.22;
-        double l_2_x = 0.1815;
-        double l_2_y = 0.22;
-        double l_3_x = 0.4185;
-        double l_1_z = 0.0;
-        double l_2_z = 0.0;
+        const double l_1_x = kTricopterArm1X;
+        const double l_1_y = kTricopterArm1Y;
+        const double l_2_x = kTricopterArm2X;
+        const double l_2_y = kTricopterArm2Y;
+        const double l_3_x = kTricopterArm3X;
+        const double l_1_z = kTricopterArm1Z;
+        const double l_2_z = kTricopterArm2Z;
 
         const double c_1 = std::cos(tilt_1_rad);
         const double c_2 = std::cos(tilt_2_rad);
@@ -392,41 +402,19 @@ void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(doubl
         return;
     }
 
-    std::cout << "[controller] Unknown UAV parameter num_of_arms. Cannot calculate control matrices\n";
+    RCLCPP_ERROR(this->get_logger(),
+        "Unsupported uav_parameters.num_of_arms = %d (supported: 3, 4). Control allocation not computed.",
+        _num_of_arms);
 }
 
-void ControllerNode::px4Inverse
-    (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench) {
-    Eigen::VectorXd omega;
-    Eigen::VectorXd pwm;
-    Eigen::VectorXd ones_temp;
-    if (_num_of_arms == 3){
-        omega.resize(3);
-        omega.setZero();
-        pwm.resize(3);
-        pwm.setZero();
-        throttles->resize(3);
-        throttles->setZero();
-        ones_temp.resize(3);
-        ones_temp = Eigen::VectorXd::Ones(3,1);
-    }
-    else if (_num_of_arms == 4){
-        omega.resize(4);
-        omega.setZero();
-        pwm.resize(4);
-        pwm.setZero();
-        throttles->resize(4);
-        throttles->setZero();
-        ones_temp.resize(4);
-        ones_temp = Eigen::VectorXd::Ones(4,1);
-    }
-    else {
-        std::cout<<("[controller] Unknown UAV parameter num_of_arms. Cannot calculate control matrices\n");
-    }
-    // Control allocation: Wrench to rotor squared speeds (omega holds omega^2 before sqrt)
+// Control allocation: wrench -> rotor speeds [rad/s]. For the tricopter this
+// also computes the commanded front-tilt from the desired tau_z. Shared by both
+// the hardware (PWM) and SITL mappings below; returns false and leaves *omega
+// empty when the airframe is not supported.
+bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen::VectorXd *omega) {
     if (_num_of_arms == 3) {
         Eigen::Vector3d reduced_wrench;
-        reduced_wrench << (*wrench)(0), (*wrench)(1), (*wrench)(3);
+        reduced_wrench << wrench(0), wrench(1), wrench(3);
         Eigen::Vector3d omega_sq = torques_and_thrust_to_rotor_velocities_ * reduced_wrench;
 
         // Safety: clamp negative values to zero
@@ -436,47 +424,62 @@ void ControllerNode::px4Inverse
             }
         }
 
-        // Compute front-tilt from desired tau_z using user formula
-        // tau_z_0 = moment_constant * _thrust_constant *(-omega1^2 + omega2^2 - omega3^2)
+        // Compute front-tilt from desired tau_z:
+        // tau_z_0 = moment_constant * thrust_constant * (-omega1^2 + omega2^2 - omega3^2)
         // tilt = (tau_z_desired - tau_z_0) / (thrust_constant*(l1y*omega1^2 + l2y*omega2^2))
-
-        double tau_z_desired = (*wrench)(2);
-        double tau_z_0 = _moment_constant * _thrust_constant * (-omega_sq[0] + omega_sq[1] - omega_sq[2]);
-
-        // arm y lever arms (match values in compute_ControlAllocation_and_ActuatorEffect_matrices)
-        const double l1y = 0.22;
-        const double l2y = 0.22;
-
-        double denom = _thrust_constant * (l1y * omega_sq[0] + l2y * omega_sq[1]);
+        const double tau_z_desired = wrench(2);
+        const double tau_z_0 = _moment_constant * _thrust_constant * (-omega_sq[0] + omega_sq[1] - omega_sq[2]);
+        const double denom = _thrust_constant * (kTricopterArm1Y * omega_sq[0] + kTricopterArm2Y * omega_sq[1]);
         double computed_tilt_rad = 0.0;
         if (std::abs(denom) > 1e-9) {
             computed_tilt_rad = (tau_z_desired - tau_z_0) / denom;
         }
 
         // Keep physical angles in radians internally; convert to normalized only when publishing.
-        double tilt_1_desired = std::clamp(computed_tilt_rad, kTiltMinDeg * kDegToRad, -kTiltMinDeg * kDegToRad);
-        
-        // Apply rate limiting with static variables
-        static double tilt_1_prev = 0.0;
-        double delta = std::clamp(tilt_1_desired - tilt_1_prev, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
-        tilt_1_rad_ = tilt_1_prev + delta;
-        tilt_1_prev = tilt_1_rad_;
+        const double tilt_1_desired = std::clamp(computed_tilt_rad, kTiltMinDeg * kDegToRad, -kTiltMinDeg * kDegToRad);
+
+        // Rate limiting
+        const double delta = std::clamp(tilt_1_desired - tilt_1_prev_, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
+        tilt_1_rad_ = tilt_1_prev_ + delta;
+        tilt_1_prev_ = tilt_1_rad_;
         tilt_2_rad_ = -tilt_1_rad_;
 
-        // finalize omega (take sqrt)
-        omega = omega_sq.cwiseSqrt();
-    } else {
-        omega = torques_and_thrust_to_rotor_velocities_ * (*wrench);
-        for (int i = 0; i < omega.size(); i++){
-            if (omega[i] <= 0){
-                omega[i] = 0.0;
+        *omega = omega_sq.cwiseSqrt();
+        return true;
+    }
+
+    if (_num_of_arms == 4) {
+        Eigen::VectorXd omega_sq = torques_and_thrust_to_rotor_velocities_ * wrench;
+        // Safety: clamp negative values to zero (prevents NaN from sqrt of negative)
+        for (int i = 0; i < omega_sq.size(); i++){
+            if (omega_sq[i] <= 0){
+                omega_sq[i] = 0.0;
             }
         }
-        // convert omega^2 to omega (rad/s) for PWM mapping
-        omega = omega.cwiseSqrt();
+        *omega = omega_sq.cwiseSqrt();
+        return true;
     }
-    pwm = (_omega_to_pwm_coefficients(0) * omega.cwiseProduct(omega)) + (_omega_to_pwm_coefficients(1) * omega) +
-          (_omega_to_pwm_coefficients(2) * ones_temp);
+
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Unsupported uav_parameters.num_of_arms = %d (supported: 3, 4). Not commanding actuators.",
+        _num_of_arms);
+    omega->resize(0);
+    return false;
+}
+
+void ControllerNode::px4Inverse
+    (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench) {
+    Eigen::VectorXd omega;
+    if (!computeRotorVelocities(*wrench, &omega)) {
+        throttles->resize(0);
+        return;
+    }
+
+    // Map rotor speed to PWM with the identified rotor curve, then normalize.
+    const Eigen::VectorXd ones_temp = Eigen::VectorXd::Ones(omega.size());
+    const Eigen::VectorXd pwm =
+        (_omega_to_pwm_coefficients(0) * omega.cwiseProduct(omega)) + (_omega_to_pwm_coefficients(1) * omega) +
+        (_omega_to_pwm_coefficients(2) * ones_temp);
     *throttles = (pwm - (_PWM_MIN * ones_temp));
     *throttles /= (_PWM_MAX - _PWM_MIN);
 }
@@ -484,88 +487,13 @@ void ControllerNode::px4Inverse
 void ControllerNode::px4InverseSITL
     (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench) {
     Eigen::VectorXd omega;
-    Eigen::VectorXd ones_temp;
-    if (_num_of_arms == 3){
-        omega.resize(3);
-        omega.setZero();
-        throttles->resize(3);
-        throttles->setZero();
-        ones_temp.resize(3);
-        ones_temp = Eigen::VectorXd::Ones(3,1);
+    if (!computeRotorVelocities(*wrench, &omega)) {
+        throttles->resize(0);
+        return;
     }
-    else if (_num_of_arms == 6){
-        omega.resize(6);
-        omega.setZero();
-        throttles->resize(6);
-        throttles->setZero();
-        ones_temp.resize(6);
-        ones_temp = Eigen::VectorXd::Ones(6,1);
-    }
-    else if (_num_of_arms == 4){
-        omega.resize(4);
-        omega.setZero();
-        throttles->resize(4);
-        throttles->setZero();
-        ones_temp.resize(4);
-        ones_temp = Eigen::VectorXd::Ones(4,1);
-    }
-    else if (_num_of_arms == 44){
-        omega.resize(8);
-        omega.setZero();
-        throttles->resize(8);
-        throttles->setZero();
-        ones_temp.resize(8);
-        ones_temp = Eigen::VectorXd::Ones(8,1);
-    }
-    else {
-        std::cout<<("[controller] Unknown UAV parameter num_of_arms. Cannot calculate control matrices\n");
-    }
-    // Control allocation: Wrench to Rotational velocities (omega)
-    if (_num_of_arms == 3) {
-        Eigen::Vector3d reduced_wrench;
-        reduced_wrench << (*wrench)(0), (*wrench)(1), (*wrench)(3);
-        Eigen::Vector3d omega_sq = torques_and_thrust_to_rotor_velocities_ * reduced_wrench;
 
-        // Safety: clamp negative values to zero
-        for (int i = 0; i < omega_sq.size(); i++){
-            if (omega_sq[i] <= 0){
-                omega_sq[i] = 0.0;
-            }
-        }
-
-        // Compute front-tilt using same law as in px4Inverse
-
-        double tau_z_desired = (*wrench)(2);
-        double tau_z_0 = _moment_constant * _thrust_constant * (-omega_sq[0] + omega_sq[1] - omega_sq[2]);
-        const double l1y = 0.22;
-        const double l2y = 0.22;
-        double denom = _thrust_constant * (l1y * omega_sq[0] + l2y * omega_sq[1]);
-        double computed_tilt_rad = 0.0;
-        if (std::abs(denom) > 1e-9) {
-            computed_tilt_rad = (tau_z_desired - tau_z_0) / denom;
-        }
-        
-        double tilt_1_desired = std::clamp(computed_tilt_rad, kTiltMinDeg * kDegToRad, -kTiltMinDeg * kDegToRad);
-        
-        // Apply rate limiting with static variables
-        static double tilt_1_prev = 0.0;
-        double delta = std::clamp(tilt_1_desired - tilt_1_prev, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
-        tilt_1_rad_ = tilt_1_prev + delta;
-        tilt_1_prev = tilt_1_rad_;
-        tilt_2_rad_ = -tilt_1_rad_;
-
-        omega = omega_sq.cwiseSqrt();
-    } else {
-        omega = torques_and_thrust_to_rotor_velocities_ * (*wrench);
-        // Safety: Clamp negative rotor velocities to zero (prevents NaN from sqrt of negative)
-        for (int i = 0; i < omega.size(); i++){
-            if (omega[i] <= 0){
-                omega[i] = 0.0;
-            }
-        }
-        // convert omega^2 to omega (rad/s) for SITL mapping
-        omega = omega.cwiseSqrt();
-    }
+    // Gazebo takes the rotor speed normalized over the engine-control range.
+    const Eigen::VectorXd ones_temp = Eigen::VectorXd::Ones(omega.size());
     *throttles = (omega - (_SIM_GZ_EC_MIN * ones_temp));
     *throttles /= (_SIM_GZ_EC_MAX - _SIM_GZ_EC_MIN);
 }
@@ -757,6 +685,10 @@ void ControllerNode::updateControllerOutput() {
     Eigen::VectorXd throttles;
     if (in_sitl_mode_) px4InverseSITL(&throttles, &controller_output);
     else px4Inverse(&throttles, &controller_output);
+
+    if (throttles.size() == 0) {
+        return;  // unsupported airframe, already reported by computeRotorVelocities()
+    }
 
     // Publish the controller output
     if (current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {

@@ -118,6 +118,8 @@ private:
     // commanded tilt angles (radians) computed by the controller and published
     double tilt_1_rad_ = 0.0;
     double tilt_2_rad_ = 0.0;
+    // previous commanded front-tilt, used by the tilt rate limiter
+    double tilt_1_prev_ = 0.0;
     // measured tilt angles (radians) read from servos feedback, used for allocation
     double measured_tilt_1_rad_ = 0.0;
     double measured_tilt_2_rad_ = 0.0;
@@ -151,6 +153,7 @@ private:
 
     void compute_ControlAllocation_and_ActuatorEffect_matrices(double tilt_1_rad = 0.0,
                                                                double tilt_2_rad = 0.0);
+    bool computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen::VectorXd *omega);
     void px4Inverse (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
     void px4InverseSITL (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
 
