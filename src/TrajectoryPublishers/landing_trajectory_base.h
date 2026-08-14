@@ -6,6 +6,12 @@
 // tag correction), and the 4-phase approach/descent/commit/touchdown state
 // machine.
 //
+// The tag supplies the translation and the in-plane yaw; the attitude used to
+// resolve that translation into world axes comes from the EKF, not from the
+// tag. Two concentric markers give the pose solve no baseline, so its
+// out-of-plane rotation is the one output that cannot be trusted — see
+// updateTagPosition().
+//
 // The vision loop stays closed all the way to the ground: PX4's NAV_LAND is
 // never used, because it descends on PX4's own position estimate with no
 // knowledge of the tag. Below the commit altitude the XY reference is frozen
@@ -19,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <cmath>
 #include "rclcpp/rclcpp.hpp"
@@ -212,16 +219,21 @@ protected:
   Eigen::Vector3d r_cam_b_b_;  // position of camera in body frame, expressed in body frame
 
   // Transformation matrices (constant)
-  // R_plat_world: transforms from world to platform frame (identity since tag is at origin)
-  Eigen::Matrix3d R_plat_world_ = Eigen::Matrix3d::Identity();
-
   // R_b_cam: fixed transformation from camera to body (-90° around z, then 180° around x)
   Eigen::Matrix3d R_b_cam_;
 
   // Transformation state (updated from TF)
-  Eigen::Matrix3d R_plat_cam_;          // Rotation: platform w.r.t. camera (from TF)
+  Eigen::Matrix3d R_plat_cam_;          // Rotation: platform w.r.t. camera (from TF; yaw only)
   Eigen::Vector3d r_plat_cam_cam_;      // Position: platform in camera frame (from TF)
   Eigen::Vector3d position_W_filtered_; // Filtered platform position in world frame
+
+  // ---- Platform yaw ----------------------------------------------------------
+  // The one rotational quantity the tag is kept for. Filtered hard: the platform
+  // is static, so anything moving fast in this signal is noise.
+  const double lpf_alpha_platform_yaw_ = 0.02;  // per tag measurement (~15 Hz)
+  double platform_yaw_raw_ = 0.0;               // [rad], world frame
+  double platform_yaw_filtered_ = 0.0;          // [rad], world frame
+  bool platform_yaw_initialized_ = false;
 
   // Current phase
   Phase phase_;
@@ -294,6 +306,23 @@ protected:
   Eigen::Quaterniond drone_orientation_W_;
   Eigen::Vector3d drone_angular_velocity_W_;
   uint64_t last_odometry_timestamp_ = 0;
+
+  // ---- Attitude history -------------------------------------------------------
+  // The tag translation is stamped at image capture, but drone_orientation_W_ is
+  // whatever arrived most recently. Rotating an old translation by a new attitude
+  // would put the vision latency straight back in as an attitude error — which is
+  // the error this node now takes the EKF attitude to avoid. Keep a short history
+  // and interpolate to the measurement's own stamp instead.
+  //
+  // Stamped with the arrival time on the node clock, not with the PX4 timestamp
+  // in the message: that one is microseconds since flight-controller boot, and
+  // would not be comparable with the ROS-clock stamps on the TF.
+  struct AttitudeSample {
+    rclcpp::Time time;
+    Eigen::Quaterniond orientation;
+  };
+  std::deque<AttitudeSample> attitude_history_;
+  const double attitude_history_length_ = 1.0;  // history retained [s]
 
   // Groundtruth state for diagnostics
   Eigen::Vector3d groundtruth_position_W_;
@@ -789,6 +818,66 @@ protected:
                 px4_confirms_landed ? "Plain" : "Forced", disarm_attempts_);
   }
 
+  // Vehicle attitude at `time`, interpolated from the odometry history. Returns
+  // false only when there is no history at all. Outside the buffered range it
+  // clamps rather than extrapolates: a stamp a few milliseconds past the newest
+  // sample is the normal case, and the nearest attitude is the right answer for
+  // it; a stamp older than the whole buffer means the measurement is far too
+  // stale to be worth a better one.
+  bool attitudeAt(const rclcpp::Time& time, Eigen::Quaterniond& orientation) const {
+    if (attitude_history_.empty()) {
+      return false;
+    }
+    if (time <= attitude_history_.front().time) {
+      orientation = attitude_history_.front().orientation;
+      return true;
+    }
+    if (time >= attitude_history_.back().time) {
+      orientation = attitude_history_.back().orientation;
+      return true;
+    }
+    // Samples arrive in order, so the history is sorted: bracket `time` and slerp.
+    const auto after = std::lower_bound(
+        attitude_history_.begin(), attitude_history_.end(), time,
+        [](const AttitudeSample& sample, const rclcpp::Time& t) { return sample.time < t; });
+    const AttitudeSample& before = *(after - 1);
+    const double span = (after->time - before.time).seconds();
+    const double ratio = span > 0.0 ? (time - before.time).seconds() / span : 0.0;
+    orientation = before.orientation.slerp(ratio, after->orientation);
+    return true;
+  }
+
+  static double wrapToPi(double angle) {
+    return std::remainder(angle, 2.0 * M_PI);
+  }
+
+  // In-plane platform yaw — the one rotational quantity two concentric tags do
+  // observe well, because it is a rotation within the marker plane and so is not
+  // touched by the planar ambiguity that spoils the out-of-plane tilt. Recovered
+  // by taking the tag orientation into world axes through the same EKF attitude
+  // the position now uses, then filtered hard: the platform is static, so
+  // anything fast in this signal is noise.
+  //
+  // Nothing steers on it yet — the published setpoint yaw is still identity. This
+  // is the measurement the yaw-alignment work (roadmap item 13) will slew
+  // towards, and in the meantime it is a free end-to-end check on the rest of the
+  // chain: with the tag at the world origin it should read 0.
+  void updatePlatformYaw(const Eigen::Matrix3d& R_W_B) {
+    const Eigen::Matrix3d R_W_plat = R_W_B * R_b_cam_ * R_plat_cam_;
+    platform_yaw_raw_ = std::atan2(R_W_plat(1, 0), R_W_plat(0, 0));
+
+    if (!platform_yaw_initialized_) {
+      platform_yaw_filtered_ = platform_yaw_raw_;
+      platform_yaw_initialized_ = true;
+      return;
+    }
+    // Filter the wrapped difference so the estimate does not take the long way
+    // round when the raw yaw crosses +/-pi.
+    platform_yaw_filtered_ = wrapToPi(
+        platform_yaw_filtered_ +
+        lpf_alpha_platform_yaw_ * wrapToPi(platform_yaw_raw_ - platform_yaw_filtered_));
+  }
+
   bool updateTagPosition() {
     try {
       // Get transformation from camera_link to platform
@@ -814,11 +903,45 @@ protected:
       );
       R_plat_cam_ = quat.toRotationMatrix();
 
-      // Apply coordinate transformation:
-      // r_b_world_world = -R_plat_world^T * R_plat_cam * (r_plat_cam_cam + R_b_cam^T * r_cam_b_b)
-      Eigen::Vector3d r_plat_b_cam = r_plat_cam_cam_ + R_b_cam_.transpose() * r_cam_b_b_;
-      Eigen::Vector3d r_plat_b_plat = R_plat_cam_.transpose() * r_plat_b_cam;
-      position_W_raw_ = -R_plat_world_.transpose() * r_plat_b_plat;
+      // Pair the measurement with the vehicle attitude at its own timestamp.
+      const rclcpp::Time measurement_stamp(transform.header.stamp,
+                                           this->get_clock()->get_clock_type());
+      Eigen::Quaterniond orientation_at_measurement;
+      if (!attitudeAt(measurement_stamp, orientation_at_measurement)) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Tag transform available but no vehicle attitude history yet; "
+                             "skipping the update.");
+        return false;
+      }
+      const double measurement_age = (this->now() - measurement_stamp).seconds();
+      if (measurement_age > attitude_history_length_) {
+        // Clamped to the oldest attitude held. The guidance freshness gates
+        // (cone_tag_max_age_, commit_tag_max_age_) will already be rejecting a
+        // measurement this stale, so this is a symptom worth seeing rather than
+        // a case worth handling.
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Tag measurement is %.2f s old, beyond the %.1f s attitude history.",
+                             measurement_age, attitude_history_length_);
+      }
+      const Eigen::Matrix3d R_W_B = orientation_at_measurement.toRotationMatrix();
+
+      // Resolve the tag translation into world axes with the EKF attitude rather
+      // than with the PnP rotation:
+      //
+      //   position_W_raw_ = -R_W_B * (R_B_C * r_plat_cam_cam_ + r_cam_b_b_)
+      //
+      // Rotating through R_plat_cam_ (as this did) is algebraically identical
+      // whenever the PnP rotation is exact, and it carried the vehicle attitude
+      // implicitly, so it needed nothing from the EKF. But it multiplies the
+      // translation by the least reliable output of monocular tag pose. With two
+      // concentric markers the solve has no baseline, so its out-of-plane tilt is
+      // where the planar ambiguity lives: it can wobble or flip by degrees between
+      // frames while the translation stays put, and at 2 m every degree is ~3.5 cm
+      // of position noise injected into an otherwise clean measurement. The EKF
+      // attitude is IMU-driven and an order of magnitude better. See §02 of the
+      // review artifact linked from CLAUDE.md.
+      const Eigen::Vector3d r_plat_b_b = R_b_cam_ * r_plat_cam_cam_ + r_cam_b_b_;
+      position_W_raw_ = -(R_W_B * r_plat_b_b);
 
       // Apply low-pass filter to position to avoid jumps
       position_W_filtered_ = applyLowPassFilter(position_W_raw_, position_W_filtered_, lpf_alpha_);
@@ -832,6 +955,7 @@ protected:
         last_tag_update_time_ = this->now();
         tag_measurement_received_ = true;
         correctFusedPositionWithTag(position_W_);
+        updatePlatformYaw(R_W_B);
       }
 
       return true;
@@ -909,6 +1033,9 @@ protected:
 
     // Publish raw tag position
     diagnostics_->publishPositionRaw(groundtruth_position_W_ - position_W_filtered_, last_odometry_timestamp_);
+
+    // Publish the in-plane platform yaw taken from the tag
+    diagnostics_->publishPlatformYaw(platform_yaw_filtered_, platform_yaw_raw_, last_odometry_timestamp_);
   }
 
   void landDetectedCallback(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg) {
@@ -946,6 +1073,15 @@ protected:
     drone_orientation_W_ = orientation;
     drone_angular_velocity_W_ = angular_velocity;
     last_odometry_timestamp_ = odom_msg->timestamp;
+
+    // Retain a short attitude history so a tag measurement can be resolved with
+    // the attitude at its own stamp rather than the newest one available.
+    const rclcpp::Time arrival_time = this->now();
+    attitude_history_.push_back({arrival_time, orientation});
+    while (!attitude_history_.empty() &&
+           (arrival_time - attitude_history_.front().time).seconds() > attitude_history_length_) {
+      attitude_history_.pop_front();
+    }
 
     // Initialize trajectory reference to current drone position on first message
     if (!trajectory_initialized_) {

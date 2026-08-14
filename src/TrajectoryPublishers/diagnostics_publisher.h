@@ -17,6 +17,7 @@ public:
     phase_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/phase", 10);
     estimated_position_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/estimated_position", 10);
     position_raw_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/position_raw", 10);
+    platform_yaw_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/platform_yaw", 10);
   }
 
   // Publish current odometry state
@@ -121,6 +122,18 @@ public:
     position_raw_pub_->publish(pos_msg);
   }
 
+  // Publish the in-plane platform yaw taken from the tag: filtered and raw, so
+  // the pair shows how much of the raw signal is noise. Radians, world frame.
+  void publishPlatformYaw(double yaw_filtered, double yaw_raw, uint64_t timestamp) {
+    geometry_msgs::msg::Vector3Stamped yaw_msg;
+    yaw_msg.header.stamp = rclcpp::Time(timestamp * 1000);
+    yaw_msg.header.frame_id = "world";
+    yaw_msg.vector.x = yaw_filtered;
+    yaw_msg.vector.y = yaw_raw;
+    yaw_msg.vector.z = 0.0;
+    platform_yaw_pub_->publish(yaw_msg);
+  }
+
 private:
   rclcpp::Node* node_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
@@ -128,6 +141,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr phase_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr estimated_position_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr position_raw_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr platform_yaw_pub_;
 };
 
 #endif  // DIAGNOSTICS_PUBLISHER_H
