@@ -323,6 +323,8 @@ protected:
   };
   std::deque<AttitudeSample> attitude_history_;
   const double attitude_history_length_ = 1.0;  // history retained [s]
+  // An "age" beyond this is not a late measurement, it is a different clock.
+  static constexpr double kImplausibleMeasurementAge = 3600.0;  // [s]
 
   // Groundtruth state for diagnostics
   Eigen::Vector3d groundtruth_position_W_;
@@ -818,19 +820,22 @@ protected:
                 px4_confirms_landed ? "Plain" : "Forced", disarm_attempts_);
   }
 
-  // Vehicle attitude at `time`, interpolated from the odometry history. Returns
-  // false only when there is no history at all. Outside the buffered range it
-  // clamps rather than extrapolates: a stamp a few milliseconds past the newest
-  // sample is the normal case, and the nearest attitude is the right answer for
-  // it; a stamp older than the whole buffer means the measurement is far too
-  // stale to be worth a better one.
+  // Vehicle attitude at `time`, interpolated from the odometry history.
+  //
+  // Returns false when the stamp cannot be resolved against the history, which
+  // means the caller must fall back rather than use whatever is nearest. A stamp
+  // a few milliseconds past the newest sample is the normal case and clamps to
+  // it; a stamp that predates the whole buffer is not a stale measurement to be
+  // approximated but a stamp that cannot be trusted, and clamping to the oldest
+  // attitude held would quietly resolve every measurement with a second-old
+  // rotation. That corrupts the estimate far more than using the latest attitude
+  // would, so it is refused here and handled explicitly at the call site.
   bool attitudeAt(const rclcpp::Time& time, Eigen::Quaterniond& orientation) const {
     if (attitude_history_.empty()) {
       return false;
     }
-    if (time <= attitude_history_.front().time) {
-      orientation = attitude_history_.front().orientation;
-      return true;
+    if (time < attitude_history_.front().time) {
+      return false;
     }
     if (time >= attitude_history_.back().time) {
       orientation = attitude_history_.back().orientation;
@@ -908,20 +913,41 @@ protected:
                                            this->get_clock()->get_clock_type());
       Eigen::Quaterniond orientation_at_measurement;
       if (!attitudeAt(measurement_stamp, orientation_at_measurement)) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "Tag transform available but no vehicle attitude history yet; "
-                             "skipping the update.");
-        return false;
-      }
-      const double measurement_age = (this->now() - measurement_stamp).seconds();
-      if (measurement_age > attitude_history_length_) {
-        // Clamped to the oldest attitude held. The guidance freshness gates
-        // (cone_tag_max_age_, commit_tag_max_age_) will already be rejecting a
-        // measurement this stale, so this is a symptom worth seeing rather than
-        // a case worth handling.
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "Tag measurement is %.2f s old, beyond the %.1f s attitude history.",
-                             measurement_age, attitude_history_length_);
+        // No usable stamp, so pair with the newest attitude instead. That is the
+        // naive version of this fusion: it gives up latency compensation and
+        // nothing else, which is a far smaller error than resolving the tag with
+        // a second-old rotation. The estimate stays usable and the descent keeps
+        // working; only the item 3 refinement is lost.
+        if (attitude_history_.empty()) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                               "Tag transform available but no vehicle attitude yet; "
+                               "skipping the update.");
+          return false;
+        }
+        orientation_at_measurement = attitude_history_.back().orientation;
+
+        // Distinguish the two ways this happens, because the fixes differ. An age
+        // of years means the stamp is not on our clock at all: ros_gz_image copies
+        // the Gazebo header, so the detector's transforms carry simulator time
+        // while this node runs on wall time. Recovering the interpolation needs
+        // /clock bridged from Gazebo *and* this node on use_sim_time -- setting
+        // use_sim_time alone leaves the node waiting on a clock nobody publishes,
+        // which stalls every timer here and is worse than this fallback.
+        const double measurement_age = (this->now() - measurement_stamp).seconds();
+        if (std::abs(measurement_age) > kImplausibleMeasurementAge) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                               "Tag stamp is not on this node's clock (apparent age %.0f s): "
+                               "the transform is stamped on the simulator clock while this node "
+                               "uses wall time. Pairing with the latest attitude, which costs "
+                               "only the latency compensation. To restore it, bridge /clock and "
+                               "run this node with use_sim_time -- neither alone is enough.",
+                               measurement_age);
+        } else {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                               "Tag measurement is %.2f s old, beyond the %.1f s attitude "
+                               "history; pairing with the latest attitude.",
+                               measurement_age, attitude_history_length_);
+        }
       }
       const Eigen::Matrix3d R_W_B = orientation_at_measurement.toRotationMatrix();
 
