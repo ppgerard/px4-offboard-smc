@@ -125,6 +125,10 @@ private:
     double measured_tilt_1_rad_ = 0.0;
     double measured_tilt_2_rad_ = 0.0;
     Eigen::MatrixXd torques_and_thrust_to_rotor_velocities_;
+    // Set by computeRotorVelocities() when the commanded wrench had to be
+    // clamped to something the airframe can produce; feeds the control law's
+    // anti-windup together with the throttle range check.
+    bool allocation_saturated_ = false;
 
     // Logic switches
     bool in_sitl_mode_;

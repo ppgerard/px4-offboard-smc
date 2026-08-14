@@ -413,6 +413,11 @@ void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(doubl
 // the hardware (PWM) and SITL mappings below; returns false and leaves *omega
 // empty when the airframe is not supported.
 bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen::VectorXd *omega) {
+    // Every clamp below means the airframe was asked for more than it has, and
+    // the delivered wrench is no longer the commanded one. Recorded so the
+    // control law can hold its integral state while that is true.
+    allocation_saturated_ = false;
+
     if (_num_of_arms == 3) {
         Eigen::Vector3d reduced_wrench;
         reduced_wrench << wrench(0), wrench(1), wrench(3);
@@ -421,6 +426,7 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         // Safety: clamp negative values to zero
         for (int i = 0; i < omega_sq.size(); i++){
             if (omega_sq[i] <= 0){
+                allocation_saturated_ = allocation_saturated_ || omega_sq[i] < 0.0;
                 omega_sq[i] = 0.0;
             }
         }
@@ -438,9 +444,12 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
 
         // Keep physical angles in radians internally; convert to normalized only when publishing.
         const double tilt_1_desired = std::clamp(computed_tilt_rad, kTiltMinDeg * kDegToRad, -kTiltMinDeg * kDegToRad);
+        allocation_saturated_ = allocation_saturated_ || tilt_1_desired != computed_tilt_rad;
 
         // Rate limiting
-        const double delta = std::clamp(tilt_1_desired - tilt_1_prev_, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
+        const double delta_desired = tilt_1_desired - tilt_1_prev_;
+        const double delta = std::clamp(delta_desired, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
+        allocation_saturated_ = allocation_saturated_ || delta != delta_desired;
         tilt_1_rad_ = tilt_1_prev_ + delta;
         tilt_1_prev_ = tilt_1_rad_;
         tilt_2_rad_ = -tilt_1_rad_;
@@ -454,6 +463,7 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         // Safety: clamp negative values to zero (prevents NaN from sqrt of negative)
         for (int i = 0; i < omega_sq.size(); i++){
             if (omega_sq[i] <= 0){
+                allocation_saturated_ = allocation_saturated_ || omega_sq[i] < 0.0;
                 omega_sq[i] = 0.0;
             }
         }
@@ -609,7 +619,19 @@ void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::S
 }
 
 void ControllerNode::vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr status_msg){
+    const bool was_offboard =
+        current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD;
     current_status_ = *status_msg;
+    const bool is_offboard =
+        current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD;
+
+    // The control law runs from node start but only publishes in offboard, so
+    // at engagement it would otherwise carry whatever its integral state wound
+    // up to while the vehicle sat on the pad waiting to be handed control.
+    if (is_offboard && !was_offboard) {
+        controller_->reset();
+        RCLCPP_INFO(this->get_logger(), "Offboard engaged: controller state reset.");
+    }
 }
 
 void ControllerNode::publishActuatorMotorsMsg(const Eigen::VectorXd& throttles) {
@@ -693,12 +715,12 @@ void ControllerNode::updateControllerOutput() {
     publishWrenchMsg(controller_output, last_odometry_timestamp_);
     
     // Debug: Log the controller output (only once per second to avoid spam)
-    if (iteration_count_++ % 100 == 0) {
-        RCLCPP_INFO(this->get_logger(), "Controller output [tau_x, tau_y, tau_z, thrust]: [%.3f, %.3f, %.3f, %.3f]",
-                    controller_output(0), controller_output(1), controller_output(2), controller_output(3));
-        RCLCPP_INFO(this->get_logger(), "Vehicle nav_state: %d (Offboard=%d)", 
-                    current_status_.nav_state, px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
-    }
+    // if (iteration_count_++ % 100 == 0) {
+    //     RCLCPP_INFO(this->get_logger(), "Controller output [tau_x, tau_y, tau_z, thrust]: [%.3f, %.3f, %.3f, %.3f]",
+    //                 controller_output(0), controller_output(1), controller_output(2), controller_output(3));
+    //     RCLCPP_INFO(this->get_logger(), "Vehicle nav_state: %d (Offboard=%d)", 
+    //                 current_status_.nav_state, px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+    // }
     
     Eigen::VectorXd throttles;
     if (in_sitl_mode_) px4InverseSITL(&throttles, &controller_output);
@@ -707,6 +729,14 @@ void ControllerNode::updateControllerOutput() {
     if (throttles.size() == 0) {
         return;  // unsupported airframe, already reported by computeRotorVelocities()
     }
+
+    // Anti-windup: tell the law whether the wrench it just asked for survived
+    // allocation. Where it did not, the loop is open at the actuators, and
+    // integrating an error they were never able to answer is what winds the
+    // super-twisting state up. Takes effect on the next cycle, 10 ms later.
+    const bool throttle_saturated = !throttles.allFinite() ||
+        (throttles.array() < 0.0).any() || (throttles.array() > 1.0).any();
+    controller_->setActuatorsSaturated(allocation_saturated_ || throttle_saturated);
 
     // Publish the controller output
     if (current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {

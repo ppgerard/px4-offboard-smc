@@ -81,9 +81,12 @@ void StSmcController::calculateControllerOutput(
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 + u_sta;
 
-    w_ += -K2.cwiseProduct(sign_s) * dt_;
+    // Bounded, saturation-aware version of w_ += -K2*sign(s)*dt.
+    const Eigen::Vector3d w_limit = Eigen::Vector3d::Constant(
+        px4_offboard::kStaThrustHoverFraction * _uav_mass * _gravity);
+    integrateStaState(w_, -K2.cwiseProduct(sign_s) * dt_, w_limit, actuators_saturated_);
 
-    thrust = I_a_d.norm();
+    thrust = projectedThrust(I_a_d);
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
     B_z_d.normalize();
@@ -158,7 +161,11 @@ void StSmcController::calculateControllerOutput(
         - _inertia_matrix * Lambda_R.cwiseProduct(e_R_dot)
         + u_sta_R;
 
-    w_R_ += -K2_R.cwiseProduct(sign_sR) * dt_;
+    // Same treatment for the rotational integral state, bounded by the angular
+    // acceleration it is allowed to command rather than by a raw torque.
+    const Eigen::Vector3d w_R_limit =
+        _inertia_matrix.diagonal() * px4_offboard::kStaMaxAngularAcceleration;
+    integrateStaState(w_R_, -K2_R.cwiseProduct(sign_sR) * dt_, w_R_limit, actuators_saturated_);
 
     // Output the wrench
     *controller_torque_thrust << tau, thrust;

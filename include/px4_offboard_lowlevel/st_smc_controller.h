@@ -52,6 +52,15 @@ public:
     StSmcController();
     void calculateControllerOutput(Eigen::VectorXd *controller_torque_thrust, Eigen::Quaterniond *desired_quaternion) override;
 
+    // The auxiliary states are the whole memory of this law: carrying them
+    // across an offboard entry would engage the aircraft with an integral term
+    // wound up against a disturbance it was never flying.
+    void reset() override {
+        ControllerBase::reset();
+        w_.setZero();
+        w_R_.setZero();
+    }
+
     // Sliding surface slopes
     void setLambda(const Eigen::Vector3d &lambda) {
         Lambda = lambda;

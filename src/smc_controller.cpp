@@ -88,8 +88,7 @@ void SmcController::calculateControllerOutput(
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 - K_s.cwiseProduct(sat_vec);
 
-    // thrust = I_a_d.dot(R_B_W_.col(2));
-    thrust = I_a_d.norm();
+    thrust = projectedThrust(I_a_d);
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
     B_z_d.normalize();

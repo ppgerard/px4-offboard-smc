@@ -163,7 +163,9 @@ protected:
   const double max_acceleration_xy_ = 2.5;  // [m/s²]
   const double max_acceleration_z_ = 1.0;   // [m/s²]
   const double xy_error_threshold_ = 0.3;   // XY error that counts as "over the tag" [m]
-  const double xy_error_min_time_ = 0.5;    // ... held this long before descending [s]
+  const double z_error_threshold_ = 0.3;    // ... altitude error that counts as "at the hold point" [m]
+  const double settled_velocity_z_ = 0.2;   // ... and vertical speed that counts as settled [m/s]
+  const double xy_error_min_time_ = 0.5;    // ... all held this long before descending [s]
   const double airborne_altitude_ = 1.0;    // above this the vehicle has certainly flown [m]
 
   // ---- Phase 2: vision-guided descent ----------------------------------------
@@ -427,20 +429,32 @@ protected:
   }
 
   void checkPhase1To2Transition() {
-    // Check XY error against actual drone position (ignore Z)
-    Eigen::Vector2d xy_error_2d(phase_1_target_(0) - drone_position_W_(0),
-                                 phase_1_target_(1) - drone_position_W_(1));
-    double xy_error = xy_error_2d.norm();
+    // Error against the actual drone position, on all three axes.
+    const Eigen::Vector3d error = phase_1_target_ - drone_position_W_;
+    const double xy_error = error.head<2>().norm();
+    const double z_error = std::abs(error(2));
+    const double climb_rate = drone_velocity_W_(2);
 
     // Check if tag is visible
     bool tag_visible = tf_buffer_->canTransform(
         camera_frame_id_, platform_frame_id_, tf2::TimePointZero, tf2::durationFromSec(0.01));
 
-    // All three must hold to start the hysteresis timer. The airborne check
-    // matters because this transition ignores Z: a node started while the
-    // vehicle sits disarmed on the pad would otherwise run straight through
-    // Phase 2 into the terminal descent without ever having flown.
-    if (xy_error < xy_error_threshold_ && tag_visible && airborne_) {
+    // The hold has to be settled, not merely centred. Phase 2 rate-limits its
+    // reference velocity to phase2_max_acceleration_z_, so handing it a climb
+    // buys seconds of reference travel in the wrong direction before the
+    // descent even begins: reversing +2 m/s takes ~7.7 s, and the reference
+    // walks metres upward in the meantime. Alignment alone is satisfied from
+    // the first instant of a climb that starts centred over the tag, which is
+    // exactly the case that produced 4.9-5.7 m overshoots against a 3 m target.
+    //
+    // The airborne check guards the opposite end: a node started while the
+    // vehicle sits disarmed on the pad reads a settled hold on every axis, and
+    // would run straight through Phase 2 into the descent without having flown.
+    const bool settled = xy_error < xy_error_threshold_ &&
+                         z_error < z_error_threshold_ &&
+                         std::abs(climb_rate) < settled_velocity_z_;
+
+    if (settled && tag_visible && airborne_) {
       if (!phase2_transition_flag_) {
         phase2_transition_start_time_ = std::chrono::high_resolution_clock::now();
         phase2_transition_flag_ = true;
@@ -448,7 +462,9 @@ protected:
       // Check if conditions have been true long enough
       auto duration = std::chrono::high_resolution_clock::now() - phase2_transition_start_time_;
       if (std::chrono::duration<double>(duration).count() >= xy_error_min_time_) {
-        RCLCPP_INFO(this->get_logger(), "Transitioning to Phase 2 (XY error=%.3f m)", xy_error);
+        RCLCPP_INFO(this->get_logger(),
+                    "Transitioning to Phase 2 (XY error=%.3f m, altitude error=%.3f m, vz=%.2f m/s)",
+                    xy_error, z_error, climb_rate);
         phase_ = Phase::PHASE_2;
         phase2_transition_flag_ = false;
       }
@@ -506,13 +522,24 @@ protected:
     // is large in frame and the estimate gets noisy, while the offset the outer
     // loop has already built up against the wind is exactly what should be kept.
     commit_position_xy_ = r_position_W_.head<2>();
+
+    // Re-anchor the altitude reference to where the vehicle actually is. Phase 2
+    // integrates r_position_W_(2) open-loop with nothing tying it back to the
+    // aircraft, so it can arrive here sitting above it. Inheriting that would
+    // give the commit descent a gap to close before it produces any real
+    // descent, and it would offset the touchdown check, which reads exactly
+    // that gap as its evidence of contact.
+    const double reference_drift = r_position_W_(2) - drone_position_W_(2);
+    r_position_W_(2) = drone_position_W_(2);
+
     commit_start_time_ = this->now();
     contact_score_ = 0.0;
     commit_timeout_warned_ = false;
     phase_ = Phase::PHASE_3_COMMIT;
     RCLCPP_INFO(this->get_logger(),
-                "Transitioning to Phase 3 (Commit) - altitude=%.3f m, XY error=%.3f m, descending at %.2f m/s",
-                estimated_position_W_(2), xy_error, commit_descent_rate_);
+                "Transitioning to Phase 3 (Commit) - altitude=%.3f m, XY error=%.3f m, descending at %.2f m/s "
+                "(altitude reference re-anchored, drift was %+.3f m)",
+                estimated_position_W_(2), xy_error, commit_descent_rate_, reference_drift);
   }
 
   void checkPhase3To4Transition() {
