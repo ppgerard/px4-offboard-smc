@@ -158,14 +158,17 @@ private:
     void px4Inverse (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
     void px4InverseSITL (Eigen::VectorXd *throttles, const Eigen::VectorXd *wrench);
 
-    inline void eigenTrajectoryPointFromMsg(
+    // Unpacks a trajectory point. Returns false and writes nothing when the
+    // message carries no transform, which is the caller's cue to skip it: the
+    // outputs would otherwise be left holding whatever they held before.
+    inline bool eigenTrajectoryPointFromMsg(
         const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint& msg,
         Eigen::Vector3d& position_W, Eigen::Quaterniond& orientation_W_B,
         Eigen::Vector3d& velocity_W, Eigen::Vector3d& angular_velocity_W,
         Eigen::Vector3d& acceleration_W) {
-        
+
         if (msg.transforms.empty()) {
-            return;
+            return false;
         }
 
         position_W << msg.transforms[0].translation.x,
@@ -194,6 +197,7 @@ private:
         } else {
             acceleration_W.setZero();
         }
+        return true;
     }
 
     inline void eigenTrajectoryPointFromPoseMsg(

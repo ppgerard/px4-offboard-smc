@@ -149,52 +149,55 @@ protected:
   // trajectory point has been computed. No-op by default.
   virtual void onSetpointPublished() {}
 
-  // Control parameters
-  const double K_p_ = 1.0;              // Position gain
-  const double dt_ = px4_offboard::kControlPeriodSeconds;  // Time step (seconds)
-  const double xy_error_threshold_ = 0.3; // 30cm threshold for XY error
-  const double tag_visibility_min_time_ = 0.5; // 0.5s minimum tag visibility
-  const double xy_error_min_time_ = 0.5;      // 0.5s minimum XY error below threshold
-  // Terminal descent (Phase 2 -> commit -> touchdown). Altitudes are the fused
-  // tag-relative altitude of the body origin, so they include the vehicle's own
-  // ground clearance: the T2 rests on the pad at ~0.105 m in this frame.
-  const double airborne_altitude_ = 1.0;        // above this the vehicle has certainly left the pad [m]
-  const double commit_altitude_ = 0.20;         // commit below this altitude (~0.10 m clearance) [m]
-  const double commit_xy_error_max_ = 0.10;     // XY alignment required to commit [m]
-  const double commit_tag_max_age_ = 0.5;       // tag measurement must be fresher than this [s]
-  const double commit_wait_timeout_ = 5.0;      // commit regardless after waiting this long [s]
-  const double commit_descent_rate_ = 0.4;      // fixed descent rate once committed [m/s]
-  const double commit_timeout_ = 8.0;           // no touchdown by then: stop descending [s]
+  // ---- Loop timing, gains, filters -------------------------------------------
+  const double dt_ = px4_offboard::kControlPeriodSeconds;  // control period [s]
+  const double K_p_ = 1.0;                    // outer-loop position gain
+  const double lpf_alpha_ = 1.0;              // AprilTag pose filter [0, 1]; 1 = disabled
+  const double lpf_alpha_velocity_ = 0.2;     // reference velocity filter [0, 1]
+  const double lpf_alpha_odometry_vz_ = 0.05; // odometry vz filter, for the contact check
+
+  // ---- Phase 1: approach ------------------------------------------------------
+  const Eigen::Vector3d phase_1_target_{0.0, 0.0, 3.0};  // hold point above the tag [m]
+  const double max_velocity_xy_ = 1.0;      // [m/s]
+  const double max_velocity_z_ = 2.0;       // [m/s]
+  const double max_acceleration_xy_ = 2.5;  // [m/s²]
+  const double max_acceleration_z_ = 1.0;   // [m/s²]
+  const double xy_error_threshold_ = 0.3;   // XY error that counts as "over the tag" [m]
+  const double xy_error_min_time_ = 0.5;    // ... held this long before descending [s]
+  const double airborne_altitude_ = 1.0;    // above this the vehicle has certainly flown [m]
+
+  // ---- Phase 2: vision-guided descent ----------------------------------------
+  //
+  // Every altitude from here down is the fused tag-relative altitude of the body
+  // origin, so it includes the vehicle's own ground clearance: a T2 at rest on
+  // the pad reads ~0.105 m, not zero.
+  const Eigen::Vector3d phase_2_target_{0.0, 0.0, 0.0};  // the tag itself
+  const double phase2_max_velocity_xy_ = 0.5;      // [m/s]
+  const double phase2_max_velocity_z_ = 0.3;       // [m/s]
+  const double phase2_max_acceleration_xy_ = 0.8;  // [m/s²]
+  const double phase2_max_acceleration_z_ = 0.3;   // [m/s²]
+  // Descent cone: altitude is only given up while the aircraft is inside a cone
+  // that narrows as it descends, which bounds the touchdown error by design
+  // instead of measuring it afterwards. A gust that pushes the aircraft
+  // off-centre pauses the descent rather than racing it to the ground.
+  const double cone_slope_ = 0.30;       // cone radius gained per metre of height [m/m]
+  const double cone_radius_min_ = 0.05;  // cone radius at the pad [m]
+  const double cone_tag_max_age_ = 0.3;  // no fresh tag, no descent [s]
+
+  // ---- Phase 3: commit --------------------------------------------------------
+  const double commit_altitude_ = 0.20;      // commit below this altitude (~0.10 m clearance) [m]
+  const double commit_xy_error_max_ = 0.10;  // XY alignment required to commit [m]
+  const double commit_tag_max_age_ = 0.5;    // tag measurement must be fresher than this [s]
+  const double commit_wait_timeout_ = 5.0;   // commit regardless after waiting this long [s]
+  const double commit_descent_rate_ = 0.4;   // fixed descent rate once committed [m/s]
+  const double commit_timeout_ = 8.0;        // no touchdown by then: stop descending [s]
+
+  // ---- Phase 4: touchdown and disarm -----------------------------------------
   const double touchdown_max_altitude_ = 0.30;  // contact only ever declared this close to the pad [m]
   const double touchdown_ref_gap_ = 0.25;       // reference this far below the vehicle = not following [m]
   const double touchdown_stall_speed_ = 0.10;   // filtered descent rate below this counts as stopped [m/s]
-  const double velocity_lpf_alpha_ = 0.05;      // filter on odometry vz for the contact check
-  const double touchdown_stall_time_ = 0.7;     // stalled this long = contact [s]
+  const double touchdown_stall_time_ = 0.7;     // evidence to accumulate before calling contact [s]
   const double disarm_retry_period_ = 0.5;      // resend DISARM this often [s]
-  // Phase 1 limits (separate XY and Z)
-  const double max_velocity_xy_ = 1.0;     // Maximum velocity XY [m/s] (Phase 1)
-  const double max_velocity_z_ = 2.0;      // Maximum velocity Z [m/s] (Phase 1)
-  const double max_acceleration_xy_ = 2.5; // Maximum acceleration XY [m/s²] (Phase 1)
-  const double max_acceleration_z_ = 1.0;  // Maximum acceleration Z [m/s²] (Phase 1)
-  // Phase 2 limits (separate XY and Z)
-  const double phase2_max_velocity_xy_ = 0.5;     // Maximum velocity XY in Phase 2 [m/s]
-  const double phase2_max_velocity_z_ = 0.3;      // Maximum velocity Z in Phase 2 [m/s]
-  const double phase2_max_acceleration_xy_ = 0.8; // Maximum acceleration XY in Phase 2 [m/s²]
-  const double phase2_max_acceleration_z_ = 0.3;  // Maximum acceleration Z in Phase 2 [m/s²]
-  // Descent cone: altitude is only given up while the aircraft is inside a cone
-  // that narrows as it descends, which bounds the touchdown error by design
-  // instead of measuring it afterwards. A gust that pushes it off-centre pauses
-  // the descent rather than racing it to the ground.
-  const double cone_slope_ = 0.30;          // cone radius gained per metre of height [m/m]
-  const double cone_radius_min_ = 0.05;     // cone radius at the pad [m]
-  const double cone_tag_max_age_ = 0.3;     // no fresh tag, no descent [s]
-  const double lpf_alpha_ = 1;        // Low-pass filter coefficient for AprilTag pose [0, 1]
-  const double lpf_alpha_velocity_ = 0.2; // Low-pass filter coefficient for velocity [0, 1]
-  // Phase 1 setpoint
-  const Eigen::Vector3d phase_1_target_{0.0, 0.0, 3.0};
-
-  // Phase 2 target (in world frame, tag at origin)
-  const Eigen::Vector3d phase_2_target_{0.0, 0.0, 0.0};
 
   // Hysteresis timer for transition Phase 1 -> Phase 2
   std::chrono::high_resolution_clock::time_point phase2_transition_start_time_;
@@ -290,7 +293,6 @@ protected:
   uint64_t last_odometry_timestamp_ = 0;
 
   // Groundtruth state for diagnostics
-  px4_msgs::msg::VehicleLocalPosition groundtruth_msg_;
   Eigen::Vector3d groundtruth_position_W_;
   Eigen::Vector3d groundtruth_velocity_W_;
 
@@ -904,7 +906,7 @@ protected:
     drone_velocity_W_ = velocity;
     // Low-passed for the contact check, which must not restart on single samples.
     drone_velocity_filtered_z_ = applyLowPassFilterScalar(velocity(2), drone_velocity_filtered_z_,
-                                                          velocity_lpf_alpha_);
+                                                          lpf_alpha_odometry_vz_);
     drone_orientation_W_ = orientation;
     drone_angular_velocity_W_ = angular_velocity;
     last_odometry_timestamp_ = odom_msg->timestamp;
@@ -929,9 +931,6 @@ protected:
   }
 
   void groundtruthCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr gt_msg) {
-    // Store groundtruth message for diagnostics
-    groundtruth_msg_ = *gt_msg;
-
     // Convert groundtruth position and velocity from NED to ENU
     Eigen::Vector3d gt_position(gt_msg->x, gt_msg->y, gt_msg->z);
     Eigen::Vector3d gt_velocity(gt_msg->vx, gt_msg->vy, gt_msg->vz);

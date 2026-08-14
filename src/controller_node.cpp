@@ -543,22 +543,28 @@ void ControllerNode::publishOffboardControlModeMsg()
 }
 
 void ControllerNode::commandPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr pose_msg) {                   // When a command is received
-    // initialize vectors
-    Eigen::Vector3d position;
-    Eigen::Quaterniond orientation;
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
     eigenTrajectoryPointFromPoseMsg(pose_msg, position, orientation);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
     controller_->setTrajectoryPoint(position, orientation);          // Send the command to controller_ obj
 }
 
 void ControllerNode::commandTrajectoryCallback(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint &msg) {                   // When a command is received
-    // initialize vectors
-    Eigen::Vector3d position;
-    Eigen::Vector3d velocity; 
-    Eigen::Quaterniond orientation;
-    Eigen::Vector3d angular_velocity;
-    Eigen::Vector3d acceleration;
-    eigenTrajectoryPointFromMsg(msg, position, orientation, velocity, angular_velocity, acceleration);
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+    Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();
+    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+
+    // A point with no transform carries no setpoint: hold the previous one
+    // rather than commanding whatever the unpacked vectors happen to contain.
+    if (!eigenTrajectoryPointFromMsg(msg, position, orientation, velocity, angular_velocity, acceleration)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 5000,
+                             "Ignoring trajectory point with no transform.");
+        return;
+    }
+
     controller_->setTrajectoryPoint(position, velocity, acceleration, orientation, angular_velocity);
     RCLCPP_INFO_ONCE(get_logger(),"Controller got first command message.");
 }
