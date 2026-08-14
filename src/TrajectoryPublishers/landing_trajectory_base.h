@@ -3,13 +3,21 @@
 
 // Shared logic for AprilTag-based landing trajectory nodes: TF lookup of the
 // platform tag, a simple position fusion filter (odometry prediction +
-// tag correction), and the 3-phase approach/descent/land state machine.
+// tag correction), and the 4-phase approach/descent/commit/touchdown state
+// machine.
+//
+// The vision loop stays closed all the way to the ground: PX4's NAV_LAND is
+// never used, because it descends on PX4's own position estimate with no
+// knowledge of the tag. Below the commit altitude the XY reference is frozen
+// at its last good value and the aircraft descends at a fixed rate until the
+// land detector reports contact, at which point this node disarms.
 //
 // Concrete nodes differ only in where the resulting setpoint is sent:
 // through the SMC controller (landing_trajectory_node.cpp) or directly to
 // PX4 (px4_offboard_landing_node.cpp). That difference is captured by the
 // onSetpointPublished() hook.
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <cmath>
@@ -24,7 +32,9 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
+#include <px4_msgs/msg/vehicle_land_detected.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
 #include "px4_offboard_lowlevel/control_config.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
@@ -67,6 +77,11 @@ public:
     // Subscriber to groundtruth for diagnostics
     groundtruth_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
         ("/fmu/out/vehicle_local_position_groundtruth_v1", qos, std::bind(&LandingTrajectoryNodeBase::groundtruthCallback, this, std::placeholders::_1));
+    // Touchdown detection and disarm confirmation for the terminal descent
+    land_detected_sub_ = this->create_subscription<px4_msgs::msg::VehicleLandDetected>
+        ("/fmu/out/vehicle_land_detected", qos, std::bind(&LandingTrajectoryNodeBase::landDetectedCallback, this, std::placeholders::_1));
+    vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>
+        ("/fmu/out/vehicle_status_v1", qos, std::bind(&LandingTrajectoryNodeBase::vehicleStatusCallback, this, std::placeholders::_1));
 
     // Publishers
     trajectory_publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>
@@ -85,6 +100,15 @@ public:
 
     // Initialize frequency monitoring
     last_callback_time_ = std::chrono::high_resolution_clock::now();
+
+    // Terminal-descent timers use the node clock (see the conventions in
+    // CLAUDE.md); they must share its clock type to be comparable.
+    const rclcpp::Time now = this->now();
+    commit_wait_start_time_ = now;
+    commit_start_time_ = now;
+    touchdown_condition_start_time_ = now;
+    last_disarm_request_time_ = now;
+    last_tag_update_time_ = now;
 
     // Initialize drone state with defaults
     drone_orientation_W_ = Eigen::Quaterniond::Identity();
@@ -117,7 +141,8 @@ protected:
   enum class Phase {
     PHASE_1,
     PHASE_2,
-    PHASE_3_LANDING
+    PHASE_3_COMMIT,
+    PHASE_4_TOUCHDOWN
   };
 
   // Hook for subclasses that need to publish an additional setpoint
@@ -131,7 +156,23 @@ protected:
   const double xy_error_threshold_ = 0.3; // 30cm threshold for XY error
   const double tag_visibility_min_time_ = 0.5; // 0.5s minimum tag visibility
   const double xy_error_min_time_ = 0.5;      // 0.5s minimum XY error below threshold
-  const double altitude_landing_threshold_ = 0.35; // 30cm altitude threshold to land
+  // Terminal descent (Phase 2 -> commit -> touchdown). Altitudes are the fused
+  // tag-relative altitude of the body origin, so they include the vehicle's own
+  // ground clearance: the T2 rests on the pad at ~0.105 m in this frame.
+  const double touchdown_altitude_ = 0.105;     // body-origin altitude at rest on the pad [m]
+  const double airborne_altitude_ = 1.0;        // above this the vehicle has certainly left the pad [m]
+  const double commit_altitude_ = 0.20;         // commit below this altitude (~0.10 m clearance) [m]
+  const double commit_xy_error_max_ = 0.10;     // XY alignment required to commit [m]
+  const double commit_tag_max_age_ = 0.5;       // tag measurement must be fresher than this [s]
+  const double commit_wait_timeout_ = 5.0;      // commit regardless after waiting this long [s]
+  const double commit_descent_rate_ = 0.4;      // fixed descent rate once committed [m/s]
+  const double commit_timeout_ = 8.0;           // no touchdown by then: stop descending [s]
+  const double touchdown_hold_time_ = 0.2;      // land-detector debounce [s]
+  const double touchdown_stall_margin_ = 0.05;  // stall check only this close to the pad [m]
+  const double touchdown_stall_speed_ = 0.05;   // descent counts as stalled below this [m/s]
+  const double touchdown_stall_time_ = 1.0;     // stalled this long = contact [s]
+  const double disarm_retry_period_ = 0.5;      // resend DISARM this often [s]
+  const int disarm_max_attempts_ = 10;
   // Phase 1 limits (separate XY and Z)
   const double max_velocity_xy_ = 1.0;     // Maximum velocity XY [m/s] (Phase 1)
   const double max_velocity_z_ = 2.0;      // Maximum velocity Z [m/s] (Phase 1)
@@ -196,7 +237,27 @@ protected:
   // Fused position estimate (100 Hz prediction + 15 Hz correction from tag)
   Eigen::Vector3d estimated_position_W_;      // Fused estimate at 100Hz
   tf2::TimePoint last_tag_measurement_time_;  // Timestamp of last processed TF measurement
+  rclcpp::Time last_tag_update_time_;         // When that measurement arrived (node clock)
+  bool tag_measurement_received_ = false;
   const double fusion_alpha_ = 0.1;          // Correction gain (0.05-0.2)
+
+  // Terminal-descent state
+  Eigen::Vector2d commit_position_xy_ = Eigen::Vector2d::Zero();  // frozen XY reference
+  rclcpp::Time commit_wait_start_time_;          // waiting for alignment at commit altitude
+  bool commit_wait_flag_ = false;
+  rclcpp::Time commit_start_time_;
+  bool commit_timeout_warned_ = false;
+  rclcpp::Time touchdown_condition_start_time_;  // debounce for the contact conditions
+  rclcpp::Time last_disarm_request_time_;
+  int disarm_attempts_ = 0;
+  bool disarm_confirmed_ = false;
+
+  // PX4 land detector and arming state
+  bool land_detected_received_ = false;
+  bool land_detected_contact_ = false;
+  bool airborne_ = false;   // has left the ground at least once
+  bool vehicle_status_received_ = false;
+  bool vehicle_armed_ = false;
 
   // Frequency monitoring
   std::chrono::high_resolution_clock::time_point last_callback_time_;
@@ -210,6 +271,8 @@ protected:
   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr groundtruth_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_detected_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   // Diagnostics publisher
@@ -313,6 +376,12 @@ protected:
       return;  // Still in initialization delay, setpoint already published
     }
 
+    // Fallback for when the land detector is not bridged: climbing well clear of
+    // the pad is enough to arm the contact check.
+    if (estimated_position_W_(2) > airborne_altitude_) {
+      airborne_ = true;
+    }
+
     // Phase-specific trajectory generation and transitions
     switch (phase_) {
       case Phase::PHASE_1:
@@ -323,19 +392,22 @@ protected:
         updatePhase2();
         checkPhase2To3Transition();
         break;
-      case Phase::PHASE_3_LANDING:
-        publishLandingCommand();
+      case Phase::PHASE_3_COMMIT:
+        updatePhase3Commit();
+        checkPhase3To4Transition();
+        break;
+      case Phase::PHASE_4_TOUCHDOWN:
+        updatePhase4Touchdown();
         break;
     }
 
-    // Publish trajectory point (not in landing phase)
-    if (phase_ != Phase::PHASE_3_LANDING) {
-      publishTrajectoryPoint();
-      onSetpointPublished();
-    }
+    // The setpoint stream runs through touchdown: it is what keeps the vehicle
+    // in offboard while the disarm request is acknowledged.
+    publishTrajectoryPoint();
+    onSetpointPublished();
 
-    // Publish platform position feedback (from TF) only in Phase 2
-    if (phase_ == Phase::PHASE_2) {
+    // Publish platform position feedback (from TF) while the vision loop is closed
+    if (phase_ == Phase::PHASE_2 || phase_ == Phase::PHASE_3_COMMIT) {
       publishPlatformPosition();
     }
 
@@ -373,11 +445,107 @@ protected:
   }
 
   void checkPhase2To3Transition() {
-    // Check if altitude is below landing threshold (position_W_(2) is altitude in ENU)
-    if (estimated_position_W_(2) < altitude_landing_threshold_) {
-      RCLCPP_INFO(this->get_logger(), "Transitioning to Phase 3 (Landing) - altitude=%.3f m", estimated_position_W_(2));
-      phase_ = Phase::PHASE_3_LANDING;
+    // An unexpected contact (mis-scaled estimate, an obstacle) short-circuits
+    // the descent: there is nothing left to commit to.
+    if (contactHeld()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Land detector reports contact in Phase 2 at altitude=%.3f m; disarming.",
+                  estimated_position_W_(2));
+      enterTouchdownPhase();
+      return;
     }
+
+    // Altitude is the trigger; alignment and a fresh tag measurement are the
+    // guards, so the aircraft does not commit while blown off-centre or while
+    // dead-reckoning. Phase 2 holds at the commit altitude until they are met.
+    if (estimated_position_W_(2) >= commit_altitude_) {
+      commit_wait_flag_ = false;
+      return;
+    }
+
+    if (!commit_wait_flag_) {
+      commit_wait_start_time_ = this->now();
+      commit_wait_flag_ = true;
+    }
+
+    const double xy_error = estimated_position_W_.head<2>().norm();
+    const bool aligned = xy_error < commit_xy_error_max_;
+    const bool tag_fresh = tag_measurement_received_ &&
+        (this->now() - last_tag_update_time_).seconds() < commit_tag_max_age_;
+    const bool waited_long_enough =
+        (this->now() - commit_wait_start_time_).seconds() >= commit_wait_timeout_;
+
+    if (!(aligned && tag_fresh)) {
+      if (!waited_long_enough) {
+        return;  // hold at the commit altitude and keep trying to centre
+      }
+      RCLCPP_WARN(this->get_logger(),
+                  "Committing after %.1f s wait: XY error=%.3f m, tag %s",
+                  commit_wait_timeout_, xy_error, tag_fresh ? "fresh" : "stale");
+    }
+
+    enterCommitPhase(xy_error);
+  }
+
+  void enterCommitPhase(double xy_error) {
+    // Freeze the XY reference at its last good value. Close to the pad the tag
+    // is large in frame and the estimate gets noisy, while the offset the outer
+    // loop has already built up against the wind is exactly what should be kept.
+    commit_position_xy_ = r_position_W_.head<2>();
+    commit_start_time_ = this->now();
+    touchdown_condition_start_time_ = commit_start_time_;
+    commit_timeout_warned_ = false;
+    phase_ = Phase::PHASE_3_COMMIT;
+    RCLCPP_INFO(this->get_logger(),
+                "Transitioning to Phase 3 (Commit) - altitude=%.3f m, XY error=%.3f m, descending at %.2f m/s",
+                estimated_position_W_(2), xy_error, commit_descent_rate_);
+  }
+
+  void checkPhase3To4Transition() {
+    if (!contactHeld()) {
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "Touchdown after %.2f s of commit: estimated XY error=%.3f m, altitude=%.3f m",
+                (this->now() - commit_start_time_).seconds(),
+                estimated_position_W_.head<2>().norm(), estimated_position_W_(2));
+    enterTouchdownPhase();
+  }
+
+  void enterTouchdownPhase() {
+    phase_ = Phase::PHASE_4_TOUCHDOWN;
+    r_velocity_W_.setZero();
+    r_acceleration_W_.setZero();
+    disarm_attempts_ = 0;
+    disarm_confirmed_ = false;
+  }
+
+  // Contact is the land detector when it is available; otherwise the commanded
+  // descent stalling within a few centimetres of the pad.
+  bool contactHeld() {
+    // Never call a touchdown before the vehicle has actually left the ground:
+    // the Phase 1 -> 2 transition only looks at XY, so Phase 2 can be entered
+    // during the initial climb.
+    if (!airborne_) {
+      return false;
+    }
+
+    bool contact;
+    if (land_detected_received_) {
+      contact = land_detected_contact_;
+    } else {
+      contact = estimated_position_W_(2) < touchdown_altitude_ + touchdown_stall_margin_ &&
+                std::abs(drone_velocity_W_(2)) < touchdown_stall_speed_;
+    }
+
+    const rclcpp::Time now = this->now();
+    if (!contact) {
+      touchdown_condition_start_time_ = now;
+      return false;
+    }
+    // The land detector has already debounced itself; the stall check has not.
+    const double hold_time = land_detected_received_ ? touchdown_hold_time_ : touchdown_stall_time_;
+    return (now - touchdown_condition_start_time_).seconds() >= hold_time;
   }
 
   void updatePhase1() {
@@ -425,6 +593,12 @@ protected:
     saturateXY(desired_velocity, phase2_max_velocity_xy_);
     saturateZ(desired_velocity, phase2_max_velocity_z_);
 
+    // Stop descending at the commit altitude: below it the terminal descent
+    // takes over, and it only starts once the aircraft is centred.
+    if (estimated_position_W_(2) < commit_altitude_) {
+      desired_velocity(2) = std::max(desired_velocity(2), 0.0);
+    }
+
     // Store previous velocity for acceleration calculation
     Eigen::Vector3d r_velocity_W_prev = r_velocity_W_;
 
@@ -444,6 +618,78 @@ protected:
 
     // Integrate setpoint from actual tag position to keep trajectory anchored to reality
     r_position_W_ = r_position_W_ + r_velocity_W_ * dt_;
+  }
+
+  void updatePhase3Commit() {
+    // Commit: the XY reference is frozen and Z descends at a fixed rate. The tag
+    // estimate keeps running for the diagnostics and the touchdown check, but it
+    // no longer steers the aircraft.
+    updateTagPosition();
+
+    const bool timed_out = (this->now() - commit_start_time_).seconds() > commit_timeout_;
+    if (timed_out && !commit_timeout_warned_) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "No touchdown %.1f s after commit (altitude estimate %.3f m); holding altitude.",
+                   commit_timeout_, estimated_position_W_(2));
+      commit_timeout_warned_ = true;
+    }
+
+    // Ramp into the descent rate so the acceleration feedforward stays bounded.
+    const double target_velocity_z = timed_out ? 0.0 : -commit_descent_rate_;
+    const double max_velocity_step = phase2_max_acceleration_z_ * dt_;
+    const double velocity_step = std::clamp(target_velocity_z - r_velocity_W_(2),
+                                            -max_velocity_step, max_velocity_step);
+    r_velocity_W_(2) += velocity_step;
+    r_velocity_W_(0) = 0.0;
+    r_velocity_W_(1) = 0.0;
+    r_acceleration_W_.setZero();
+
+    r_position_W_(0) = commit_position_xy_(0);
+    r_position_W_(1) = commit_position_xy_(1);
+    r_position_W_(2) += r_velocity_W_(2) * dt_;
+  }
+
+  void updatePhase4Touchdown() {
+    // Hold the touchdown reference and disarm. PX4 can reject the request while
+    // its own land detector is still settling, so retry a few times.
+    r_velocity_W_.setZero();
+    r_acceleration_W_.setZero();
+
+    if (disarm_confirmed_) {
+      return;
+    }
+    if (vehicle_status_received_ && !vehicle_armed_) {
+      disarm_confirmed_ = true;
+      RCLCPP_INFO(this->get_logger(), "Disarmed. Landing complete.");
+      return;
+    }
+    if (disarm_attempts_ >= disarm_max_attempts_) {
+      RCLCPP_ERROR_ONCE(this->get_logger(),
+                        "Vehicle still armed after %d disarm requests.", disarm_max_attempts_);
+      return;
+    }
+    if (disarm_attempts_ > 0 &&
+        (this->now() - last_disarm_request_time_).seconds() < disarm_retry_period_) {
+      return;
+    }
+    sendDisarmCommand();
+  }
+
+  void sendDisarmCommand() {
+    px4_msgs::msg::VehicleCommand cmd{};
+    cmd.command = px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+    cmd.param1 = 0.0;  // 0 = disarm
+    cmd.target_system = 1;
+    cmd.target_component = 1;
+    cmd.source_system = 1;
+    cmd.source_component = 1;
+    cmd.from_external = true;
+    cmd.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+
+    vehicle_command_pub_->publish(cmd);
+    last_disarm_request_time_ = this->now();
+    disarm_attempts_++;
+    RCLCPP_INFO(this->get_logger(), "Disarm command published (attempt %d)", disarm_attempts_);
   }
 
   bool updateTagPosition() {
@@ -486,6 +732,8 @@ protected:
       tf2::TimePoint measurement_time = tf2_ros::fromMsg(transform.header.stamp);
       if (measurement_time > last_tag_measurement_time_) {
         last_tag_measurement_time_ = measurement_time;
+        last_tag_update_time_ = this->now();
+        tag_measurement_received_ = true;
         correctFusedPositionWithTag(position_W_);
       }
 
@@ -566,23 +814,17 @@ protected:
     diagnostics_->publishPositionRaw(groundtruth_position_W_ - position_W_filtered_, last_odometry_timestamp_);
   }
 
-  void publishLandingCommand() {
-    // Publish VEHICLE_CMD_NAV_LAND command once
-    static bool land_command_sent = false;
-    if (!land_command_sent) {
-      px4_msgs::msg::VehicleCommand cmd{};
-      cmd.command = px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND;
-      cmd.target_system = 1;
-      cmd.target_component = 1;
-      cmd.source_system = 1;
-      cmd.source_component = 1;
-      cmd.from_external = true;
-      cmd.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-
-      vehicle_command_pub_->publish(cmd);
-      RCLCPP_INFO(this->get_logger(), "Landing command published");
-      land_command_sent = true;
+  void landDetectedCallback(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg) {
+    land_detected_received_ = true;
+    land_detected_contact_ = msg->landed || msg->ground_contact;
+    if (!msg->landed && !msg->maybe_landed) {
+      airborne_ = true;
     }
+  }
+
+  void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
+    vehicle_status_received_ = true;
+    vehicle_armed_ = (msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
   }
 
   void odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg) {
