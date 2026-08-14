@@ -269,6 +269,7 @@ protected:
   bool airborne_ = false;   // has left the ground at least once
   bool vehicle_status_received_ = false;
   bool vehicle_armed_ = false;
+  bool offboard_active_ = false;  // this stack is flying the vehicle, not PX4
 
   // Frequency monitoring
   std::chrono::high_resolution_clock::time_point last_callback_time_;
@@ -454,7 +455,14 @@ protected:
                          z_error < z_error_threshold_ &&
                          std::abs(climb_rate) < settled_velocity_z_;
 
-    if (settled && tag_visible && airborne_) {
+    // Descend only once this stack is the one flying. Phase 2 integrates its
+    // reference open-loop and assumes the vehicle follows it; while PX4 holds
+    // the aircraft — flying its own takeoff, say — that assumption is false,
+    // and the reference walks away for the whole handover wait with nothing to
+    // pull it back. Measured at -7.6 m below the aircraft, which the SMC then
+    // dives after at engagement. Phase 1 is safe to sit in meanwhile: it
+    // re-anchors its reference to the vehicle every cycle.
+    if (settled && tag_visible && airborne_ && offboard_active_) {
       if (!phase2_transition_flag_) {
         phase2_transition_start_time_ = std::chrono::high_resolution_clock::now();
         phase2_transition_flag_ = true;
@@ -912,6 +920,7 @@ protected:
   void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
     vehicle_status_received_ = true;
     vehicle_armed_ = (msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
+    offboard_active_ = (msg->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
   }
 
   void odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg) {
