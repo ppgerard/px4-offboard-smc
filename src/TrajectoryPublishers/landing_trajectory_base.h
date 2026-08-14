@@ -106,7 +106,7 @@ public:
     const rclcpp::Time now = this->now();
     commit_wait_start_time_ = now;
     commit_start_time_ = now;
-    touchdown_condition_start_time_ = now;
+    descent_stall_start_ = now;
     last_disarm_request_time_ = now;
     last_tag_update_time_ = now;
 
@@ -159,7 +159,6 @@ protected:
   // Terminal descent (Phase 2 -> commit -> touchdown). Altitudes are the fused
   // tag-relative altitude of the body origin, so they include the vehicle's own
   // ground clearance: the T2 rests on the pad at ~0.105 m in this frame.
-  const double touchdown_altitude_ = 0.105;     // body-origin altitude at rest on the pad [m]
   const double airborne_altitude_ = 1.0;        // above this the vehicle has certainly left the pad [m]
   const double commit_altitude_ = 0.20;         // commit below this altitude (~0.10 m clearance) [m]
   const double commit_xy_error_max_ = 0.10;     // XY alignment required to commit [m]
@@ -167,10 +166,10 @@ protected:
   const double commit_wait_timeout_ = 5.0;      // commit regardless after waiting this long [s]
   const double commit_descent_rate_ = 0.4;      // fixed descent rate once committed [m/s]
   const double commit_timeout_ = 8.0;           // no touchdown by then: stop descending [s]
-  const double touchdown_hold_time_ = 0.2;      // land-detector debounce [s]
-  const double touchdown_stall_margin_ = 0.05;  // stall check only this close to the pad [m]
+  const double touchdown_max_altitude_ = 0.15;  // contact only ever declared this close to the pad [m]
+  const double touchdown_min_descent_cmd_ = 0.05;  // reference must be commanding down [m/s]
   const double touchdown_stall_speed_ = 0.05;   // descent counts as stalled below this [m/s]
-  const double touchdown_stall_time_ = 1.0;     // stalled this long = contact [s]
+  const double touchdown_stall_time_ = 1.5;     // stalled this long = contact [s]
   const double disarm_retry_period_ = 0.5;      // resend DISARM this often [s]
   const int disarm_max_attempts_ = 10;
   // Phase 1 limits (separate XY and Z)
@@ -247,14 +246,15 @@ protected:
   bool commit_wait_flag_ = false;
   rclcpp::Time commit_start_time_;
   bool commit_timeout_warned_ = false;
-  rclcpp::Time touchdown_condition_start_time_;  // debounce for the contact conditions
+  rclcpp::Time descent_stall_start_;             // debounce for the stalled-descent check
   rclcpp::Time last_disarm_request_time_;
   int disarm_attempts_ = 0;
   bool disarm_confirmed_ = false;
 
   // PX4 land detector and arming state
-  bool land_detected_received_ = false;
-  bool land_detected_contact_ = false;
+  bool land_detected_landed_ = false;
+  bool land_detected_maybe_landed_ = false;
+  bool land_detected_ground_contact_ = false;
   bool airborne_ = false;   // has left the ground at least once
   bool vehicle_status_received_ = false;
   bool vehicle_armed_ = false;
@@ -376,8 +376,7 @@ protected:
       return;  // Still in initialization delay, setpoint already published
     }
 
-    // Fallback for when the land detector is not bridged: climbing well clear of
-    // the pad is enough to arm the contact check.
+    // Arm the contact check once the vehicle has climbed clear of the pad.
     if (estimated_position_W_(2) > airborne_altitude_) {
       airborne_ = true;
     }
@@ -425,8 +424,11 @@ protected:
     bool tag_visible = tf_buffer_->canTransform(
         camera_frame_id_, platform_frame_id_, tf2::TimePointZero, tf2::durationFromSec(0.01));
 
-    // Both conditions must be true to start hysteresis timer
-    if (xy_error < xy_error_threshold_ && tag_visible) {
+    // All three must hold to start the hysteresis timer. The airborne check
+    // matters because this transition ignores Z: a node started while the
+    // vehicle sits disarmed on the pad would otherwise run straight through
+    // Phase 2 into the terminal descent without ever having flown.
+    if (xy_error < xy_error_threshold_ && tag_visible && airborne_) {
       if (!phase2_transition_flag_) {
         phase2_transition_start_time_ = std::chrono::high_resolution_clock::now();
         phase2_transition_flag_ = true;
@@ -449,7 +451,7 @@ protected:
     // the descent: there is nothing left to commit to.
     if (contactHeld()) {
       RCLCPP_WARN(this->get_logger(),
-                  "Land detector reports contact in Phase 2 at altitude=%.3f m; disarming.",
+                  "Contact detected in Phase 2 at altitude=%.3f m; disarming.",
                   estimated_position_W_(2));
       enterTouchdownPhase();
       return;
@@ -493,7 +495,7 @@ protected:
     // loop has already built up against the wind is exactly what should be kept.
     commit_position_xy_ = r_position_W_.head<2>();
     commit_start_time_ = this->now();
-    touchdown_condition_start_time_ = commit_start_time_;
+    descent_stall_start_ = commit_start_time_;
     commit_timeout_warned_ = false;
     phase_ = Phase::PHASE_3_COMMIT;
     RCLCPP_INFO(this->get_logger(),
@@ -506,9 +508,11 @@ protected:
       return;
     }
     RCLCPP_INFO(this->get_logger(),
-                "Touchdown after %.2f s of commit: estimated XY error=%.3f m, altitude=%.3f m",
+                "Touchdown after %.2f s of commit: estimated XY error=%.3f m, altitude=%.3f m "
+                "(PX4 land detector: landed=%d ground_contact=%d)",
                 (this->now() - commit_start_time_).seconds(),
-                estimated_position_W_.head<2>().norm(), estimated_position_W_(2));
+                estimated_position_W_.head<2>().norm(), estimated_position_W_(2),
+                land_detected_landed_, land_detected_ground_contact_);
     enterTouchdownPhase();
   }
 
@@ -520,32 +524,37 @@ protected:
     disarm_confirmed_ = false;
   }
 
-  // Contact is the land detector when it is available; otherwise the commanded
-  // descent stalling within a few centimetres of the pad.
+  // Touchdown evidence: within a few centimetres of the pad, the reference is
+  // still commanding a descent and the vehicle has stopped going down.
+  //
+  // PX4's own land detector deliberately plays no part in this. Both of its
+  // stages gate on a low-throttle reading taken from vehicle_thrust_setpoint
+  // (MulticopterLandDetector.cpp:219, :268), and in offboard direct-actuator
+  // control nothing publishes that topic — the reading sticks, and the detector
+  // then latches ground contact on any descent slower than LNDMC_Z_VEL_MAX. In
+  // SITL it called contact at 0.71 m in flight. Its flags are still read, but
+  // only to decide whether Commander will accept a plain disarm.
   bool contactHeld() {
-    // Never call a touchdown before the vehicle has actually left the ground:
-    // the Phase 1 -> 2 transition only looks at XY, so Phase 2 can be entered
-    // during the initial climb.
-    if (!airborne_) {
-      return false;
-    }
-
-    bool contact;
-    if (land_detected_received_) {
-      contact = land_detected_contact_;
-    } else {
-      contact = estimated_position_W_(2) < touchdown_altitude_ + touchdown_stall_margin_ &&
-                std::abs(drone_velocity_W_(2)) < touchdown_stall_speed_;
-    }
-
     const rclcpp::Time now = this->now();
-    if (!contact) {
-      touchdown_condition_start_time_ = now;
+
+    // Never call a touchdown before the vehicle has actually left the ground.
+    if (!airborne_) {
+      descent_stall_start_ = now;
       return false;
     }
-    // The land detector has already debounced itself; the stall check has not.
-    const double hold_time = land_detected_received_ ? touchdown_hold_time_ : touchdown_stall_time_;
-    return (now - touchdown_condition_start_time_).seconds() >= hold_time;
+
+    // Past the commit timeout the reference no longer commands a descent, so the
+    // timeout itself stands in for the command: it means the same thing, that
+    // the vehicle was told to go down and did not.
+    const bool descent_commanded =
+        r_velocity_W_(2) <= -touchdown_min_descent_cmd_ || commitTimedOut();
+    const bool descent_stopped = std::abs(drone_velocity_W_(2)) < touchdown_stall_speed_;
+    const bool near_pad = estimated_position_W_(2) < touchdown_max_altitude_;
+    if (!(descent_commanded && descent_stopped && near_pad)) {
+      descent_stall_start_ = now;
+      return false;
+    }
+    return (now - descent_stall_start_).seconds() >= touchdown_stall_time_;
   }
 
   void updatePhase1() {
@@ -620,13 +629,19 @@ protected:
     r_position_W_ = r_position_W_ + r_velocity_W_ * dt_;
   }
 
+  // Only meaningful inside the commit phase: elsewhere commit_start_time_ is stale.
+  bool commitTimedOut() const {
+    return phase_ == Phase::PHASE_3_COMMIT &&
+           (this->now() - commit_start_time_).seconds() > commit_timeout_;
+  }
+
   void updatePhase3Commit() {
     // Commit: the XY reference is frozen and Z descends at a fixed rate. The tag
     // estimate keeps running for the diagnostics and the touchdown check, but it
     // no longer steers the aircraft.
     updateTagPosition();
 
-    const bool timed_out = (this->now() - commit_start_time_).seconds() > commit_timeout_;
+    const bool timed_out = commitTimedOut();
     if (timed_out && !commit_timeout_warned_) {
       RCLCPP_ERROR(this->get_logger(),
                    "No touchdown %.1f s after commit (altitude estimate %.3f m); holding altitude.",
@@ -676,9 +691,18 @@ protected:
   }
 
   void sendDisarmCommand() {
+    // Commander denies a plain disarm unless its own land detector reports
+    // landed or maybe_landed, which it cannot do in offboard direct-actuator
+    // control (see contactHeld()). Where it has not confirmed the landing, force
+    // the disarm: 21196 is PX4's magic "skip the checks" value. This is only
+    // reached once our own contact check has held, i.e. with the vehicle
+    // stationary on the pad.
+    const bool px4_confirms_landed = land_detected_landed_ || land_detected_maybe_landed_;
+
     px4_msgs::msg::VehicleCommand cmd{};
     cmd.command = px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM;
     cmd.param1 = 0.0;  // 0 = disarm
+    cmd.param2 = px4_confirms_landed ? 0.0 : 21196.0;
     cmd.target_system = 1;
     cmd.target_component = 1;
     cmd.source_system = 1;
@@ -689,7 +713,8 @@ protected:
     vehicle_command_pub_->publish(cmd);
     last_disarm_request_time_ = this->now();
     disarm_attempts_++;
-    RCLCPP_INFO(this->get_logger(), "Disarm command published (attempt %d)", disarm_attempts_);
+    RCLCPP_INFO(this->get_logger(), "%s disarm command published (attempt %d)",
+                px4_confirms_landed ? "Plain" : "Forced", disarm_attempts_);
   }
 
   bool updateTagPosition() {
@@ -815,11 +840,9 @@ protected:
   }
 
   void landDetectedCallback(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg) {
-    land_detected_received_ = true;
-    land_detected_contact_ = msg->landed || msg->ground_contact;
-    if (!msg->landed && !msg->maybe_landed) {
-      airborne_ = true;
-    }
+    land_detected_landed_ = msg->landed;
+    land_detected_maybe_landed_ = msg->maybe_landed;
+    land_detected_ground_contact_ = msg->ground_contact;
   }
 
   void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
