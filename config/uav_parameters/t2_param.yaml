@@ -15,7 +15,7 @@
       moment_constant: 0.05     # m
       thrust_constant: 1.6e-05   # N.s^2/rad^2
       gravity: 9.81                # m/s^2
-      pitch_trim_deg: -4.1         # compensates the tiltrotor's natural mounting tilt
+      pitch_trim_deg: 0.0         # compensates the tiltrotor's natural mounting tilt
       omega_to_pwm_coefficient:
         x_2: 0.001142
         x_1: 0.2273
