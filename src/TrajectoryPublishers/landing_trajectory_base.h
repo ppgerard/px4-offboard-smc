@@ -106,7 +106,6 @@ public:
     const rclcpp::Time now = this->now();
     commit_wait_start_time_ = now;
     commit_start_time_ = now;
-    descent_stall_start_ = now;
     last_disarm_request_time_ = now;
     last_tag_update_time_ = now;
 
@@ -166,12 +165,12 @@ protected:
   const double commit_wait_timeout_ = 5.0;      // commit regardless after waiting this long [s]
   const double commit_descent_rate_ = 0.4;      // fixed descent rate once committed [m/s]
   const double commit_timeout_ = 8.0;           // no touchdown by then: stop descending [s]
-  const double touchdown_max_altitude_ = 0.15;  // contact only ever declared this close to the pad [m]
-  const double touchdown_min_descent_cmd_ = 0.05;  // reference must be commanding down [m/s]
-  const double touchdown_stall_speed_ = 0.05;   // descent counts as stalled below this [m/s]
-  const double touchdown_stall_time_ = 1.5;     // stalled this long = contact [s]
+  const double touchdown_max_altitude_ = 0.30;  // contact only ever declared this close to the pad [m]
+  const double touchdown_ref_gap_ = 0.25;       // reference this far below the vehicle = not following [m]
+  const double touchdown_stall_speed_ = 0.10;   // filtered descent rate below this counts as stopped [m/s]
+  const double velocity_lpf_alpha_ = 0.05;      // filter on odometry vz for the contact check
+  const double touchdown_stall_time_ = 0.7;     // stalled this long = contact [s]
   const double disarm_retry_period_ = 0.5;      // resend DISARM this often [s]
-  const int disarm_max_attempts_ = 10;
   // Phase 1 limits (separate XY and Z)
   const double max_velocity_xy_ = 1.0;     // Maximum velocity XY [m/s] (Phase 1)
   const double max_velocity_z_ = 2.0;      // Maximum velocity Z [m/s] (Phase 1)
@@ -182,7 +181,13 @@ protected:
   const double phase2_max_velocity_z_ = 0.3;      // Maximum velocity Z in Phase 2 [m/s]
   const double phase2_max_acceleration_xy_ = 0.8; // Maximum acceleration XY in Phase 2 [m/s²]
   const double phase2_max_acceleration_z_ = 0.3;  // Maximum acceleration Z in Phase 2 [m/s²]
-  const double phase2_descent_rate_z_ = 0.3;   // Constant descent rate in Z during Phase 2 [m/s]
+  // Descent cone: altitude is only given up while the aircraft is inside a cone
+  // that narrows as it descends, which bounds the touchdown error by design
+  // instead of measuring it afterwards. A gust that pushes it off-centre pauses
+  // the descent rather than racing it to the ground.
+  const double cone_slope_ = 0.30;          // cone radius gained per metre of height [m/m]
+  const double cone_radius_min_ = 0.05;     // cone radius at the pad [m]
+  const double cone_tag_max_age_ = 0.3;     // no fresh tag, no descent [s]
   const double lpf_alpha_ = 1;        // Low-pass filter coefficient for AprilTag pose [0, 1]
   const double lpf_alpha_velocity_ = 0.2; // Low-pass filter coefficient for velocity [0, 1]
   // Phase 1 setpoint
@@ -246,7 +251,8 @@ protected:
   bool commit_wait_flag_ = false;
   rclcpp::Time commit_start_time_;
   bool commit_timeout_warned_ = false;
-  rclcpp::Time descent_stall_start_;             // debounce for the stalled-descent check
+  double contact_score_ = 0.0;                   // integrated evidence of contact [s]
+  double drone_velocity_filtered_z_ = 0.0;       // low-passed vertical speed [m/s]
   rclcpp::Time last_disarm_request_time_;
   int disarm_attempts_ = 0;
   bool disarm_confirmed_ = false;
@@ -312,6 +318,10 @@ protected:
   Eigen::Vector3d applyLowPassFilter(const Eigen::Vector3d& new_value,
                                      const Eigen::Vector3d& old_value,
                                      double alpha) {
+    return alpha * new_value + (1.0 - alpha) * old_value;
+  }
+
+  double applyLowPassFilterScalar(double new_value, double old_value, double alpha) {
     return alpha * new_value + (1.0 - alpha) * old_value;
   }
 
@@ -495,7 +505,7 @@ protected:
     // loop has already built up against the wind is exactly what should be kept.
     commit_position_xy_ = r_position_W_.head<2>();
     commit_start_time_ = this->now();
-    descent_stall_start_ = commit_start_time_;
+    contact_score_ = 0.0;
     commit_timeout_warned_ = false;
     phase_ = Phase::PHASE_3_COMMIT;
     RCLCPP_INFO(this->get_logger(),
@@ -535,26 +545,29 @@ protected:
   // SITL it called contact at 0.71 m in flight. Its flags are still read, but
   // only to decide whether Commander will accept a plain disarm.
   bool contactHeld() {
-    const rclcpp::Time now = this->now();
-
     // Never call a touchdown before the vehicle has actually left the ground.
     if (!airborne_) {
-      descent_stall_start_ = now;
+      contact_score_ = 0.0;
       return false;
     }
 
-    // Past the commit timeout the reference no longer commands a descent, so the
-    // timeout itself stands in for the command: it means the same thing, that
-    // the vehicle was told to go down and did not.
-    const bool descent_commanded =
-        r_velocity_W_(2) <= -touchdown_min_descent_cmd_ || commitTimedOut();
-    const bool descent_stopped = std::abs(drone_velocity_W_(2)) < touchdown_stall_speed_;
+    // The primary evidence is the reference running away downwards: it sinks at
+    // commit_descent_rate_, so if the vehicle is on the ground the gap between
+    // where it is told to be and where it is grows steadily. That signal comes
+    // from odometry and our own reference only — no tag, no PX4 state.
+    const bool not_following = (drone_position_W_(2) - r_position_W_(2)) > touchdown_ref_gap_;
+    const bool descent_stopped = std::abs(drone_velocity_filtered_z_) < touchdown_stall_speed_;
     const bool near_pad = estimated_position_W_(2) < touchdown_max_altitude_;
-    if (!(descent_commanded && descent_stopped && near_pad)) {
-      descent_stall_start_ = now;
-      return false;
+
+    // Integrate rather than require an unbroken window: on the ground, rotor wash
+    // and airframe vibration put isolated samples outside the velocity band, and
+    // a plain hysteresis timer restarts on every one of them.
+    if (not_following && descent_stopped && near_pad) {
+      contact_score_ = std::min(contact_score_ + dt_, touchdown_stall_time_);
+    } else {
+      contact_score_ = std::max(contact_score_ - dt_, 0.0);
     }
-    return (now - descent_stall_start_).seconds() >= touchdown_stall_time_;
+    return contact_score_ >= touchdown_stall_time_;
   }
 
   void updatePhase1() {
@@ -588,6 +601,23 @@ protected:
     r_position_W_ = drone_position_W_ + r_velocity_W_ * dt_;
   }
 
+  // Descent rate the alignment currently earns: full rate on the axis of the
+  // cone, nothing at its edge, nothing at all on a stale estimate. The cone
+  // radius narrows with height, so the horizontal error at touchdown is bounded
+  // by cone_radius_min_ by construction rather than measured after the fact.
+  double coneDescentLimit() {
+    const double height = std::max(estimated_position_W_(2), 0.0);
+    const double xy_error = estimated_position_W_.head<2>().norm();
+    const double cone_radius = cone_slope_ * height + cone_radius_min_;
+    const double alignment = std::clamp(1.0 - xy_error / cone_radius, 0.0, 1.0);
+
+    // Stands in for the estimator confidence a covariance would give us.
+    const bool tag_fresh = tag_measurement_received_ &&
+        (this->now() - last_tag_update_time_).seconds() < cone_tag_max_age_;
+
+    return tag_fresh ? phase2_max_velocity_z_ * alignment : 0.0;
+  }
+
   void updatePhase2() {
     // Phase 2: Use TF to get tag position and move to phase_2_target_ with controlled descent
     updateTagPosition();
@@ -601,6 +631,10 @@ protected:
     // Saturate velocity: limit XY norm and Z separately
     saturateXY(desired_velocity, phase2_max_velocity_xy_);
     saturateZ(desired_velocity, phase2_max_velocity_z_);
+
+    // Descend on a cone, not on a clock: the further off-centre the aircraft is
+    // relative to its height, the slower it is allowed to come down.
+    desired_velocity(2) = std::max(desired_velocity(2), -coneDescentLimit());
 
     // Stop descending at the commit altitude: below it the terminal descent
     // takes over, and it only starts once the aircraft is centred.
@@ -665,8 +699,9 @@ protected:
   }
 
   void updatePhase4Touchdown() {
-    // Hold the touchdown reference and disarm. PX4 can reject the request while
-    // its own land detector is still settling, so retry a few times.
+    // Hold the touchdown reference and disarm. Keep asking until the vehicle
+    // reports disarmed: giving up would leave it armed on the pad, which is the
+    // failure this phase exists to prevent.
     r_velocity_W_.setZero();
     r_acceleration_W_.setZero();
 
@@ -675,13 +710,13 @@ protected:
     }
     if (vehicle_status_received_ && !vehicle_armed_) {
       disarm_confirmed_ = true;
-      RCLCPP_INFO(this->get_logger(), "Disarmed. Landing complete.");
+      RCLCPP_INFO(this->get_logger(), "Disarmed after %d request(s). Landing complete.",
+                  disarm_attempts_);
       return;
     }
-    if (disarm_attempts_ >= disarm_max_attempts_) {
-      RCLCPP_ERROR_ONCE(this->get_logger(),
-                        "Vehicle still armed after %d disarm requests.", disarm_max_attempts_);
-      return;
+    if (disarm_attempts_ > 0 && disarm_attempts_ % 10 == 0) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "Vehicle still armed after %d disarm requests.", disarm_attempts_);
     }
     if (disarm_attempts_ > 0 &&
         (this->now() - last_disarm_request_time_).seconds() < disarm_retry_period_) {
@@ -867,6 +902,9 @@ protected:
 
     drone_position_W_ = position;
     drone_velocity_W_ = velocity;
+    // Low-passed for the contact check, which must not restart on single samples.
+    drone_velocity_filtered_z_ = applyLowPassFilterScalar(velocity(2), drone_velocity_filtered_z_,
+                                                          velocity_lpf_alpha_);
     drone_orientation_W_ = orientation;
     drone_angular_velocity_W_ = angular_velocity;
     last_odometry_timestamp_ = odom_msg->timestamp;
