@@ -28,6 +28,7 @@
 #include <deque>
 #include <memory>
 #include <cmath>
+#include <limits>
 #include "rclcpp/rclcpp.hpp"
 #include "trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -120,9 +121,25 @@ public:
     drone_orientation_W_ = Eigen::Quaterniond::Identity();
     drone_angular_velocity_W_.setZero();
 
-    // Initialize rotation matrices
-    // R_b_cam: rotation from camera to body (-90° around z, then 180° around x)
-    Eigen::AngleAxisd rot_z(-M_PI / 2.0, Eigen::Vector3d::UnitZ());
+    // R_b_cam: rotation from the camera OPTICAL frame to body FLU (+90° about z,
+    // then 180° about x), giving optical x -> body -Y, optical y -> body -X,
+    // optical z -> body -Z.
+    //
+    // Derived from the mounting, not guessed. The camera link sits at
+    // <pose>0 0 -0.10 0 1.5707 0</pose>, so Ry(90°) takes link x -> body -Z
+    // (boresight down), link y -> body +Y, link z -> body +X. The detector's
+    // translation is a solvePnP output and so is in the ROS optical convention
+    // (x right, y down, z forward), which relates to the link frame by
+    // optical_x = -link_y, optical_y = -link_z, optical_z = +link_x.
+    //
+    // This used to use -pi/2, which inverts both lateral axes: a 180° error
+    // about the boresight. It reported the vehicle on the opposite side of the
+    // pad, so the approach flew directly away from the tag and the aircraft
+    // drifted off. It survived every synthetic test because fake_tag_tf.py was
+    // written to mirror this same constant, so the error cancelled there and
+    // only ever appeared against a real camera. Measured before the fix: the
+    // estimate read [-1.93 -1.23 2.69] with the vehicle truly at [1.99 0.90 3.04].
+    Eigen::AngleAxisd rot_z(M_PI / 2.0, Eigen::Vector3d::UnitZ());
     Eigen::AngleAxisd rot_x(M_PI, Eigen::Vector3d::UnitX());
     R_b_cam_ = (rot_x * rot_z).toRotationMatrix();
 
@@ -174,6 +191,10 @@ protected:
   const double settled_velocity_z_ = 0.2;   // ... and vertical speed that counts as settled [m/s]
   const double xy_error_min_time_ = 0.5;    // ... all held this long before descending [s]
   const double airborne_altitude_ = 1.0;    // above this the vehicle has certainly flown [m]
+  // Longer than the descent gate: losing the tag for a moment while still far
+  // from the pad should not throw away the approach, but steering at a stale
+  // estimate for longer than this is a fly-away rather than a hold.
+  const double phase1_tag_max_age_ = 1.0;   // aim at the tag only this fresh [s]
 
   // ---- Phase 2: vision-guided descent ----------------------------------------
   //
@@ -451,25 +472,32 @@ protected:
     publishTrajectoryPoint();
     onSetpointPublished();
 
-    // Publish platform position feedback (from TF) while the vision loop is closed
-    if (phase_ == Phase::PHASE_2 || phase_ == Phase::PHASE_3_COMMIT) {
-      publishPlatformPosition();
-    }
+    // Publish the tag-relative estimate in every phase. This used to be gated to
+    // phases 2 and 3, which meant the one signal that explains what the aircraft
+    // thinks it is doing went silent in exactly the phase where it now aims --
+    // and a Phase 1 that never advanced looked, from outside, like a vehicle
+    // with no estimate at all. Diagnostics should not have phase conditions.
+    publishPlatformPosition();
 
     // Publish diagnostic topics
     publishDiagnostics();
   }
 
   void checkPhase1To2Transition() {
-    // Error against the actual drone position, on all three axes.
-    const Eigen::Vector3d error = phase_1_target_ - drone_position_W_;
+    // Error against the tag, in the same frame Phase 1 now flies in, so the
+    // condition that releases the descent is the condition the descent needs:
+    // centred over the pad, not merely settled somewhere.
+    const Eigen::Vector3d error = phase_1_target_ - estimated_position_W_;
     const double xy_error = error.head<2>().norm();
     const double z_error = std::abs(error(2));
     const double climb_rate = drone_velocity_W_(2);
 
-    // Check if tag is visible
-    bool tag_visible = tf_buffer_->canTransform(
-        camera_frame_id_, platform_frame_id_, tf2::TimePointZero, tf2::durationFromSec(0.01));
+    // canTransform() is not a visibility test. It succeeds on the last detection
+    // for as long as the transform stays in the buffer, and the detector keeps
+    // publishing empty TF messages while it sees nothing, so this used to hand
+    // Phase 2 an aircraft that had not seen the tag for minutes. Require a
+    // measurement recent enough to steer on.
+    const bool tag_visible = tagIsFresh(cone_tag_max_age_);
 
     // The hold has to be settled, not merely centred. Phase 2 rate-limits its
     // reference velocity to phase2_max_acceleration_z_, so handing it a climb
@@ -539,8 +567,7 @@ protected:
 
     const double xy_error = estimated_position_W_.head<2>().norm();
     const bool aligned = xy_error < commit_xy_error_max_;
-    const bool tag_fresh = tag_measurement_received_ &&
-        (this->now() - last_tag_update_time_).seconds() < commit_tag_max_age_;
+    const bool tag_fresh = tagIsFresh(commit_tag_max_age_);
     const bool waited_long_enough =
         (this->now() - commit_wait_start_time_).seconds() >= commit_wait_timeout_;
 
@@ -639,11 +666,49 @@ protected:
   }
 
   void updatePhase1() {
-    // Phase 1: Move to phase_1_target_ with proportional velocity control
-    // Use actual drone position from odometry for real-time feedback
+    // Phase 1: fly to phase_1_target_, which is a point above *the tag*.
     updateTagPosition();
 
-    Eigen::Vector3d position_error = phase_1_target_ - drone_position_W_;
+    // The target has to be resolved against the tag, not against odometry.
+    // estimated_position_W_ is the vehicle relative to the tag; drone_position_W_
+    // is the vehicle relative to wherever PX4 happened to initialise its local
+    // frame, which is the takeoff point. Those two agree only when the aircraft
+    // launched from the pad -- true of the default synthetic harness and of
+    // essentially nothing else. Fly the odometry version anywhere else and the
+    // aircraft parks over its own launch point with the tag outside the camera's
+    // footprint (~3 m radius at 2.5 m), so the detector sees nothing, the descent
+    // gate never opens, and it hovers silently until it drifts away. That is not
+    // hypothetical: measured 4.5 m off the pad while the estimate read 0.02 m,
+    // because with no detections the estimate is just dead-reckoned odometry.
+    // Aim at the tag only while the tag is actually being seen. tag_measurement_
+    // received_ latches on the first detection and never clears, so trusting it
+    // means that once the tag has been seen once the aircraft keeps steering at
+    // a purely dead-reckoned estimate forever. That is a fly-away, not a hold:
+    // the estimate drifts, the aircraft chases it, the tag leaves the frame, and
+    // nothing pulls it back. A short grace period rides out ordinary dropouts;
+    // past that, hold XY and wait for the tag rather than guess where it is.
+    Eigen::Vector3d position_error;
+    if (tagIsFresh(phase1_tag_max_age_)) {
+      position_error = phase_1_target_ - estimated_position_W_;
+    } else {
+      // No usable bearing on the tag: hold XY where the aircraft is and take only
+      // the altitude from the target, which is what gives the tag a chance to
+      // enter the frame at all.
+      position_error = Eigen::Vector3d(0.0, 0.0, phase_1_target_(2) - drone_position_W_(2));
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "%s; holding XY at the current position and keeping %.1f m altitude "
+                           "to search. The approach cannot be aimed until the tag is seen.",
+                           tag_measurement_received_
+                               ? "Tag lost" : "No tag acquired yet",
+                           phase_1_target_(2));
+    }
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Phase 1: tag-relative est [%.2f %.2f %.2f], tag age %.2f s, "
+                         "XY error to hold point %.2f m",
+                         estimated_position_W_(0), estimated_position_W_(1),
+                         estimated_position_W_(2), tagAge(),
+                         (phase_1_target_ - estimated_position_W_).head<2>().norm());
 
     // Desired velocity proportional to position error
     Eigen::Vector3d desired_velocity = K_p_ * position_error;
@@ -680,10 +745,23 @@ protected:
     const double alignment = std::clamp(1.0 - xy_error / cone_radius, 0.0, 1.0);
 
     // Stands in for the estimator confidence a covariance would give us.
-    const bool tag_fresh = tag_measurement_received_ &&
-        (this->now() - last_tag_update_time_).seconds() < cone_tag_max_age_;
-
-    return tag_fresh ? phase2_max_velocity_z_ * alignment : 0.0;
+    if (!tagIsFresh(cone_tag_max_age_)) {
+      // Say so. A descent that stops because the tag went stale is otherwise
+      // indistinguishable from a vehicle simply hovering, and the aircraft will
+      // sit there until something else intervenes. Silence here is what made a
+      // vehicle parked 4.5 m off the pad look like a controller problem.
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                           "Descent paused: no tag measurement for %.1f s (need < %.1f s). "
+                           "Altitude %.2f m, XY %.2f m by the last estimate.",
+                           tagAge(), cone_tag_max_age_, estimated_position_W_(2), xy_error);
+      return 0.0;
+    }
+    if (alignment <= 0.0) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                           "Descent paused: %.2f m off centre, outside the %.2f m cone at "
+                           "%.2f m altitude.", xy_error, cone_radius, height);
+    }
+    return phase2_max_velocity_z_ * alignment;
   }
 
   void updatePhase2() {
@@ -819,6 +897,21 @@ protected:
     RCLCPP_INFO(this->get_logger(), "%s disarm command published (attempt %d)",
                 px4_confirms_landed ? "Plain" : "Forced", disarm_attempts_);
   }
+
+  // Age of the newest tag measurement actually consumed [s]. Large when nothing
+  // has arrived yet, so callers can treat "never seen" and "long lost" alike.
+  double tagAge() const {
+    if (!tag_measurement_received_) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return (this->now() - last_tag_update_time_).seconds();
+  }
+
+  // A transform being present in the TF buffer is not the same as the tag being
+  // seen: lookupTransform() happily returns the last detection forever, and the
+  // detector keeps publishing empty TF messages when it finds nothing. Freshness
+  // is the only signal that separates the two.
+  bool tagIsFresh(double max_age) const { return tagAge() < max_age; }
 
   // Vehicle attitude at `time`, interpolated from the odometry history.
   //
@@ -1039,8 +1132,14 @@ protected:
   }
 
   void publishPlatformPosition() {
-    // Publish fused position estimate (100Hz prediction + 15Hz correction from tag)
-    // This is the feedback that controller_node will use via setActualPosition()
+    // Fused tag-relative position of the vehicle (100 Hz odometry prediction,
+    // corrected at the ~15 Hz measurement rate). Telemetry only: nothing
+    // subscribes to it. The controller closes on command/trajectory against its
+    // own odometry, and the tag reaches it solely through that setpoint -- the
+    // outer loop lives in this node. (An older comment here claimed
+    // controller_node consumed this via setActualPosition(); no such subscriber
+    // or method exists, and describing a loop that is not wired invites someone
+    // to debug the wrong side of it.)
     geometry_msgs::msg::Vector3 pos_msg;
     pos_msg.x = estimated_position_W_(0);
     pos_msg.y = estimated_position_W_(1);
