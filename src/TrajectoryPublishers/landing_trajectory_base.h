@@ -443,6 +443,33 @@ protected:
       return;  // Still in initialization delay, setpoint already published
     }
 
+    // Say so when there is nobody listening to the setpoints. A disarmed vehicle
+    // ignores this node completely, so every phase below keeps computing and
+    // logging a perfectly healthy trajectory while the aircraft sits on the pad --
+    // which reads exactly like a guidance bug and is not one. It happens for real:
+    // PX4's land detector calls "Landing detected" seconds after liftoff in
+    // offboard direct-actuator mode (see contactHeld() below for why its throttle
+    // reading is meaningless here), and COM_DISARM_LAND then cuts the motors
+    // mid-climb. The same silence hid a stalled descent last session; a stalled
+    // takeoff deserves the same treatment.
+    //
+    // Warn only once it has actually flown, and only when the disarm was not
+    // ours: streaming setpoints at a disarmed vehicle is how offboard is entered
+    // in the first place, and Phase 4 disarms on purpose. Warning in either case
+    // would fire on every healthy run and train the reader to ignore it.
+    if (vehicle_status_received_ && !vehicle_armed_ && airborne_ &&
+        phase_ != Phase::PHASE_4_TOUCHDOWN) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Vehicle DISARMED in flight (phase %d, altitude %.2f m); setpoints "
+                           "are still being published but nothing is flying them. PX4's land "
+                           "detector does this in offboard direct-actuator mode -- set "
+                           "COM_DISARM_LAND 0.",
+                           static_cast<int>(phase_), estimated_position_W_(2));
+    } else if (vehicle_status_received_ && !offboard_active_ && phase_ != Phase::PHASE_1) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Not in offboard (nav_state); PX4 is flying, not this node.");
+    }
+
     // Arm the contact check once the vehicle has climbed clear of the pad.
     if (estimated_position_W_(2) > airborne_altitude_) {
       airborne_ = true;
