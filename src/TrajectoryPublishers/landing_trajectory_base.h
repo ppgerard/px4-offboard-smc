@@ -935,13 +935,19 @@ protected:
         // which stalls every timer here and is worse than this fallback.
         const double measurement_age = (this->now() - measurement_stamp).seconds();
         if (std::abs(measurement_age) > kImplausibleMeasurementAge) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                               "Tag stamp is not on this node's clock (apparent age %.0f s): "
-                               "the transform is stamped on the simulator clock while this node "
-                               "uses wall time. Pairing with the latest attitude, which costs "
-                               "only the latency compensation. To restore it, bridge /clock and "
-                               "run this node with use_sim_time -- neither alone is enough.",
-                               measurement_age);
+          // Say this once, not on a timer: a clock-domain mismatch is a fixed
+          // property of how the stack was launched, so repeating it only buries
+          // the tf2 TF_OLD_DATA warnings that share its root cause.
+          RCLCPP_WARN_ONCE(this->get_logger(),
+                           "Tag stamp is not on this node's clock (apparent age %.0f s): the "
+                           "transform is stamped on the simulator clock while this node uses "
+                           "wall time. Pairing with the latest attitude for the rest of this "
+                           "run, which costs only the latency compensation. To restore it, "
+                           "bridge /clock and run this node with use_sim_time -- neither alone "
+                           "is enough. If tf2 is also logging TF_OLD_DATA for the platform "
+                           "frame, something else is publishing it on a second clock (usually "
+                           "a leftover fake_tag_tf.py); run tools/tf_clock_check.py.",
+                           measurement_age);
         } else {
           RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                "Tag measurement is %.2f s old, beyond the %.1f s attitude "
