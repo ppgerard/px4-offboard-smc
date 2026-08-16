@@ -696,38 +696,38 @@ protected:
     // Phase 1: fly to phase_1_target_, which is a point above *the tag*.
     updateTagPosition();
 
-    // The target has to be resolved against the tag, not against odometry.
-    // estimated_position_W_ is the vehicle relative to the tag; drone_position_W_
-    // is the vehicle relative to wherever PX4 happened to initialise its local
-    // frame, which is the takeoff point. Those two agree only when the aircraft
-    // launched from the pad -- true of the default synthetic harness and of
-    // essentially nothing else. Fly the odometry version anywhere else and the
-    // aircraft parks over its own launch point with the tag outside the camera's
-    // footprint (~3 m radius at 2.5 m), so the detector sees nothing, the descent
-    // gate never opens, and it hovers silently until it drifts away. That is not
-    // hypothetical: measured 4.5 m off the pad while the estimate read 0.02 m,
-    // because with no detections the estimate is just dead-reckoned odometry.
-    // Aim at the tag only while the tag is actually being seen. tag_measurement_
-    // received_ latches on the first detection and never clears, so trusting it
-    // means that once the tag has been seen once the aircraft keeps steering at
-    // a purely dead-reckoned estimate forever. That is a fly-away, not a hold:
-    // the estimate drifts, the aircraft chases it, the tag leaves the frame, and
-    // nothing pulls it back. A short grace period rides out ordinary dropouts;
-    // past that, hold XY and wait for the tag rather than guess where it is.
+    // Two frames, and the approach uses whichever one is actually backed by a
+    // measurement. estimated_position_W_ is the vehicle relative to the tag;
+    // drone_position_W_ is the vehicle relative to wherever PX4 initialised its
+    // local frame, which is the takeoff point. With a live tag the first is
+    // strictly better: it aims at the pad rather than at the launch point, and
+    // the two agree only when the aircraft took off from the pad.
+    //
+    // Without a live tag, fly the odometry hold point. This deliberately does NOT
+    // freeze XY, which is what it used to do: with no detection ever received the
+    // estimate is pure dead-reckoned odometry, so holding station parks the
+    // aircraft wherever it happened to be when the node started, pointing its
+    // camera at empty ground -- it can never acquire the tag, and the run is over
+    // before it begins. That is worse than the thing the freeze was guarding
+    // against. The odometry target is bounded and deterministic (a fixed point in
+    // the local frame, normally the pad the vehicle launched from), so it is a
+    // real search behaviour rather than a guess that drifts.
+    //
+    // Note the descent gate is unaffected: checkPhase1To2Transition() still
+    // requires a genuinely fresh tag, so a stale approach can loiter here but can
+    // never release the descent.
     Eigen::Vector3d position_error;
     if (tagIsFresh(phase1_tag_max_age_)) {
       position_error = phase_1_target_ - estimated_position_W_;
     } else {
-      // No usable bearing on the tag: hold XY where the aircraft is and take only
-      // the altitude from the target, which is what gives the tag a chance to
-      // enter the frame at all.
-      position_error = Eigen::Vector3d(0.0, 0.0, phase_1_target_(2) - drone_position_W_(2));
+      position_error = phase_1_target_ - drone_position_W_;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "%s; holding XY at the current position and keeping %.1f m altitude "
-                           "to search. The approach cannot be aimed until the tag is seen.",
-                           tag_measurement_received_
-                               ? "Tag lost" : "No tag acquired yet",
-                           phase_1_target_(2));
+                           "%s (age %.1f s); flying the odometry hold point [%.1f %.1f %.1f] to "
+                           "search for it. The descent stays locked until the tag is seen.",
+                           tag_measurement_received_ ? "Tag lost" : "No tag has EVER been received"
+                                                       " -- is the detector (or fake_tag_tf.py)"
+                                                       " running?",
+                           tagAge(), phase_1_target_(0), phase_1_target_(1), phase_1_target_(2));
     }
 
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
