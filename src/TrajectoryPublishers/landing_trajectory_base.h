@@ -230,7 +230,7 @@ protected:
   const double commit_tag_max_age_ = 0.5;    // tag measurement must be fresher than this [s]
   const double commit_wait_timeout_ = 5.0;   // commit regardless after waiting this long [s]
   const double commit_descent_rate_ = 0.4;   // fixed descent rate once committed [m/s]
-  const double commit_timeout_ = 8.0;        // no touchdown by then: stop descending [s]
+  const double commit_timeout_ = 8.0;        // no touchdown by then: disarm anyway [s]
 
   // ---- Phase 4: touchdown and disarm -----------------------------------------
   const double touchdown_max_altitude_ = 0.30;  // contact only ever declared this close to the pad [m]
@@ -298,7 +298,9 @@ protected:
   rclcpp::Time commit_wait_start_time_;          // waiting for alignment at commit altitude
   bool commit_wait_flag_ = false;
   rclcpp::Time commit_start_time_;
-  bool commit_timeout_warned_ = false;
+  bool contact_not_following_ = false;
+  bool contact_descent_stopped_ = false;
+  bool contact_near_pad_ = false;
   double contact_score_ = 0.0;                   // integrated evidence of contact [s]
   double drone_velocity_filtered_z_ = 0.0;       // low-passed vertical speed [m/s]
   rclcpp::Time last_disarm_request_time_;
@@ -663,7 +665,6 @@ protected:
 
     commit_start_time_ = this->now();
     contact_score_ = 0.0;
-    commit_timeout_warned_ = false;
     phase_ = Phase::PHASE_3_COMMIT;
     RCLCPP_INFO(this->get_logger(),
                 "Transitioning to Phase 3 (Commit) - altitude=%.3f m, XY error=%.3f m, descending at %.2f m/s "
@@ -673,6 +674,29 @@ protected:
 
   void checkPhase3To4Transition() {
     if (!contactHeld()) {
+      // The timeout bounds the phase; it does not brake the descent. It used to
+      // zero the reference velocity, and that removed contactHeld()'s primary
+      // evidence -- the reference running away below the vehicle only grows while
+      // the reference keeps sinking. Freezing it deleted the one signal that ends
+      // the phase, so the aircraft sat on the pad, armed, with the reference
+      // parked just above the contact threshold: measured at 18 s, 27 s and once
+      // 80 s, by which point XY had drifted 39 cm because commit freezes XY and
+      // the wind does not. Shortening the timeout made it fire sooner and stall
+      // more often; the value was never the problem, the braking was.
+      //
+      // A vehicle this far into a 0.5 s descent is on the ground whatever the
+      // estimate says, and it committed from at most commit_altitude_, so
+      // disarming is bounded and is the safe reading. Holding is not.
+      if (commitTimedOut()) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "No touchdown %.1f s after commit (altitude estimate %.3f m); disarming. "
+                     "Contact evidence still missing: %s%s%s",
+                     commit_timeout_, estimated_position_W_(2),
+                     contact_not_following_ ? "" : "reference gap too small ",
+                     contact_descent_stopped_ ? "" : "still descending ",
+                     contact_near_pad_ ? "" : "altitude above the pad threshold ");
+        enterTouchdownPhase();
+      }
       return;
     }
     RCLCPP_INFO(this->get_logger(),
@@ -716,6 +740,12 @@ protected:
     const bool not_following = (drone_position_W_(2) - r_position_W_(2)) > touchdown_ref_gap_;
     const bool descent_stopped = std::abs(drone_velocity_filtered_z_) < touchdown_stall_speed_;
     const bool near_pad = estimated_position_W_(2) < touchdown_max_altitude_;
+
+    // Kept only so a stalled commit can report which condition is holding it up.
+    // Inferring that from the outside cost a long debugging session once.
+    contact_not_following_ = not_following;
+    contact_descent_stopped_ = descent_stopped;
+    contact_near_pad_ = near_pad;
 
     // Integrate rather than require an unbroken window: on the ground, rotor wash
     // and airframe vibration put isolated samples outside the velocity band, and
@@ -884,16 +914,10 @@ protected:
     // no longer steers the aircraft.
     updateTagPosition();
 
-    const bool timed_out = commitTimedOut();
-    if (timed_out && !commit_timeout_warned_) {
-      RCLCPP_ERROR(this->get_logger(),
-                   "No touchdown %.1f s after commit (altitude estimate %.3f m); holding altitude.",
-                   commit_timeout_, estimated_position_W_(2));
-      commit_timeout_warned_ = true;
-    }
-
     // Ramp into the descent rate so the acceleration feedforward stays bounded.
-    const double target_velocity_z = timed_out ? 0.0 : -commit_descent_rate_;
+    // The commit timeout deliberately does NOT brake this: see
+    // checkPhase3To4Transition(), where it ends the phase instead.
+    const double target_velocity_z = -commit_descent_rate_;
     const double max_velocity_step = phase2_max_acceleration_z_ * dt_;
     const double velocity_step = std::clamp(target_velocity_z - r_velocity_W_(2),
                                             -max_velocity_step, max_velocity_step);
