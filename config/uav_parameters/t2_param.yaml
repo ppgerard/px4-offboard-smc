@@ -28,10 +28,19 @@
       camera_frame_id: "t2_cruza_vtol_0/camera_link/imager"
       platform_frame_id: "platform"
       world_frame_id: "world"
-      camera_offset_body:        # position of camera in body frame [m]
+      # Position of the camera's optical centre in body FLU [m]. Read off the
+      # SDF, not guessed: t2_cruza_vtol/model.sdf includes mono_cam at
+      # <pose>0 0 -0.10 0 1.5707 0</pose>, base_link is at the model origin
+      # (<pose>0 0 0 ...>), and the imager sensor sits at the camera_link origin.
+      # So the optical centre is 0.10 m below the body origin.
+      #
+      # This was -0.03 for the whole project -- a 7 cm error, which is a 2.3%
+      # scale error on the projection at 3 m and 23% at 0.3 m. It is the thing
+      # extrinsic_sigma in the filter was standing in for.
+      camera_offset_body:
         x: 0.0
         y: 0.0
-        z: -0.03
+        z: -0.10
       # Detector interface for the pixel-space estimator (roadmap item 7).
       detections_topic: "/apriltag/detections"
       camera_info_topic: "/sensor/imager/camera_info"

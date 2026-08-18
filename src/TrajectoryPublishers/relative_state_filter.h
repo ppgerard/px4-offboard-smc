@@ -13,7 +13,23 @@
 //
 //   x = [ p_rel (3)   vehicle body origin relative to the platform origin, world axes [m]
 //         v_rel (3)   its derivative; on a static pad, the vehicle velocity   [m/s]
-//         psi_pf(1)   platform yaw relative to the world x axis               [rad] ]
+//         psi_pf(1)   platform yaw relative to the world x axis               [rad]
+//         b_v   (3)   bias on the navigation velocity measurement             [m/s] ]
+//
+// b_v is a MEASUREMENT bias, not a force: it is what EKF2's velocity is wrong by,
+// which is a slowly drifting quantity rather than white noise. It is NOT f_ext --
+// that is an unmodelled input to the DYNAMICS and needs a specific-force input
+// this filter is not given (roadmap item 8). The two look alike and sit on
+// opposite sides of the filter.
+//
+// Modelling it replaces a fudge. Fusing a time-correlated velocity error at 50 Hz
+// as if it were white drives the velocity covariance almost to zero, and the
+// position covariance then grows far more slowly than the estimate really drifts.
+// The previous compromise was an extra random walk laid directly on position,
+// which grows as sqrt(t) where a real drifting bias grows LINEARLY -- so no single
+// value was right both while the tag was visible and through a loss of it. With
+// the bias as a state the uncertainty reaches position through the integration and
+// comes out the right shape, with nothing to retune per outage length.
 //
 // f_ext (§05 / roadmap item 8) and the camera boresight bias are deliberately
 // left out until this much is consistent: every extra state is another thing
@@ -181,18 +197,38 @@ struct RelativeStateFilterConfig {
   // unmodelled and this has to cover it: the T2 commands up to 2.5 m/s^2 in the
   // approach and rides 5 m/s gusts.
   double accel_noise_density = 2.0;          // [m/s^2/sqrt(Hz)]
-  // Position random walk on top of the velocity integral. The velocity
-  // measurements below are EKF2 outputs, so their errors are time-correlated
-  // rather than white; fusing them at 50 Hz as if they were white would drive the
-  // position covariance far below the drift the estimate actually has.
+  // How fast the navigation velocity's bias is allowed to wander. Small, because
+  // EKF2's velocity error drifts over seconds rather than jumping, and because the
+  // state is only observable while the tag is pinning position -- through a tag
+  // loss this is what decides how fast the filter admits it is dead reckoning.
+  // Position random walk, standing in for the fact that the navigation velocity's
+  // error is time-correlated rather than white. A random walk is the wrong SHAPE
+  // for that -- real drift grows linearly with an outage, this grows as its square
+  // root -- so it is a compromise, and b_v below is the principled replacement.
   //
-  // A random walk cannot represent a correlated error exactly -- real drift grows
-  // linearly with the outage, this grows as its square root -- so the value is a
-  // compromise measured offline (see the sweep in the unit test): at 0.02 the
-  // covariance is ~1.5x conservative while the tag is visible and still bounds a
-  // 4 s tag loss at about 3 sigma. Modelling it properly wants a velocity-bias
-  // state, which is the same machinery as f_ext and belongs with roadmap item 8.
-  double position_noise_density = 0.02;      // [m/sqrt(s)]
+  // It is still the shipped default, on flight evidence. See the note on b_v.
+  double position_noise_density = 0.02;  // [m/sqrt(s)]
+
+  // Velocity-measurement bias, the principled version of the term above: model the
+  // correlated part as a state and the uncertainty reaches position through the
+  // integration with the right shape. OFF by default (zero process noise pins it
+  // at its initial value of zero), and that is a flight result rather than a
+  // preference.
+  //
+  // Offline it is clearly better: NEES 2.7 against 6.1, and a 4 s tag loss bounded
+  // at 1.3 sigma against 2.5. In flight it made the APPROACH slightly better and
+  // the terminal phase clearly worse -- synthetic commit 1.08 -> 2.12 cm and
+  // touchdown 2.74 -> 5.61 cm, with the same direction on the real camera. The
+  // mechanism is visible in the numbers: near the ground R explodes as 1/range, so
+  // the tag stops correcting, b_v stops being observable, and whatever value it
+  // last took is then integrated as truth through exactly the phase that has no
+  // other XY reference. The offline suite cannot see this because it has no
+  // terminal phase where the measurement is discounted rather than absent.
+  //
+  // To finish it: add that case to the offline suite, then either freeze b_v when
+  // the tag is not effectively correcting, or bound it far more tightly than
+  // velocity_bias_max. Turn on with velocity_bias_noise_density > 0.
+  double velocity_bias_noise_density = 0.0;  // [m/s/sqrt(s)]
   // The pad does not move, so this is not "how fast can the platform turn" but
   // "how fast may the estimate of its heading wander". It has to be small: once
   // attitude uncertainty is in R (below), a rotation of the whole corner pattern
@@ -224,7 +260,9 @@ struct RelativeStateFilterConfig {
   // good measurements rejected during a descent. This project has an open
   // question of about 4 cm on camera_offset_body.z, so this is not hypothetical.
   double extrinsic_sigma = 0.02;  // [m]
-  double velocity_sigma = 0.15;  // [m/s]  EKF2 velocity, inflated for time correlation
+  // Only the WHITE part of the navigation velocity error now: the correlated part
+  // is a state (b_v), so this no longer has to be inflated to cover it.
+  double velocity_sigma = 0.15;  // [m/s]  inflated for time correlation while b_v is off
   double range_sigma = 0.03;     // [m]    dist_bottom vs groundtruth: mean 3 mm, worst 1.9 cm
   double pose_sigma = 0.10;      // [m]    debug pose mode only
 
@@ -262,13 +300,20 @@ struct RelativeStateFilterConfig {
 
   // ---- Initial covariance ---------------------------------------------------
   double initial_position_sigma = 2.0;  // [m]
-  double initial_velocity_sigma = 0.5;  // [m/s]
+  double initial_velocity_sigma = 0.5;       // [m/s]
+  // Zero while b_v is off: an initial uncertainty on a state with no process noise
+  // would let it be estimated once, early, and then held forever.
+  double initial_velocity_bias_sigma = 0.0;  // [m/s]
+  // Hard bound on the velocity bias, applied after every update. See the note at
+  // the clamp: an unbounded bias state turns a large position innovation into a
+  // runaway.
+  double velocity_bias_max = 0.30;  // [m/s]
   double initial_yaw_sigma = 0.6;       // [rad]
 };
 
 class RelativeStateFilter {
  public:
-  static constexpr int kStateDim = 7;
+  static constexpr int kStateDim = 10;
   using StateVector = Eigen::Matrix<double, kStateDim, 1>;
   using StateMatrix = Eigen::Matrix<double, kStateDim, kStateDim>;
 
@@ -296,7 +341,8 @@ class RelativeStateFilter {
   const RelativeStateFilterConfig &config() const { return config_; }
 
   void initialize(double time, const Eigen::Vector3d &position_relative,
-                  const Eigen::Vector3d &velocity_relative, double platform_yaw) {
+                  const Eigen::Vector3d &velocity_relative, double platform_yaw,
+                  const Eigen::Vector3d &velocity_bias = Eigen::Vector3d::Zero()) {
     state_.setZero();
     state_.segment<3>(0) = position_relative;
     state_.segment<3>(3) = velocity_relative;
@@ -308,6 +354,10 @@ class RelativeStateFilter {
     covariance_.block<3, 3>(3, 3) =
         Eigen::Matrix3d::Identity() * config_.initial_velocity_sigma * config_.initial_velocity_sigma;
     covariance_(6, 6) = config_.initial_yaw_sigma * config_.initial_yaw_sigma;
+    state_.segment<3>(7) = velocity_bias;
+    covariance_.block<3, 3>(7, 7) = Eigen::Matrix3d::Identity() *
+                                    config_.initial_velocity_bias_sigma *
+                                    config_.initial_velocity_bias_sigma;
 
     time_ = time;
     initialized_ = true;
@@ -427,6 +477,7 @@ class RelativeStateFilter {
   Eigen::Vector3d positionRelative() const { return state_.segment<3>(0); }
   Eigen::Vector3d velocityRelative() const { return state_.segment<3>(3); }
   double platformYaw() const { return state_(6); }
+  Eigen::Vector3d velocityBias() const { return state_.segment<3>(7); }
 
   Eigen::Vector3d positionStdDev() const {
     return Eigen::Vector3d(std::sqrt(std::max(covariance_(0, 0), 0.0)),
@@ -439,6 +490,12 @@ class RelativeStateFilter {
   // freedom and the gate it was compared against. If the covariance is right,
   // lastNIS() averages its dof -- that claim is the whole basis for trusting any
   // accuracy number this filter produces, so it is published, not just logged.
+  // RMS reprojection residual of the last accepted corner update [px], and the
+  // RMS of what S says it should have been. Together these are how pixel_sigma
+  // gets MEASURED instead of assumed: pixel noise is the part of the residual that
+  // varies frame to frame, and the ratio of the two says whether R is honest.
+  double lastResidualRms() const { return last_residual_rms_; }
+  double lastResidualPredictedRms() const { return last_residual_predicted_rms_; }
   double lastNIS() const { return last_nis_; }
   int lastNISDof() const { return last_nis_dof_; }
   double lastGateThreshold() const { return last_gate_threshold_; }
@@ -609,16 +666,17 @@ class RelativeStateFilter {
     F.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
 
     const double qa = config_.accel_noise_density * config_.accel_noise_density;
+    const double qb = config_.velocity_bias_noise_density * config_.velocity_bias_noise_density;
     const double qp = config_.position_noise_density * config_.position_noise_density;
     const double qpsi = config_.platform_yaw_noise_density * config_.platform_yaw_noise_density;
 
     StateMatrix Q = StateMatrix::Zero();
-    Q.block<3, 3>(0, 0) =
-        Eigen::Matrix3d::Identity() * (qa * dt * dt * dt / 3.0 + qp * dt);
+    Q.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * (qa * dt * dt * dt / 3.0 + qp * dt);
     Q.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * (qa * dt * dt / 2.0);
     Q.block<3, 3>(3, 0) = Q.block<3, 3>(0, 3);
     Q.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * (qa * dt);
     Q(6, 6) = qpsi * dt;
+    Q.block<3, 3>(7, 7) = Eigen::Matrix3d::Identity() * (qb * dt);
 
     covariance_ = F * covariance_ * F.transpose() + Q;
     symmetrize();
@@ -642,6 +700,17 @@ class RelativeStateFilter {
     std::vector<Eigen::Vector2d> projected;
     if (!cornerModel(state_, *event.corners, innovation, H, projected, &attitude_jacobian,
                      &extrinsic_jacobian)) {
+      // The estimate says the tag is behind the camera, and yet a detector just
+      // read it. That is not a missing measurement, it is a statement that the
+      // ESTIMATE is wrong -- so it has to drive the recovery timer like any other
+      // rejection. Returning quietly here was a second one-way door, hidden behind
+      // the one that was already fixed: a filter whose position had run away
+      // stopped even being offered measurements, and sat there dead-reckoning for
+      // the rest of the flight while its rejection count stood still.
+      if (!is_replay) {
+        ++rejected_count_;
+        ++consecutive_rejects_;
+      }
       return Result::kInvalid;
     }
     const int rows = static_cast<int>(innovation.size());
@@ -661,13 +730,20 @@ class RelativeStateFilter {
     // error is H_p v dt -- one direction, one rank.
     const Eigen::VectorXd lag = H.leftCols<3>() * state_.segment<3>(3);
     R += (config_.latency_sigma * config_.latency_sigma) * (lag * lag.transpose());
-    return update(innovation, H, R, /*gate=*/true, is_replay, event.was_applied);
+    return update(innovation, H, R, /*gate=*/true, is_replay, event.was_applied,
+                  /*measures_pixels=*/true);
   }
 
+  // The navigation velocity measures the true relative velocity PLUS its own bias.
+  // Writing that down is the whole point of b_v: the filter can now tell a vehicle
+  // that is moving from a navigation solution that thinks it is, and it carries the
+  // difference forward as uncertainty rather than as confidence.
   Result applyVelocity(const Event &event) {
     Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, kStateDim);
     H.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
-    const Eigen::VectorXd innovation = event.vector - state_.segment<3>(3);
+    H.block<3, 3>(0, 7) = Eigen::Matrix3d::Identity();
+    const Eigen::VectorXd innovation =
+        event.vector - state_.segment<3>(3) - state_.segment<3>(7);
     const Eigen::MatrixXd R =
         Eigen::Matrix3d::Identity() * config_.velocity_sigma * config_.velocity_sigma;
     return update(innovation, H, R, /*gate=*/false, /*is_replay=*/false, /*was_applied=*/true);
@@ -804,7 +880,8 @@ class RelativeStateFilter {
 
   // ---- The update itself -----------------------------------------------------
   Result update(const Eigen::VectorXd &innovation, const Eigen::MatrixXd &H,
-                const Eigen::MatrixXd &R, bool gate, bool is_replay, bool was_applied) {
+                const Eigen::MatrixXd &R, bool gate, bool is_replay, bool was_applied,
+                bool measures_pixels = false) {
     // Nothing has been accepted for a while: the estimate, not the world, is the
     // thing most likely to be wrong. Widen the covariance BEFORE forming the gain
     // so the correction that follows is taken with an honest uncertainty, and let
@@ -833,6 +910,10 @@ class RelativeStateFilter {
         last_nis_ = nis;
         last_nis_dof_ = dof;
         last_gate_threshold_ = threshold;
+        if (measures_pixels) {
+          last_residual_rms_ = std::sqrt(innovation.squaredNorm() / dof);
+          last_residual_predicted_rms_ = std::sqrt(S.diagonal().mean());
+        }
       }
       const bool bootstrap = bootstrap_remaining_ > 0;
       const bool accept = is_replay ? was_applied : (bootstrap || nis <= threshold || locked_out);
@@ -861,6 +942,15 @@ class RelativeStateFilter {
     const Eigen::MatrixXd K = ldlt.solve(PHt.transpose()).transpose();
     state_ += K * innovation;
     state_(6) = wrapToPi(state_(6));
+    // Bound the velocity bias. It is the state most able to wreck the others: it
+    // enters the propagation, so a bias soaked up from a large position innovation
+    // walks the estimate away at that speed, and the estimate walking away is what
+    // put the tag outside the predicted image in the first place. Measured before
+    // this bound: a filter started 1 m out attributed the correction to b_v,
+    // reached 0.67 m/s of it, and then ran away at exactly that rate. Nothing
+    // EKF2's position derivative does justifies more than this.
+    state_.segment<3>(7) = state_.segment<3>(7).cwiseMax(-config_.velocity_bias_max)
+                               .cwiseMin(config_.velocity_bias_max);
 
     // Joseph form: it costs one extra product and keeps the covariance symmetric
     // and positive definite through thousands of updates, which matters here
@@ -913,6 +1003,8 @@ class RelativeStateFilter {
 
   std::deque<Event> history_;
 
+  double last_residual_rms_ = 0.0;
+  double last_residual_predicted_rms_ = 0.0;
   double last_nis_ = 0.0;
   int last_nis_dof_ = 0;
   double last_gate_threshold_ = 0.0;

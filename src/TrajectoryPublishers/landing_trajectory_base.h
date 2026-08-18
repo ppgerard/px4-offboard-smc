@@ -126,6 +126,9 @@ public:
     this->declare_parameter("landing_parameters.filter.pose_sigma", 0.10);
     this->declare_parameter("landing_parameters.filter.accel_noise_density", 2.0);
     this->declare_parameter("landing_parameters.filter.position_noise_density", 0.02);
+    // Zero: the velocity-bias state is implemented but off by default -- see the
+    // note in relative_state_filter.h for the flight result that decided that.
+    this->declare_parameter("landing_parameters.filter.velocity_bias_noise_density", 0.0);
     this->declare_parameter("landing_parameters.filter.platform_yaw_noise_density", 0.01);
     this->declare_parameter("landing_parameters.filter.gate_probability", 0.999);
 
@@ -626,6 +629,11 @@ protected:
         this->get_parameter("landing_parameters.filter.accel_noise_density").as_double();
     config.position_noise_density =
         this->get_parameter("landing_parameters.filter.position_noise_density").as_double();
+    config.velocity_bias_noise_density =
+        this->get_parameter("landing_parameters.filter.velocity_bias_noise_density").as_double();
+    // The bias state only makes sense with room to move; zero process noise and a
+    // zero initial sigma together pin it at zero, which is the "off" configuration.
+    config.initial_velocity_bias_sigma = config.velocity_bias_noise_density > 0.0 ? 0.10 : 0.0;
     config.platform_yaw_noise_density =
         this->get_parameter("landing_parameters.filter.platform_yaw_noise_density").as_double();
     config.gate_probability =
@@ -1758,6 +1766,9 @@ protected:
       const int dof = std::max(filter_.lastNISDof(), 1);
       diagnostics_->publishFilterNIS(filter_.lastNIS() / dof, dof, filter_.rejectFraction(),
                                      last_odometry_timestamp_);
+      diagnostics_->publishFilterResidual(filter_.lastResidualRms(),
+                                          filter_.lastResidualPredictedRms(), dof / 2,
+                                          last_odometry_timestamp_);
     }
   }
 

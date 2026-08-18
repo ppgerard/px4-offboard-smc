@@ -21,6 +21,7 @@ public:
     filter_position_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_position", 10);
     filter_sigma_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_sigma", 10);
     filter_nis_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_nis", 10);
+    filter_residual_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_residual", 10);
   }
 
   // Publish current odometry state
@@ -162,6 +163,17 @@ public:
                   timestamp);
   }
 
+  // The reprojection residual, in pixels: what the detector reported minus where
+  // the filter thought the corners would be. x is its RMS, y is what S says that
+  // should be, z is the corner count. This is the measurement that turns
+  // pixel_sigma from an assumption into a number -- and the x/y ratio is the same
+  // consistency statement as NIS, in units anyone can picture.
+  void publishFilterResidual(double residual_rms, double predicted_rms, int corners,
+                             uint64_t timestamp) {
+    publishVector(filter_residual_pub_, residual_rms, predicted_rms,
+                  static_cast<double>(corners), timestamp);
+  }
+
 private:
   void publishVector(const rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr& pub,
                      double x, double y, double z, uint64_t timestamp) {
@@ -184,6 +196,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_position_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_sigma_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_nis_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_residual_pub_;
 };
 
 #endif  // DIAGNOSTICS_PUBLISHER_H
