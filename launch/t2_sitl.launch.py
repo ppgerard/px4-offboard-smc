@@ -45,11 +45,12 @@ def generate_launch_description():
 
    estimator_arg = DeclareLaunchArgument(
       'estimator',
-      default_value='complementary',
-      description='Estimator the landing guidance steers on: complementary '
-                   '(fixed-gain filter), ekf (relative-state EKF on tag corner '
-                   'pixels) or ekf_pose (the same EKF fed the TF pose, for bring-up). '
-                   'Both estimators run and are published either way.'
+      default_value='ekf',
+      description='Estimator the landing guidance steers on: ekf (relative-state '
+                   'EKF on tag corner pixels, the default), complementary '
+                   '(the older fixed-gain filter) or ekf_pose (the same EKF fed the '
+                   'TF pose, for bring-up). Both estimators run and are published '
+                   'either way.'
    )
    estimator = LaunchConfiguration('estimator')
 

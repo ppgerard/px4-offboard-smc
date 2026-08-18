@@ -78,11 +78,17 @@ public:
     this->declare_parameter("landing_parameters.camera_offset_body.y", 0.0);
     this->declare_parameter("landing_parameters.camera_offset_body.z", -0.03);
 
-    // Which estimator steers: "complementary" (the fixed-gain filter this node
-    // has always used), "ekf" (the relative-state EKF on corner pixels), or
-    // "ekf_pose" (the same EKF fed the TF pose instead -- the bring-up mode, kept
-    // because it separates "the filter is wrong" from "the projection is wrong").
-    this->declare_parameter("landing_parameters.estimator", "complementary");
+    // Which estimator steers: "ekf" (the relative-state EKF on corner pixels,
+    // the default), "complementary" (the fixed-gain filter this node used to fly,
+    // kept as the fallback and as the thing to score against), or "ekf_pose" (the
+    // same EKF fed the TF pose instead -- the bring-up mode, kept because it
+    // separates "the filter is wrong" from "the projection is wrong").
+    //
+    // The EKF is the default because it measured better in every phase of every
+    // configuration, on the synthetic tag and on the real camera; see the item 7
+    // section of CLAUDE.md. The complementary filter still runs in parallel and
+    // still publishes its error, so switching back is a parameter, not a rebuild.
+    this->declare_parameter("landing_parameters.estimator", "ekf");
     this->declare_parameter("landing_parameters.detections_topic", "/apriltag/detections");
     this->declare_parameter("landing_parameters.camera_info_topic", "/sensor/imager/camera_info");
     // The marker layout, which MUST agree with the detector's own configuration
