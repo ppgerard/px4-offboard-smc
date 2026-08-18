@@ -43,9 +43,20 @@ def generate_launch_description():
    )
    controller_type = LaunchConfiguration('controller_type')
 
+   estimator_arg = DeclareLaunchArgument(
+      'estimator',
+      default_value='complementary',
+      description='Estimator the landing guidance steers on: complementary '
+                   '(fixed-gain filter), ekf (relative-state EKF on tag corner '
+                   'pixels) or ekf_pose (the same EKF fed the TF pose, for bring-up). '
+                   'Both estimators run and are published either way.'
+   )
+   estimator = LaunchConfiguration('estimator')
+
    return LaunchDescription([
       trajectory_arg,
       controller_type_arg,
+      estimator_arg,
       # Controller. Not launched for 'px4_landing', which bypasses it and
       # sends setpoints straight to PX4 (running both would fight for control).
       Node(
@@ -65,14 +76,14 @@ def generate_launch_description():
          package='px4_offboard_lowlevel',
          executable='landing_trajectory_node',
          name='landing_trajectory_publisher',
-         parameters=[config_1],
+         parameters=[config_1, {'landing_parameters.estimator': estimator}],
          condition=IfCondition(EqualsSubstitution(trajectory, 'landing')),
       ),
       Node(
          package='px4_offboard_lowlevel',
          executable='px4_offboard_landing_node',
          name='px4_offboard_trajectory_publisher',
-         parameters=[config_1],
+         parameters=[config_1, {'landing_parameters.estimator': estimator}],
          condition=IfCondition(EqualsSubstitution(trajectory, 'px4_landing')),
       ),
       Node(

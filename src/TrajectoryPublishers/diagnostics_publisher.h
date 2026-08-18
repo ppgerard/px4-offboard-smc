@@ -18,6 +18,9 @@ public:
     estimated_position_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/estimated_position", 10);
     position_raw_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/position_raw", 10);
     platform_yaw_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/platform_yaw", 10);
+    filter_position_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_position", 10);
+    filter_sigma_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_sigma", 10);
+    filter_nis_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_nis", 10);
   }
 
   // Publish current odometry state
@@ -122,19 +125,55 @@ public:
     position_raw_pub_->publish(pos_msg);
   }
 
-  // Publish the in-plane platform yaw taken from the tag: filtered and raw, so
-  // the pair shows how much of the raw signal is noise. Radians, world frame.
-  void publishPlatformYaw(double yaw_filtered, double yaw_raw, uint64_t timestamp) {
+  // Publish the in-plane platform yaw taken from the tag: the complementary
+  // filter's filtered and raw pair, plus the EKF's psi_pf state. Radians, world
+  // frame. All three should read 0 with the tag at the world origin.
+  void publishPlatformYaw(double yaw_filtered, double yaw_raw, double yaw_filter_state,
+                          uint64_t timestamp) {
     geometry_msgs::msg::Vector3Stamped yaw_msg;
     yaw_msg.header.stamp = rclcpp::Time(timestamp * 1000);
     yaw_msg.header.frame_id = "world";
     yaw_msg.vector.x = yaw_filtered;
     yaw_msg.vector.y = yaw_raw;
-    yaw_msg.vector.z = 0.0;
+    yaw_msg.vector.z = yaw_filter_state;
     platform_yaw_pub_->publish(yaw_msg);
   }
 
+  // ---- Relative-state EKF ----------------------------------------------------
+  // Error against groundtruth, in the same sense as the topics above (truth minus
+  // estimate), so the two estimators can be scored with one tool.
+  void publishFilterPosition(const Eigen::Vector3d& error, uint64_t timestamp) {
+    publishVector(filter_position_pub_, error(0), error(1), error(2), timestamp);
+  }
+
+  // The uncertainty the filter claims: position sigma per axis, and the platform
+  // yaw sigma in z. This is the signal the descent gate and the failsafe tiers
+  // are meant to be built on, so it is telemetry from the first flight.
+  void publishFilterSigma(const Eigen::Vector3d& sigma, double yaw_sigma, uint64_t timestamp) {
+    publishVector(filter_sigma_pub_, sigma(0), sigma(1), yaw_sigma, timestamp);
+  }
+
+  // x: normalised innovation squared of the last gated measurement (NIS/dof, so
+  // 1 means the covariance is telling the truth). y: its degrees of freedom.
+  // z: the fraction of measurements the gate has rejected so far.
+  void publishFilterNIS(double normalised_nis, int dof, double reject_fraction,
+                        uint64_t timestamp) {
+    publishVector(filter_nis_pub_, normalised_nis, static_cast<double>(dof), reject_fraction,
+                  timestamp);
+  }
+
 private:
+  void publishVector(const rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr& pub,
+                     double x, double y, double z, uint64_t timestamp) {
+    geometry_msgs::msg::Vector3Stamped msg;
+    msg.header.stamp = rclcpp::Time(timestamp * 1000);
+    msg.header.frame_id = "world";
+    msg.vector.x = x;
+    msg.vector.y = y;
+    msg.vector.z = z;
+    pub->publish(msg);
+  }
+
   rclcpp::Node* node_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr groundtruth_pub_;
@@ -142,6 +181,9 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr estimated_position_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr position_raw_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr platform_yaw_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_position_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_sigma_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_nis_pub_;
 };
 
 #endif  // DIAGNOSTICS_PUBLISHER_H

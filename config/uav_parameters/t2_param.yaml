@@ -32,3 +32,15 @@
         x: 0.0
         y: 0.0
         z: -0.03
+      # Detector interface for the pixel-space estimator (roadmap item 7).
+      detections_topic: "/apriltag/detections"
+      camera_info_topic: "/sensor/imager/camera_info"
+      # The marker layout, which MUST match apriltag_ros_enhanced/cfg/tags_36h11.yaml:
+      # two concentric tags at the platform centre. Corner positions are derived
+      # from these, so a wrong size here is a scale error in the estimate.
+      tag_ids: [2, 1]
+      tag_families: ["Custom48h12", "36h11"]
+      tag_sizes: [0.6, 0.16]
+      tag_positions_x: [0.0, 0.0]
+      tag_positions_y: [0.0, 0.0]
+      tag_positions_z: [0.0, 0.0]

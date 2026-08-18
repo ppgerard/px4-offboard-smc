@@ -22,13 +22,25 @@
 // through the SMC controller (landing_trajectory_node.cpp) or directly to
 // PX4 (px4_offboard_landing_node.cpp). That difference is captured by the
 // onSetpointPublished() hook.
+//
+// TWO ESTIMATORS RUN AT ONCE. The complementary filter above is one; the
+// relative-state EKF in relative_state_filter.h is the other, updated from the
+// detector's corner PIXELS rather than from its pose. Which one steers is the
+// landing_parameters.estimator parameter; both publish their error against
+// groundtruth every cycle, so a single flight scores both in the same wind
+// instead of comparing two flights that differ in more than the estimator.
+// tools/landing_estimator_error.py reads those topics.
 
 #include <algorithm>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <memory>
+#include <cctype>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <vector>
 #include "rclcpp/rclcpp.hpp"
 #include "trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -43,9 +55,12 @@
 #include <px4_msgs/msg/vehicle_land_detected.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
+#include <apriltag_msgs/msg/april_tag_detection_array.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include "px4_offboard_lowlevel/control_config.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
+#include "relative_state_filter.h"
 
 using namespace std::chrono_literals;
 
@@ -63,6 +78,36 @@ public:
     this->declare_parameter("landing_parameters.camera_offset_body.y", 0.0);
     this->declare_parameter("landing_parameters.camera_offset_body.z", -0.03);
 
+    // Which estimator steers: "complementary" (the fixed-gain filter this node
+    // has always used), "ekf" (the relative-state EKF on corner pixels), or
+    // "ekf_pose" (the same EKF fed the TF pose instead -- the bring-up mode, kept
+    // because it separates "the filter is wrong" from "the projection is wrong").
+    this->declare_parameter("landing_parameters.estimator", "complementary");
+    this->declare_parameter("landing_parameters.detections_topic", "/apriltag/detections");
+    this->declare_parameter("landing_parameters.camera_info_topic", "/sensor/imager/camera_info");
+    // The marker layout, which MUST agree with the detector's own configuration
+    // (apriltag_ros_enhanced/cfg/tags_36h11.yaml). It is duplicated rather than
+    // read from the detector because this package does not depend on it -- only
+    // on the messages it publishes.
+    this->declare_parameter("landing_parameters.tag_ids", std::vector<int64_t>{2, 1});
+    this->declare_parameter("landing_parameters.tag_families",
+                            std::vector<std::string>{"Custom48h12", "36h11"});
+    this->declare_parameter("landing_parameters.tag_sizes", std::vector<double>{0.6, 0.16});
+    this->declare_parameter("landing_parameters.tag_positions_x", std::vector<double>{0.0, 0.0});
+    this->declare_parameter("landing_parameters.tag_positions_y", std::vector<double>{0.0, 0.0});
+    this->declare_parameter("landing_parameters.tag_positions_z", std::vector<double>{0.0, 0.0});
+    // Filter tuning. Defaults are the ones the offline consistency sweep chose
+    // (test/relative_state_filter_test.cpp); they are parameters because
+    // pixel_sigma in particular should be measured on the real camera.
+    this->declare_parameter("landing_parameters.filter.pixel_sigma", 1.0);
+    this->declare_parameter("landing_parameters.filter.velocity_sigma", 0.15);
+    this->declare_parameter("landing_parameters.filter.range_sigma", 0.03);
+    this->declare_parameter("landing_parameters.filter.pose_sigma", 0.10);
+    this->declare_parameter("landing_parameters.filter.accel_noise_density", 2.0);
+    this->declare_parameter("landing_parameters.filter.position_noise_density", 0.02);
+    this->declare_parameter("landing_parameters.filter.platform_yaw_noise_density", 0.01);
+    this->declare_parameter("landing_parameters.filter.gate_probability", 0.999);
+
     camera_frame_id_ = this->get_parameter("landing_parameters.camera_frame_id").as_string();
     platform_frame_id_ = this->get_parameter("landing_parameters.platform_frame_id").as_string();
     world_frame_id_ = this->get_parameter("landing_parameters.world_frame_id").as_string();
@@ -70,6 +115,8 @@ public:
         this->get_parameter("landing_parameters.camera_offset_body.x").as_double(),
         this->get_parameter("landing_parameters.camera_offset_body.y").as_double(),
         this->get_parameter("landing_parameters.camera_offset_body.z").as_double());
+
+    configureEstimator();
 
     // TF2 buffer and listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -93,6 +140,15 @@ public:
     // Rangefinder-derived height above terrain, for the altitude correction below.
     local_position_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
         ("/fmu/out/vehicle_local_position_v1", qos, std::bind(&LandingTrajectoryNodeBase::localPositionCallback, this, std::placeholders::_1));
+    // The detector's raw output: corner pixels and the tag identity. The pose it
+    // also publishes is deliberately not used by the EKF path -- see
+    // relative_state_filter.h for why pixels make a better measurement.
+    detections_sub_ = this->create_subscription<apriltag_msgs::msg::AprilTagDetectionArray>(
+        detections_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&LandingTrajectoryNodeBase::detectionsCallback, this, std::placeholders::_1));
+    camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+        camera_info_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&LandingTrajectoryNodeBase::cameraInfoCallback, this, std::placeholders::_1));
 
     // Publishers
     trajectory_publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>
@@ -119,6 +175,8 @@ public:
     commit_start_time_ = now;
     last_disarm_request_time_ = now;
     last_tag_update_time_ = now;
+    last_filter_update_time_ = now;
+    last_odometry_arrival_ = now;
 
     // Initialize drone state with defaults
     drone_orientation_W_ = Eigen::Quaterniond::Identity();
@@ -286,12 +344,74 @@ protected:
   Eigen::Vector3d drone_position_W_;    // Actual drone position from odometry
   Eigen::Vector3d drone_velocity_W_;    // Actual drone velocity from odometry
 
-  // Fused position estimate (100 Hz prediction + 15 Hz correction from tag)
+  // Complementary filter: 100 Hz odometry prediction + a fixed-gain correction at
+  // the ~15 Hz measurement rate. Kept running whichever estimator steers, so the
+  // EKF always has something to be scored against in the same flight.
   Eigen::Vector3d estimated_position_W_;      // Fused estimate at 100Hz
   tf2::TimePoint last_tag_measurement_time_;  // Timestamp of last processed TF measurement
   rclcpp::Time last_tag_update_time_;         // When that measurement arrived (node clock)
   bool tag_measurement_received_ = false;
   const double fusion_alpha_ = 0.1;          // Correction gain (0.05-0.2)
+
+  // ---- Relative-state EKF (roadmap item 7) -----------------------------------
+  // Runs every flight, whether or not it steers. Its measurement is the corner
+  // pixels; its outputs are a position, a velocity, an observable platform yaw
+  // and -- the part the rest of the stack has never had -- a covariance.
+  enum class Estimator { kComplementary, kFilterPose, kFilterPixels };
+  Estimator estimator_ = Estimator::kComplementary;
+  landing::RelativeStateFilter filter_;
+  Eigen::Vector3d filter_position_W_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d filter_velocity_W_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d filter_sigma_ = Eigen::Vector3d::Zero();
+  double filter_platform_yaw_ = 0.0;
+  double filter_platform_yaw_sigma_ = 0.0;
+  bool filter_initialized_ = false;
+  bool filter_measurement_received_ = false;
+  long detections_received_ = 0;           // detection messages that carried a tag
+  rclcpp::Time last_odometry_arrival_;
+  bool last_odometry_arrival_valid_ = false;
+  rclcpp::Time last_filter_update_time_;   // last measurement the filter ACCEPTED
+  std::string detections_topic_;
+  std::string camera_info_topic_;
+
+  // Marker layout, indexed by tag id: the corner positions in platform axes that
+  // every projection is written against. Populated from parameters that mirror
+  // the detector's cfg; a mismatch here is a silent bias, so the ids that arrive
+  // and are not configured get counted and warned about once.
+  struct TagLayout {
+    std::string family;
+    double size = 0.0;
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  };
+  std::map<int, TagLayout> tag_layout_;
+  landing::CameraIntrinsics camera_intrinsics_;
+  bool camera_info_received_ = false;
+
+  // The detector's stamps are on the simulator clock while this node runs on wall
+  // time (see the conventions in CLAUDE.md). Rather than give up latency
+  // compensation there, estimate the constant offset between the two clocks as
+  // the smallest arrival-minus-stamp seen recently: the minimum is the transport
+  // delay floor, so what survives is the VARIABLE part of the latency, which is
+  // the part that biases the estimate differently from frame to frame. The
+  // constant part it cannot see is a lower bound on the true age, so this errs
+  // towards treating measurements as fresher than they are, never staler.
+  bool detection_clock_differs_ = false;
+  // What the pipeline delay is worth when it cannot be measured at all. Roughly
+  // the whole capture-to-detection latency, since none of it is observable once
+  // the stamps are on another clock.
+  const double latency_sigma_unsynced_ = 0.08;  // [s]
+
+  // The blind zone, fused as information rather than left as a gap. Below this
+  // height the beam is inside its minimum range, and that silence bounds the
+  // altitude from above -- which is what near_pad should be reading instead of a
+  // dead-reckoned number. Rate-limited because it is ONE fact, not one per cycle.
+  const double blind_zone_ceiling_ = 0.245;        // [m] beam minimum + lever arm
+  // And the other side of it: the vehicle is not below the pad it is landing on.
+  // Obvious, and worth stating, because the estimate went to -1.13 m on a real
+  // camera run while the aircraft sat on the ground -- which kept the touchdown
+  // check waiting for a descent that had already finished.
+  const double blind_zone_floor_ = 0.0;            // [m]
+  bool blind_zone_active_ = false;
 
   // Terminal-descent state
   Eigen::Vector2d commit_position_xy_ = Eigen::Vector2d::Zero();  // frozen XY reference
@@ -342,6 +462,8 @@ protected:
   const double range_min_trusted_altitude_ = 0.25;  // [m]
   rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_detected_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
+  rclcpp::Subscription<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr detections_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   // Diagnostics publisher
@@ -427,6 +549,268 @@ protected:
     }
   }
 
+  // ============ Relative-state EKF: setup, inputs and outputs ============
+  void configureEstimator() {
+    const std::string mode = this->get_parameter("landing_parameters.estimator").as_string();
+    if (mode == "ekf") {
+      estimator_ = Estimator::kFilterPixels;
+    } else if (mode == "ekf_pose") {
+      estimator_ = Estimator::kFilterPose;
+    } else {
+      estimator_ = Estimator::kComplementary;
+      if (mode != "complementary") {
+        RCLCPP_WARN(this->get_logger(),
+                    "Unknown estimator '%s'; using the complementary filter. "
+                    "Valid values: complementary, ekf, ekf_pose.", mode.c_str());
+      }
+    }
+    detections_topic_ = this->get_parameter("landing_parameters.detections_topic").as_string();
+    camera_info_topic_ = this->get_parameter("landing_parameters.camera_info_topic").as_string();
+
+    landing::RelativeStateFilterConfig config;
+    config.pixel_sigma = this->get_parameter("landing_parameters.filter.pixel_sigma").as_double();
+    config.velocity_sigma =
+        this->get_parameter("landing_parameters.filter.velocity_sigma").as_double();
+    config.range_sigma = this->get_parameter("landing_parameters.filter.range_sigma").as_double();
+    config.pose_sigma = this->get_parameter("landing_parameters.filter.pose_sigma").as_double();
+    config.accel_noise_density =
+        this->get_parameter("landing_parameters.filter.accel_noise_density").as_double();
+    config.position_noise_density =
+        this->get_parameter("landing_parameters.filter.position_noise_density").as_double();
+    config.platform_yaw_noise_density =
+        this->get_parameter("landing_parameters.filter.platform_yaw_noise_density").as_double();
+    config.gate_probability =
+        this->get_parameter("landing_parameters.filter.gate_probability").as_double();
+    filter_.setConfig(config);
+
+    const auto ids = this->get_parameter("landing_parameters.tag_ids").as_integer_array();
+    const auto families = this->get_parameter("landing_parameters.tag_families").as_string_array();
+    const auto sizes = this->get_parameter("landing_parameters.tag_sizes").as_double_array();
+    const auto x = this->get_parameter("landing_parameters.tag_positions_x").as_double_array();
+    const auto y = this->get_parameter("landing_parameters.tag_positions_y").as_double_array();
+    const auto z = this->get_parameter("landing_parameters.tag_positions_z").as_double_array();
+    if (ids.size() != sizes.size() || ids.size() != x.size() || ids.size() != y.size() ||
+        ids.size() != z.size() || (!families.empty() && families.size() != ids.size())) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "Tag layout parameters disagree in length (%zu ids, %zu sizes, %zu families); "
+                   "the pixel estimator will have no markers to match.",
+                   ids.size(), sizes.size(), families.size());
+      return;
+    }
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      TagLayout layout;
+      layout.family = families.empty() ? std::string() : families[i];
+      layout.size = sizes[i];
+      layout.position = Eigen::Vector3d(x[i], y[i], z[i]);
+      tag_layout_[static_cast<int>(ids[i])] = layout;
+      RCLCPP_INFO(this->get_logger(), "Tag %ld (%s): %.3f m at platform [%.2f %.2f %.2f]", ids[i],
+                  layout.family.empty() ? "any family" : layout.family.c_str(), layout.size,
+                  x[i], y[i], z[i]);
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "Estimator steering the landing: %s (the other one still runs and is still "
+                "published, so both are scored in this flight)",
+                mode.c_str());
+  }
+
+  bool usingFilter() const { return estimator_ != Estimator::kComplementary; }
+
+  // The detector reports the AprilTag library's family name, which carries a
+  // "tag" prefix the configuration keys do not ("tag36h11" against "36h11").
+  // Compare the names rather than the spellings.
+  static std::string normaliseFamily(const std::string &family) {
+    std::string lowered;
+    lowered.reserve(family.size());
+    for (char c : family) {
+      lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lowered.rfind("tag", 0) == 0) {
+      lowered.erase(0, 3);
+    }
+    return lowered;
+  }
+
+  // The estimate the guidance actually flies. Both estimators run regardless;
+  // this is the one that steers.
+  const Eigen::Vector3d &landingEstimate() const {
+    return usingFilter() ? filter_position_W_ : estimated_position_W_;
+  }
+
+  double nodeSeconds() const { return this->now().seconds(); }
+
+  void refreshFilterOutputs() {
+    if (!filter_initialized_) {
+      return;
+    }
+    filter_position_W_ = filter_.positionRelative();
+    filter_velocity_W_ = filter_.velocityRelative();
+    filter_sigma_ = filter_.positionStdDev();
+    filter_platform_yaw_ = filter_.platformYaw();
+    filter_platform_yaw_sigma_ = filter_.platformYawStdDev();
+  }
+
+  // The measurement's own time, expressed on this node's clock.
+  //
+  // When the stamp is on our clock this is the stamp, and the ring buffer does its
+  // job: the measurement is applied where it belongs and the state is replayed
+  // forward. When it is not -- the real detector stamps on the simulator clock,
+  // because ros_gz_image copies the Gazebo header -- the honest answer is that the
+  // measurement time is NOT RECOVERABLE, and the measurement is treated as current.
+  //
+  // It is worth being clear about why, because the obvious repair does not work.
+  // Estimating a constant offset between the two clocks assumes they run at the
+  // same rate, and in this stack they do not: measured against wall time during a
+  // camera-in-the-loop run, the simulator clock advanced at 0.67x, so
+  // arrival-minus-stamp grew by a third of a second for every second of flight. An
+  // offset fitted over a few seconds then places measurements hundreds of
+  // milliseconds in the past, the rewind faithfully applies them there, and the
+  // estimate degrades exactly in proportion to how fast the vehicle is moving:
+  // 19 cm of descent error against 1.7 cm for the fixed-gain filter on the same
+  // measurements. Treating the stamp as unusable costs only latency compensation,
+  // which is what the attitude path here already does for the same reason.
+  //
+  // The unrecoverable latency is not ignored -- it is declared to the filter as
+  // extra measurement noise along the direction of travel (latency_sigma), which
+  // is the honest way to say "this measurement is older than I can tell, and that
+  // matters more the faster I am going".
+  rclcpp::Time measurementTime(const rclcpp::Time &stamp, const rclcpp::Time &arrival) {
+    const double offset = (arrival - stamp).seconds();
+    if (std::abs(offset) < kImplausibleMeasurementAge) {
+      return stamp;
+    }
+    if (!detection_clock_differs_) {
+      detection_clock_differs_ = true;
+      landing::RelativeStateFilterConfig config = filter_.config();
+      config.latency_sigma = latency_sigma_unsynced_;
+      filter_.setConfig(config);
+      RCLCPP_WARN(this->get_logger(),
+                  "Detection stamps are not on this node's clock (offset %.0f s): they carry "
+                  "simulator time while this node runs on wall time, and the two clocks do not "
+                  "even run at the same rate, so the measurement time cannot be recovered from "
+                  "them. Treating detections as current and widening the measurement noise to "
+                  "%.0f ms of unknown delay. Bridge /clock and set use_sim_time to get the real "
+                  "timestamps back -- neither alone is enough.",
+                  offset, latency_sigma_unsynced_ * 1000.0);
+    }
+    return arrival;
+  }
+
+  void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+    // K = [fx 0 cx; 0 fy cy; 0 0 1]. Distortion is ignored: SITL's camera has
+    // none, and a real lens must have its corners undistorted upstream -- doing
+    // it here would mean re-deriving what the detector already knows.
+    if (msg->k[0] <= 0.0 || msg->k[4] <= 0.0) {
+      return;
+    }
+    camera_intrinsics_.fx = msg->k[0];
+    camera_intrinsics_.fy = msg->k[4];
+    camera_intrinsics_.cx = msg->k[2];
+    camera_intrinsics_.cy = msg->k[5];
+    if (!camera_info_received_) {
+      camera_info_received_ = true;
+      RCLCPP_INFO(this->get_logger(), "Camera intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                  camera_intrinsics_.fx, camera_intrinsics_.fy, camera_intrinsics_.cx,
+                  camera_intrinsics_.cy);
+    }
+  }
+
+  // Corner pixels straight from the detector. One update per tag rather than one
+  // per message: that way a marker whose corners are bad is gated out on its own
+  // and the other one still contributes, which is the graceful degradation a
+  // single pose measurement cannot offer.
+  void detectionsCallback(const apriltag_msgs::msg::AprilTagDetectionArray::SharedPtr msg) {
+    if (estimator_ == Estimator::kFilterPose) {
+      return;  // that mode is fed the TF pose instead; fusing both would double count
+    }
+    if (!filter_initialized_ || msg->detections.empty()) {
+      return;
+    }
+    if (!camera_info_received_) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Detections are arriving but no camera_info on '%s'; the pixel "
+                           "estimator cannot project anything without intrinsics.",
+                           camera_info_topic_.c_str());
+      return;
+    }
+
+    ++detections_received_;
+    const rclcpp::Time arrival = this->now();
+    const rclcpp::Time stamp(msg->header.stamp, this->get_clock()->get_clock_type());
+    const rclcpp::Time measurement_stamp = measurementTime(stamp, arrival);
+
+    Eigen::Quaterniond orientation;
+    if (!attitudeAt(measurement_stamp, orientation)) {
+      if (attitude_history_.empty()) {
+        return;
+      }
+      orientation = attitude_history_.back().orientation;
+    }
+
+    for (const auto &detection : msg->detections) {
+      const auto entry = tag_layout_.find(detection.id);
+      if (entry == tag_layout_.end()) {
+        RCLCPP_WARN_ONCE(this->get_logger(),
+                         "Detected tag id %d is not in landing_parameters.tag_ids; ignoring it. "
+                         "This node's layout must match the detector's cfg.", detection.id);
+        continue;
+      }
+      if (!entry->second.family.empty() &&
+          normaliseFamily(detection.family) != normaliseFamily(entry->second.family)) {
+        // Same id, different family, which is a different marker entirely. Say so
+        // rather than skipping quietly: this exact check, before it normalised the
+        // names, threw away every detection of a whole flight -- the detector
+        // reports the AprilTag library's own name ("tag36h11") while the
+        // configuration uses the key that selects it ("36h11"), so nothing ever
+        // matched and the aircraft hovered waiting for a tag it was being handed
+        // 15 times a second.
+        RCLCPP_WARN_ONCE(this->get_logger(),
+                         "Tag %d arrived as family '%s' but is configured as '%s'; ignoring it. "
+                         "Fix landing_parameters.tag_families to match the detector.",
+                         detection.id, detection.family.c_str(), entry->second.family.c_str());
+        continue;
+      }
+
+      landing::CornerObservation observation;
+      observation.camera = camera_intrinsics_;
+      observation.R_world_body = orientation.toRotationMatrix();
+      observation.R_body_camera = R_b_cam_;
+      observation.r_camera_body = r_cam_b_b_;
+      observation.pixels.reserve(4);
+      observation.points_platform.reserve(4);
+
+      // Corner order follows the detector's object points (pose_estimation.cpp):
+      // (-s/2,-s/2), (+s/2,-s/2), (+s/2,+s/2), (-s/2,+s/2) about the tag centre.
+      // Getting this wrong is a yaw error of a right angle, not noise.
+      const double half = 0.5 * entry->second.size;
+      const Eigen::Vector3d centre = entry->second.position;
+      const Eigen::Vector3d corners[4] = {centre + Eigen::Vector3d(-half, -half, 0.0),
+                                          centre + Eigen::Vector3d(half, -half, 0.0),
+                                          centre + Eigen::Vector3d(half, half, 0.0),
+                                          centre + Eigen::Vector3d(-half, half, 0.0)};
+      for (std::size_t i = 0; i < 4; ++i) {
+        observation.pixels.emplace_back(detection.corners[i].x, detection.corners[i].y);
+        observation.points_platform.push_back(corners[i]);
+      }
+
+      const landing::RelativeStateFilter::Result result =
+          filter_.addCorners(measurement_stamp.seconds(), observation);
+      if (result == landing::RelativeStateFilter::Result::kApplied) {
+        filter_measurement_received_ = true;
+        last_filter_update_time_ = arrival;
+      } else if (result == landing::RelativeStateFilter::Result::kRejected) {
+        // Not freshness. A gated-out measurement is evidence the estimate and the
+        // detector disagree, and it deliberately does NOT count as having seen
+        // the tag -- which is the distinction tagAge() alone could never make.
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                             "Tag %d gated out: NIS %.1f against a %.1f threshold (%.0f%% of "
+                             "measurements rejected so far).",
+                             detection.id, filter_.lastNIS(), filter_.lastGateThreshold(),
+                             filter_.rejectFraction() * 100.0);
+      }
+    }
+    refreshFilterOutputs();
+  }
+
   // ============ Fused Position Estimation (100Hz prediction + 15Hz correction) ============
   //
   // The tag corrects XY ONLY. Altitude comes from the EKF, which fuses the
@@ -475,6 +859,13 @@ protected:
       return;
     }
 
+    // Propagate the EKF to now before anything reads it, so every gate and every
+    // diagnostic in this cycle sees one consistent snapshot of the estimate.
+    if (filter_initialized_) {
+      filter_.predict(nodeSeconds());
+      refreshFilterOutputs();
+    }
+
     // Handle initialization delay phase (publish drone's own position for 5 seconds)
     if (handleInitializationDelay()) {
       publishDiagnostics();
@@ -502,14 +893,14 @@ protected:
                            "are still being published but nothing is flying them. PX4's land "
                            "detector does this in offboard direct-actuator mode -- set "
                            "COM_DISARM_LAND 0.",
-                           static_cast<int>(phase_), estimated_position_W_(2));
+                           static_cast<int>(phase_), landingEstimate()(2));
     } else if (vehicle_status_received_ && !offboard_active_ && phase_ != Phase::PHASE_1) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                            "Not in offboard (nav_state); PX4 is flying, not this node.");
     }
 
     // Arm the contact check once the vehicle has climbed clear of the pad.
-    if (estimated_position_W_(2) > airborne_altitude_) {
+    if (landingEstimate()(2) > airborne_altitude_) {
       airborne_ = true;
     }
 
@@ -552,7 +943,7 @@ protected:
     // Error against the tag, in the same frame Phase 1 now flies in, so the
     // condition that releases the descent is the condition the descent needs:
     // centred over the pad, not merely settled somewhere.
-    const Eigen::Vector3d error = phase_1_target_ - estimated_position_W_;
+    const Eigen::Vector3d error = phase_1_target_ - landingEstimate();
     const double xy_error = error.head<2>().norm();
     const double z_error = std::abs(error(2));
     const double climb_rate = drone_velocity_W_(2);
@@ -612,7 +1003,7 @@ protected:
     if (contactHeld()) {
       RCLCPP_WARN(this->get_logger(),
                   "Contact detected in Phase 2 at altitude=%.3f m; disarming.",
-                  estimated_position_W_(2));
+                  landingEstimate()(2));
       enterTouchdownPhase();
       return;
     }
@@ -620,7 +1011,7 @@ protected:
     // Altitude is the trigger; alignment and a fresh tag measurement are the
     // guards, so the aircraft does not commit while blown off-centre or while
     // dead-reckoning. Phase 2 holds at the commit altitude until they are met.
-    if (estimated_position_W_(2) >= commit_altitude_) {
+    if (landingEstimate()(2) >= commit_altitude_) {
       commit_wait_flag_ = false;
       return;
     }
@@ -630,7 +1021,7 @@ protected:
       commit_wait_flag_ = true;
     }
 
-    const double xy_error = estimated_position_W_.head<2>().norm();
+    const double xy_error = landingEstimate().head<2>().norm();
     const bool aligned = xy_error < commit_xy_error_max_;
     const bool tag_fresh = tagIsFresh(commit_tag_max_age_);
     const bool waited_long_enough =
@@ -669,7 +1060,7 @@ protected:
     RCLCPP_INFO(this->get_logger(),
                 "Transitioning to Phase 3 (Commit) - altitude=%.3f m, XY error=%.3f m, descending at %.2f m/s "
                 "(altitude reference re-anchored, drift was %+.3f m)",
-                estimated_position_W_(2), xy_error, commit_descent_rate_, reference_drift);
+                landingEstimate()(2), xy_error, commit_descent_rate_, reference_drift);
   }
 
   void checkPhase3To4Transition() {
@@ -691,7 +1082,7 @@ protected:
         RCLCPP_ERROR(this->get_logger(),
                      "No touchdown %.1f s after commit (altitude estimate %.3f m); disarming. "
                      "Contact evidence still missing: %s%s%s",
-                     commit_timeout_, estimated_position_W_(2),
+                     commit_timeout_, landingEstimate()(2),
                      contact_not_following_ ? "" : "reference gap too small ",
                      contact_descent_stopped_ ? "" : "still descending ",
                      contact_near_pad_ ? "" : "altitude above the pad threshold ");
@@ -703,7 +1094,7 @@ protected:
                 "Touchdown after %.2f s of commit: estimated XY error=%.3f m, altitude=%.3f m "
                 "(PX4 land detector: landed=%d ground_contact=%d)",
                 (this->now() - commit_start_time_).seconds(),
-                estimated_position_W_.head<2>().norm(), estimated_position_W_(2),
+                landingEstimate().head<2>().norm(), landingEstimate()(2),
                 land_detected_landed_, land_detected_ground_contact_);
     enterTouchdownPhase();
   }
@@ -739,7 +1130,7 @@ protected:
     // from odometry and our own reference only — no tag, no PX4 state.
     const bool not_following = (drone_position_W_(2) - r_position_W_(2)) > touchdown_ref_gap_;
     const bool descent_stopped = std::abs(drone_velocity_filtered_z_) < touchdown_stall_speed_;
-    const bool near_pad = estimated_position_W_(2) < touchdown_max_altitude_;
+    const bool near_pad = landingEstimate()(2) < touchdown_max_altitude_;
 
     // Kept only so a stalled commit can report which condition is holding it up.
     // Inferring that from the outside cost a long debugging session once.
@@ -784,24 +1175,36 @@ protected:
     // never release the descent.
     Eigen::Vector3d position_error;
     if (tagIsFresh(phase1_tag_max_age_)) {
-      position_error = phase_1_target_ - estimated_position_W_;
+      position_error = phase_1_target_ - landingEstimate();
     } else {
       position_error = phase_1_target_ - drone_position_W_;
+      // Three different situations, three different fixes, and telling them apart
+      // from outside used to be impossible. "Nothing arriving" is a detector or a
+      // camera; "arriving but never usable" is a configuration mismatch between
+      // this node and the detector (tag ids, families, intrinsics), which looked
+      // exactly like a dead detector for a whole flight; "lost" is perception.
+      const char *reason = "Tag lost";
+      if (!measurementEverReceived()) {
+        reason = detections_received_ > 0
+                     ? "Detections ARE arriving but none has ever been usable -- check that "
+                       "landing_parameters.tag_ids/tag_families match the detector, and look "
+                       "for a gating warning above"
+                     : "No tag has EVER been received -- is the detector (or the synthetic tag) "
+                       "running?";
+      }
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                            "%s (age %.1f s); flying the odometry hold point [%.1f %.1f %.1f] to "
                            "search for it. The descent stays locked until the tag is seen.",
-                           tag_measurement_received_ ? "Tag lost" : "No tag has EVER been received"
-                                                       " -- is the detector (or fake_tag_tf.py)"
-                                                       " running?",
-                           tagAge(), phase_1_target_(0), phase_1_target_(1), phase_1_target_(2));
+                           reason, tagAge(), phase_1_target_(0), phase_1_target_(1),
+                           phase_1_target_(2));
     }
 
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "Phase 1: tag-relative est [%.2f %.2f %.2f], tag age %.2f s, "
                          "XY error to hold point %.2f m",
-                         estimated_position_W_(0), estimated_position_W_(1),
-                         estimated_position_W_(2), tagAge(),
-                         (phase_1_target_ - estimated_position_W_).head<2>().norm());
+                         landingEstimate()(0), landingEstimate()(1),
+                         landingEstimate()(2), tagAge(),
+                         (phase_1_target_ - landingEstimate()).head<2>().norm());
 
     // Desired velocity proportional to position error
     Eigen::Vector3d desired_velocity = K_p_ * position_error;
@@ -832,8 +1235,8 @@ protected:
   // radius narrows with height, so the horizontal error at touchdown is bounded
   // by cone_radius_min_ by construction rather than measured after the fact.
   double coneDescentLimit() {
-    const double height = std::max(estimated_position_W_(2), 0.0);
-    const double xy_error = estimated_position_W_.head<2>().norm();
+    const double height = std::max(landingEstimate()(2), 0.0);
+    const double xy_error = landingEstimate().head<2>().norm();
     const double cone_radius = cone_slope_ * height + cone_radius_min_;
     const double alignment = std::clamp(1.0 - xy_error / cone_radius, 0.0, 1.0);
 
@@ -846,7 +1249,7 @@ protected:
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
                            "Descent paused: no tag measurement for %.1f s (need < %.1f s). "
                            "Altitude %.2f m, XY %.2f m by the last estimate.",
-                           tagAge(), cone_tag_max_age_, estimated_position_W_(2), xy_error);
+                           tagAge(), cone_tag_max_age_, landingEstimate()(2), xy_error);
       return 0.0;
     }
     if (alignment <= 0.0) {
@@ -862,7 +1265,7 @@ protected:
     updateTagPosition();
 
     // Use actual tag position from TF for real-time vision feedback
-    Eigen::Vector3d position_error = phase_2_target_ - estimated_position_W_;
+    Eigen::Vector3d position_error = phase_2_target_ - landingEstimate();
 
     // Desired velocity proportional to position error
     Eigen::Vector3d desired_velocity = K_p_ * position_error;
@@ -877,7 +1280,7 @@ protected:
 
     // Stop descending at the commit altitude: below it the terminal descent
     // takes over, and it only starts once the aircraft is centred.
-    if (estimated_position_W_(2) < commit_altitude_) {
+    if (landingEstimate()(2) < commit_altitude_) {
       desired_velocity(2) = std::max(desired_velocity(2), 0.0);
     }
 
@@ -985,13 +1388,32 @@ protected:
                 px4_confirms_landed ? "Plain" : "Forced", disarm_attempts_);
   }
 
-  // Age of the newest tag measurement actually consumed [s]. Large when nothing
-  // has arrived yet, so callers can treat "never seen" and "long lost" alike.
+  // Age of the newest tag measurement actually consumed by the estimator that is
+  // steering [s]. Large when nothing has arrived yet, so callers can treat "never
+  // seen" and "long lost" alike.
+  //
+  // In the EKF modes this counts only measurements the chi-squared gate ACCEPTED.
+  // A stream of rejected detections means the estimate and the detector disagree,
+  // which is not a reason to believe the tag is being tracked -- and it is the
+  // first thing here that can tell the two apart. §07's tiers are the eventual
+  // home for that distinction.
   double tagAge() const {
+    if (usingFilter()) {
+      if (!filter_measurement_received_) {
+        return std::numeric_limits<double>::infinity();
+      }
+      return (this->now() - last_filter_update_time_).seconds();
+    }
     if (!tag_measurement_received_) {
       return std::numeric_limits<double>::infinity();
     }
     return (this->now() - last_tag_update_time_).seconds();
+  }
+
+  // Whether the steering estimator has ever had a measurement, which is a
+  // different question from whether it has one now.
+  bool measurementEverReceived() const {
+    return usingFilter() ? filter_measurement_received_ : tag_measurement_received_;
   }
 
   // A transform being present in the TF buffer is not the same as the tag being
@@ -1092,7 +1514,8 @@ protected:
       const rclcpp::Time measurement_stamp(transform.header.stamp,
                                            this->get_clock()->get_clock_type());
       Eigen::Quaterniond orientation_at_measurement;
-      if (!attitudeAt(measurement_stamp, orientation_at_measurement)) {
+      const bool stamp_usable = attitudeAt(measurement_stamp, orientation_at_measurement);
+      if (!stamp_usable) {
         // No usable stamp, so pair with the newest attitude instead. That is the
         // naive version of this fusion: it gives up latency compensation and
         // nothing else, which is a far smaller error than resolving the tag with
@@ -1168,6 +1591,21 @@ protected:
         tag_measurement_received_ = true;
         correctFusedPositionWithTag(position_W_);
         updatePlatformYaw(R_W_B);
+
+        // The bring-up mode: the same measurement the complementary filter just
+        // took at a fixed gain, handed to the EKF as a linear h = p_rel instead.
+        // It shares the rewind, the gate and the covariance with the pixel path,
+        // so a bad NIS here is the filter and a bad NIS there is the projection.
+        if (estimator_ == Estimator::kFilterPose && filter_initialized_) {
+          const double measurement_seconds =
+              stamp_usable ? measurement_stamp.seconds() : this->now().seconds();
+          if (filter_.addPose(measurement_seconds, position_W_) ==
+              landing::RelativeStateFilter::Result::kApplied) {
+            filter_measurement_received_ = true;
+            last_filter_update_time_ = this->now();
+          }
+          refreshFilterOutputs();
+        }
       }
 
       return true;
@@ -1219,8 +1657,8 @@ protected:
   }
 
   void publishPlatformPosition() {
-    // Fused tag-relative position of the vehicle (100 Hz odometry prediction,
-    // corrected at the ~15 Hz measurement rate). Telemetry only: nothing
+    // Tag-relative position of the vehicle, from whichever estimator is steering
+    // (landing_parameters.estimator). Telemetry only: nothing
     // subscribes to it. The controller closes on command/trajectory against its
     // own odometry, and the tag reaches it solely through that setpoint -- the
     // outer loop lives in this node. (An older comment here claimed
@@ -1228,9 +1666,9 @@ protected:
     // or method exists, and describing a loop that is not wired invites someone
     // to debug the wrong side of it.)
     geometry_msgs::msg::Vector3 pos_msg;
-    pos_msg.x = estimated_position_W_(0);
-    pos_msg.y = estimated_position_W_(1);
-    pos_msg.z = estimated_position_W_(2);
+    pos_msg.x = landingEstimate()(0);
+    pos_msg.y = landingEstimate()(1);
+    pos_msg.z = landingEstimate()(2);
     platform_position_pub_->publish(pos_msg);
   }
 
@@ -1252,8 +1690,26 @@ protected:
     // Publish raw tag position
     diagnostics_->publishPositionRaw(groundtruth_position_W_ - position_W_filtered_, last_odometry_timestamp_);
 
-    // Publish the in-plane platform yaw taken from the tag
-    diagnostics_->publishPlatformYaw(platform_yaw_filtered_, platform_yaw_raw_, last_odometry_timestamp_);
+    // Publish the in-plane platform yaw: the complementary filter's pair, plus
+    // the EKF's psi_pf -- which is a state with a covariance rather than a signal
+    // smoothed at a fixed alpha, and is what retires updatePlatformYaw() once the
+    // EKF is the only estimator left.
+    diagnostics_->publishPlatformYaw(platform_yaw_filtered_, platform_yaw_raw_,
+                                     filter_platform_yaw_, last_odometry_timestamp_);
+
+    // The EKF's own error, its claimed uncertainty and its innovation statistics.
+    // Published only once it has actually been fed something: a filter running on
+    // dead reckoning alone has an estimate, but scoring it would measure the
+    // odometry rather than the estimator.
+    if (filter_measurement_received_) {
+      diagnostics_->publishFilterPosition(groundtruth_position_W_ - filter_position_W_,
+                                          last_odometry_timestamp_);
+      diagnostics_->publishFilterSigma(filter_sigma_, filter_platform_yaw_sigma_,
+                                       last_odometry_timestamp_);
+      const int dof = std::max(filter_.lastNISDof(), 1);
+      diagnostics_->publishFilterNIS(filter_.lastNIS() / dof, dof, filter_.rejectFraction(),
+                                     last_odometry_timestamp_);
+    }
   }
 
   void landDetectedCallback(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg) {
@@ -1283,6 +1739,32 @@ protected:
         estimated_position_W_ += delta_position;
     }
 
+    // The EKF takes the same odometry as a MEASUREMENT of v_rel -- on a static pad
+    // the vehicle velocity is the relative velocity -- so the position follows
+    // from integrating a quantity the filter has an uncertainty for, instead of
+    // accumulating deltas it has no opinion about.
+    //
+    // But the velocity it is given is the DERIVATIVE OF THE REPORTED POSITION, not
+    // the velocity field of the same message. Those are not always the same
+    // signal: measured in flight, PX4 reported 0.20 m/s of climb while its own
+    // position moved at 0.013 m/s, and a filter integrating the velocity walked
+    // 1.65 m up in eight seconds -- while the complementary filter, propagating
+    // position deltas from the identical messages, stayed within 21 cm.
+    // Differentiating the position keeps the estimate consistent with the signal
+    // the tag is there to correct, which is the whole point of a relative filter.
+    const rclcpp::Time odometry_arrival = this->now();
+    if (filter_initialized_ && last_odometry_arrival_valid_) {
+      const double interval = (odometry_arrival - last_odometry_arrival_).seconds();
+      // Too short and the difference is quantisation noise; too long and the
+      // vehicle has manoeuvred inside the interval. Either way, skip it rather
+      // than feed the filter a number it will believe.
+      if (interval > 0.005 && interval < 0.2) {
+        filter_.addVelocity(nodeSeconds(), delta_position / interval);
+      }
+    }
+    last_odometry_arrival_ = odometry_arrival;
+    last_odometry_arrival_valid_ = true;
+
     drone_position_W_ = position;
     drone_velocity_W_ = velocity;
     // Low-passed for the contact check, which must not restart on single samples.
@@ -1309,6 +1791,15 @@ protected:
 
       // Initialize fused position estimate from odometry
       estimated_position_W_ = position;
+
+      // Seed the EKF from the same place, so the two estimators start level and
+      // any difference between them later is the estimator rather than the seed.
+      // The platform yaw starts at zero with a wide prior: it is observable from
+      // the corners, and the first few measurements are accepted ungated so that
+      // a genuinely large initial error can be corrected rather than gated away.
+      filter_.initialize(nodeSeconds(), position, velocity, 0.0);
+      filter_initialized_ = true;
+      refreshFilterOutputs();
 
       initialization_time_ = std::chrono::high_resolution_clock::now();
       trajectory_initialized_ = true;
@@ -1349,6 +1840,57 @@ protected:
   void localPositionCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg) {
     range_altitude_fresh_ = msg->dist_bottom_valid && std::isfinite(msg->dist_bottom) &&
                             msg->dist_bottom > range_min_trusted_altitude_;
+
+    // The EKF gets the same signal, in the two forms it actually takes.
+    //
+    // Live beam: an altitude measurement with a real sigma, so it competes with
+    // the tag's own (much weaker) range information on the evidence rather than
+    // by a rule about which source owns z.
+    //
+    // Blind zone: the beam falling inside its minimum range is not missing data,
+    // it is an upper bound of blind_zone_ceiling_ on the altitude -- and it is
+    // the only altitude information that exists in the last 25 cm, where the
+    // dead-reckoned z has been seen to climb while the aircraft descended.
+    if (filter_initialized_) {
+      const bool inside_blind_zone = msg->dist_bottom_valid && std::isfinite(msg->dist_bottom) &&
+                                     msg->dist_bottom <= range_min_trusted_altitude_;
+      if (range_altitude_fresh_) {
+        filter_.addRangeAltitude(nodeSeconds(), msg->dist_bottom);
+        blind_zone_active_ = false;
+      } else if (inside_blind_zone) {
+        // Latched: once the beam has reported from inside its minimum range, the
+        // vehicle is in the blind zone until a trusted reading says otherwise.
+        // dist_bottom_valid cannot carry that -- it went FALSE for the whole
+        // touchdown of a real-camera run (EKF2 reset its terrain state three
+        // times), and a ceiling conditioned on the flag simply stopped being
+        // applied at the moment it was needed.
+        if (!blind_zone_active_) {
+          RCLCPP_INFO(this->get_logger(),
+                      "Rangefinder blind zone entered (dist_bottom %.3f m): altitude is now "
+                      "bounded to [%.2f, %.2f] m rather than measured.",
+                      msg->dist_bottom, blind_zone_floor_, blind_zone_ceiling_);
+        }
+        blind_zone_active_ = true;
+      }
+
+      // The floor is a property of the world rather than of the sensor: the
+      // vehicle is not underneath the pad it is landing on. So it is applied on
+      // every message, with no dependence on the beam at all -- the case that
+      // needs it most is exactly the case where the beam has stopped reporting.
+      // Measured: with dist_bottom_valid false through touchdown and PX4's own vz
+      // reading -0.135 m/s at a vehicle sitting still on the ground, the estimate
+      // sank 1.05 m into the pad, and the touchdown check waited for a descent
+      // that had finished eight seconds earlier.
+      //
+      // No rate limit: the filter applies these as a projection onto the interval
+      // rather than as evidence about it, so repeating one is free and skipping it
+      // is not.
+      const double ceiling = (blind_zone_active_ && airborne_)
+                                 ? blind_zone_ceiling_
+                                 : std::numeric_limits<double>::infinity();
+      filter_.addAltitudeBounds(nodeSeconds(), blind_zone_floor_, ceiling);
+    }
+
     if (!range_altitude_fresh_) {
       return;
     }
