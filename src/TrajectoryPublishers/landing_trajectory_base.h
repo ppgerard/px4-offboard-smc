@@ -54,6 +54,7 @@
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_land_detected.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/distance_sensor.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -77,6 +78,20 @@ public:
     this->declare_parameter("landing_parameters.camera_offset_body.x", 0.0);
     this->declare_parameter("landing_parameters.camera_offset_body.y", 0.0);
     this->declare_parameter("landing_parameters.camera_offset_body.z", -0.03);
+
+    // Where the downward beam sits on the airframe, in body FLU. These MUST match
+    // EKF2_RNG_POS_X/Y/Z in the airframe (which are FRD, so z is negated): both
+    // filters now measure the same beam, and a disagreement between them would
+    // show up as one filter being biased against the other with nothing to say
+    // which is right. The mount is off-centre because the centreline has no clear
+    // line of sight down -- see CLAUDE.md; do not "tidy" it to zero.
+    this->declare_parameter("landing_parameters.rangefinder_offset_body.x", 0.10);
+    this->declare_parameter("landing_parameters.rangefinder_offset_body.y", 0.0);
+    this->declare_parameter("landing_parameters.rangefinder_offset_body.z", -0.145);
+    this->declare_parameter("landing_parameters.rangefinder_max_tilt_deg", 20.0);
+    this->declare_parameter("landing_parameters.rangefinder_sigma_base", 0.02);
+    this->declare_parameter("landing_parameters.rangefinder_sigma_scale", 0.01);
+    this->declare_parameter("landing_parameters.rangefinder_sigma_lever", 0.01);
 
     // Which estimator steers: "ekf" (the relative-state EKF on corner pixels,
     // the default), "complementary" (the fixed-gain filter this node used to fly,
@@ -117,6 +132,19 @@ public:
     camera_frame_id_ = this->get_parameter("landing_parameters.camera_frame_id").as_string();
     platform_frame_id_ = this->get_parameter("landing_parameters.platform_frame_id").as_string();
     world_frame_id_ = this->get_parameter("landing_parameters.world_frame_id").as_string();
+    range_geometry_.r_sensor_body = Eigen::Vector3d(
+        this->get_parameter("landing_parameters.rangefinder_offset_body.x").as_double(),
+        this->get_parameter("landing_parameters.rangefinder_offset_body.y").as_double(),
+        this->get_parameter("landing_parameters.rangefinder_offset_body.z").as_double());
+    range_geometry_.max_tilt =
+        this->get_parameter("landing_parameters.rangefinder_max_tilt_deg").as_double() * M_PI / 180.0;
+    range_geometry_.sigma_base =
+        this->get_parameter("landing_parameters.rangefinder_sigma_base").as_double();
+    range_geometry_.sigma_scale =
+        this->get_parameter("landing_parameters.rangefinder_sigma_scale").as_double();
+    range_geometry_.sigma_lever =
+        this->get_parameter("landing_parameters.rangefinder_sigma_lever").as_double();
+
     r_cam_b_b_ = Eigen::Vector3d(
         this->get_parameter("landing_parameters.camera_offset_body.x").as_double(),
         this->get_parameter("landing_parameters.camera_offset_body.y").as_double(),
@@ -146,6 +174,12 @@ public:
     // Rangefinder-derived height above terrain, for the altitude correction below.
     local_position_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
         ("/fmu/out/vehicle_local_position_v1", qos, std::bind(&LandingTrajectoryNodeBase::localPositionCallback, this, std::placeholders::_1));
+    // The RAW beam, for the EKF. dist_bottom above is EKF2's terrain estimate --
+    // the same beam, already fused and filtered -- and consuming both would have
+    // the EKF treat two outputs of one filter as independent evidence. See
+    // distanceSensorCallback().
+    distance_sensor_sub_ = this->create_subscription<px4_msgs::msg::DistanceSensor>
+        ("/fmu/out/distance_sensor", qos, std::bind(&LandingTrajectoryNodeBase::distanceSensorCallback, this, std::placeholders::_1));
     // The detector's raw output: corner pixels and the tag identity. The pose it
     // also publishes is deliberately not used by the EKF path -- see
     // relative_state_filter.h for why pixels make a better measurement.
@@ -407,11 +441,12 @@ protected:
   // the stamps are on another clock.
   const double latency_sigma_unsynced_ = 0.08;  // [s]
 
-  // The blind zone, fused as information rather than left as a gap. Below this
-  // height the beam is inside its minimum range, and that silence bounds the
-  // altitude from above -- which is what near_pad should be reading instead of a
-  // dead-reckoned number. Rate-limited because it is ONE fact, not one per cycle.
-  const double blind_zone_ceiling_ = 0.245;        // [m] beam minimum + lever arm
+  // The blind zone, fused as information rather than left as a gap. Below ~0.245 m
+  // the beam is inside its minimum range, and that silence bounds the altitude
+  // from above -- which is what near_pad should be reading instead of a
+  // dead-reckoned number. The bound itself is derived per-message from the
+  // sensor's own reported minimum and the current tilt (beam_ceiling_), not
+  // hard-coded, so it stays right if the mount or the sensor changes.
   // And the other side of it: the vehicle is not below the pad it is landing on.
   // Obvious, and worth stating, because the estimate went to -1.13 m on a real
   // camera run while the aircraft sat on the ground -- which kept the touchdown
@@ -455,6 +490,14 @@ protected:
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr groundtruth_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_position_sub_;
+  rclcpp::Subscription<px4_msgs::msg::DistanceSensor>::SharedPtr distance_sensor_sub_;
+
+  // Raw-beam geometry and the state derived from it, for the EKF path.
+  landing::RangeGeometry range_geometry_;
+  double beam_altitude_ = 0.0;        // [m] last accepted raw-beam altitude
+  bool beam_altitude_fresh_ = false;
+  double beam_ceiling_ = 0.245;       // [m] blind-zone bound, derived from the beam's own minimum
+  int beam_tilt_rejections_ = 0;
 
   // Rangefinder altitude. dist_bottom is height above terrain of the body origin
   // once EKF2_RNG_POS_Z models the lever arm, which is what this pipeline means
@@ -1847,55 +1890,10 @@ protected:
     range_altitude_fresh_ = msg->dist_bottom_valid && std::isfinite(msg->dist_bottom) &&
                             msg->dist_bottom > range_min_trusted_altitude_;
 
-    // The EKF gets the same signal, in the two forms it actually takes.
-    //
-    // Live beam: an altitude measurement with a real sigma, so it competes with
-    // the tag's own (much weaker) range information on the evidence rather than
-    // by a rule about which source owns z.
-    //
-    // Blind zone: the beam falling inside its minimum range is not missing data,
-    // it is an upper bound of blind_zone_ceiling_ on the altitude -- and it is
-    // the only altitude information that exists in the last 25 cm, where the
-    // dead-reckoned z has been seen to climb while the aircraft descended.
-    if (filter_initialized_) {
-      const bool inside_blind_zone = msg->dist_bottom_valid && std::isfinite(msg->dist_bottom) &&
-                                     msg->dist_bottom <= range_min_trusted_altitude_;
-      if (range_altitude_fresh_) {
-        filter_.addRangeAltitude(nodeSeconds(), msg->dist_bottom);
-        blind_zone_active_ = false;
-      } else if (inside_blind_zone) {
-        // Latched: once the beam has reported from inside its minimum range, the
-        // vehicle is in the blind zone until a trusted reading says otherwise.
-        // dist_bottom_valid cannot carry that -- it went FALSE for the whole
-        // touchdown of a real-camera run (EKF2 reset its terrain state three
-        // times), and a ceiling conditioned on the flag simply stopped being
-        // applied at the moment it was needed.
-        if (!blind_zone_active_) {
-          RCLCPP_INFO(this->get_logger(),
-                      "Rangefinder blind zone entered (dist_bottom %.3f m): altitude is now "
-                      "bounded to [%.2f, %.2f] m rather than measured.",
-                      msg->dist_bottom, blind_zone_floor_, blind_zone_ceiling_);
-        }
-        blind_zone_active_ = true;
-      }
-
-      // The floor is a property of the world rather than of the sensor: the
-      // vehicle is not underneath the pad it is landing on. So it is applied on
-      // every message, with no dependence on the beam at all -- the case that
-      // needs it most is exactly the case where the beam has stopped reporting.
-      // Measured: with dist_bottom_valid false through touchdown and PX4's own vz
-      // reading -0.135 m/s at a vehicle sitting still on the ground, the estimate
-      // sank 1.05 m into the pad, and the touchdown check waited for a descent
-      // that had finished eight seconds earlier.
-      //
-      // No rate limit: the filter applies these as a projection onto the interval
-      // rather than as evidence about it, so repeating one is free and skipping it
-      // is not.
-      const double ceiling = (blind_zone_active_ && airborne_)
-                                 ? blind_zone_ceiling_
-                                 : std::numeric_limits<double>::infinity();
-      filter_.addAltitudeBounds(nodeSeconds(), blind_zone_floor_, ceiling);
-    }
+    // NOTE the EKF no longer reads dist_bottom at all -- it takes the raw beam in
+    // distanceSensorCallback(). This one stays for the complementary filter, and
+    // the two are now genuinely independent measurements of the same quantity,
+    // which is what makes the A/B between them mean anything.
 
     if (!range_altitude_fresh_) {
       return;
@@ -1904,6 +1902,101 @@ protected:
     if (trajectory_initialized_) {
       estimated_position_W_(2) = range_altitude_;
     }
+  }
+
+  // The RAW rangefinder, tilt-corrected, as the EKF's altitude measurement.
+  //
+  // The EKF used to take dist_bottom, which is EKF2's terrain estimate: the same
+  // beam, already fused with GPS and baro and filtered. That layering was wrong in
+  // three ways at once. It made the filter consume two correlated outputs of one
+  // upstream filter (this altitude and the velocity differentiated from the same
+  // solution) while treating them as independent evidence, so the z covariance was
+  // optimistic by construction. It inherited EKF2's failure modes wholesale --
+  // dist_bottom_valid went FALSE through an entire real-camera touchdown while
+  // EKF2 reset its terrain state three times. And it left EKF2's own height with
+  // nothing to be checked against, since the thing checking it was derived from it.
+  //
+  // The beam is still fused inside EKF2 as well (EKF2_RNG_CTRL 2), deliberately:
+  // PX4 flies its own takeoff on that estimate and the SMC closes on the odometry
+  // built from it, so switching range aiding off to de-duplicate would degrade
+  // three things to tidy one. What is removed here is the SECOND-HAND consumption,
+  // not the sensor sharing -- EKF2's GPS/baro-referenced height is now a genuinely
+  // independent cross-check on this filter rather than a correlated one.
+  //
+  // The other thing the raw beam buys is an honest blind-zone signal. It reports
+  // its own blindness (a non-finite reading inside the minimum range) where
+  // dist_bottom_valid stays TRUE while EKF2 quietly substitutes EKF2_MIN_RNG --
+  // the same trap as canTransform() not being a visibility test.
+  void distanceSensorCallback(const px4_msgs::msg::DistanceSensor::SharedPtr msg) {
+    if (!filter_initialized_) {
+      return;
+    }
+    if (msg->orientation != px4_msgs::msg::DistanceSensor::ROTATION_DOWNWARD_FACING) {
+      RCLCPP_WARN_ONCE(this->get_logger(),
+                       "Ignoring a distance sensor with orientation %u: this filter's geometry "
+                       "assumes a downward-facing beam.", msg->orientation);
+      return;
+    }
+
+    // The message stamp is microseconds since flight-controller boot, which is not
+    // comparable with this node's clock (the same trap the tag stamps have), so the
+    // beam is paired with the latest attitude rather than one interpolated to it.
+    // At 50 Hz against a 100 Hz attitude that is worth well under a degree, and the
+    // tilt term below is second-order in it near level.
+    const Eigen::Matrix3d R_W_B = drone_orientation_W_.toRotationMatrix();
+    const double range = msg->current_distance;
+    const double min_range = msg->min_distance > 0.0f ? msg->min_distance : 0.1;
+    const bool returned = std::isfinite(range) && range >= min_range && range <= msg->max_distance;
+    // 0 means the driver is telling us the reading is invalid; -1 means it has no
+    // opinion, which is what SITL reports and is not a fault.
+    const bool quality_ok = msg->signal_quality != 0;
+
+    if (returned && quality_ok) {
+      const landing::RangeAltitude beam =
+          landing::rangeToAltitude(range, R_W_B, range_geometry_, filter_.config().attitude_sigma);
+      if (beam.valid) {
+        filter_.addRangeAltitude(nodeSeconds(), beam.altitude, beam.sigma);
+        beam_altitude_ = beam.altitude;
+        beam_altitude_fresh_ = true;
+        blind_zone_active_ = false;
+      } else {
+        // Too far off level for the flat-pad assumption to hold. Not an error --
+        // it is the gate doing its job -- but worth counting, because a landing
+        // that spends its descent leaning is a different problem.
+        beam_altitude_fresh_ = false;
+        ++beam_tilt_rejections_;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Rangefinder rejected on tilt (%.1f deg > %.1f deg limit), %d so far; "
+                             "altitude is running on the tag and dead reckoning.",
+                             std::acos(std::clamp(beam.cos_tilt, -1.0, 1.0)) * 180.0 / M_PI,
+                             range_geometry_.max_tilt * 180.0 / M_PI, beam_tilt_rejections_);
+      }
+    } else {
+      beam_altitude_fresh_ = false;
+      // At these altitudes the only way to lose the return is the minimum range:
+      // the sensor's maximum is 100 m. So a non-finite reading is not missing
+      // data, it is the statement that the vehicle is inside the blind zone.
+      const bool below_minimum = !std::isfinite(range) || range < min_range;
+      if (below_minimum) {
+        beam_ceiling_ = landing::blindZoneCeiling(min_range, R_W_B, range_geometry_);
+        if (!blind_zone_active_) {
+          RCLCPP_INFO(this->get_logger(),
+                      "Rangefinder blind zone entered (beam %.3f m, minimum %.3f m): altitude is "
+                      "now bounded to [%.2f, %.2f] m rather than measured.",
+                      range, min_range, blind_zone_floor_, beam_ceiling_);
+        }
+        blind_zone_active_ = true;
+      }
+    }
+
+    // Both sides of the bound, on every message. The floor is a property of the
+    // world rather than of the sensor -- the vehicle is not underneath the pad --
+    // so it does not wait for the beam to say anything, which is the point: the
+    // case that needs it is the case where the beam has stopped reporting.
+    const double ceiling = (blind_zone_active_ && airborne_)
+                               ? beam_ceiling_
+                               : std::numeric_limits<double>::infinity();
+    filter_.addAltitudeBounds(nodeSeconds(), blind_zone_floor_, ceiling);
   }
 
   void groundtruthCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr gt_msg) {

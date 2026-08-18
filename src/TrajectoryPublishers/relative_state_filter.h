@@ -107,6 +107,74 @@ struct CornerObservation {
   }
 };
 
+// ---- Rangefinder geometry ---------------------------------------------------
+// Where the raw beam becomes an altitude. Kept here, next to the filter and free
+// of ROS, because it is arithmetic with a right answer and it is worth being able
+// to check it offline: the same lever arm was silently zero inside EKF2 for the
+// whole project and cost 14.5 cm of altitude bias before anyone measured it.
+//
+// The beam looks along body -z. With the vehicle tilted, the range it reports is
+// the slant distance, and the sensor is not at the body origin, so
+//
+//     h = range * cos(tilt) - (R_world_body * r_sensor_body)_z
+//
+// where cos(tilt) is just R_world_body(2,2), the world-vertical component of the
+// body z axis. Level, with the mount 0.145 m below the origin, that is
+// range + 0.145 -- which is why the beam reads 0.155 m with the body at 0.30 m,
+// and why it goes blind (0.1 m minimum) at 0.245 m of body height.
+//
+// This assumes flat ground under the vehicle, which is a project constraint (a
+// static, flat pad) rather than an approximation being smuggled in. Off level the
+// assumption decays -- the beam lands somewhere else on the pad -- so the tilt
+// limit below is a real gate, not a formality.
+struct RangeGeometry {
+  Eigen::Vector3d r_sensor_body{0.10, 0.0, -0.145};  // sensor in body FLU [m]
+  double max_tilt = 0.35;      // [rad] beyond ~20 deg the flat-ground assumption goes
+  double sigma_base = 0.02;    // [m]   fixed part of the beam's error
+  double sigma_scale = 0.01;   // [m/m] proportional part, 1% of range
+  double sigma_lever = 0.01;   // [m]   how well the mount position is known
+};
+
+struct RangeAltitude {
+  bool valid = false;
+  double altitude = 0.0;  // [m] body origin above the pad
+  double sigma = 0.0;     // [m] one standard deviation of the above
+  double cos_tilt = 1.0;
+};
+
+// Convert one beam reading into an altitude of the body origin, with its sigma.
+// `attitude_sigma` is the navigation attitude error, which enters because a
+// tilted beam turns attitude error into range error: d(h)/d(tilt) = -range*sin(tilt),
+// zero at level and growing as the vehicle leans, which is exactly the behaviour
+// a fixed sigma would get wrong in both directions.
+inline RangeAltitude rangeToAltitude(double range, const Eigen::Matrix3d &R_world_body,
+                                     const RangeGeometry &geometry, double attitude_sigma) {
+  RangeAltitude result;
+  result.cos_tilt = R_world_body(2, 2);
+  if (!std::isfinite(range) || range <= 0.0 || result.cos_tilt < std::cos(geometry.max_tilt)) {
+    return result;
+  }
+  const double lever_z = (R_world_body * geometry.r_sensor_body)(2);
+  result.altitude = range * result.cos_tilt - lever_z;
+
+  const double sin_tilt =
+      std::sqrt(std::max(0.0, 1.0 - result.cos_tilt * result.cos_tilt));
+  const double beam = geometry.sigma_base + geometry.sigma_scale * range;
+  const double tilt_term = range * sin_tilt * attitude_sigma;
+  result.sigma = std::sqrt(beam * beam + tilt_term * tilt_term +
+                           geometry.sigma_lever * geometry.sigma_lever);
+  result.valid = true;
+  return result;
+}
+
+// The largest body altitude consistent with the beam being INSIDE its minimum
+// range -- i.e. what the silence in the blind zone actually says.
+inline double blindZoneCeiling(double min_range, const Eigen::Matrix3d &R_world_body,
+                               const RangeGeometry &geometry) {
+  const double lever_z = (R_world_body * geometry.r_sensor_body)(2);
+  return min_range * R_world_body(2, 2) - lever_z;
+}
+
 struct RelativeStateFilterConfig {
   // ---- Process noise --------------------------------------------------------
   // The filter is fed no acceleration input, so the whole vehicle acceleration is
@@ -313,11 +381,15 @@ class RelativeStateFilter {
   // estimate. Ungated: it is the altitude reference the rest of the stack already
   // trusts, and gating it against a covariance this filter derived would let a
   // drifting estimate lock the good measurement out.
-  Result addRangeAltitude(double time, double altitude) {
+  // `sigma` is per-measurement because the beam's error is not constant: it grows
+  // with range and with tilt (see rangeToAltitude()). Pass a non-positive value to
+  // fall back on the configured range_sigma.
+  Result addRangeAltitude(double time, double altitude, double sigma = -1.0) {
     Event event;
     event.kind = Event::Kind::kRangeAltitude;
     event.time = time;
     event.scalar = altitude;
+    event.scalar_low = sigma > 0.0 ? sigma : config_.range_sigma;
     return submit(std::move(event));
   }
 
@@ -607,7 +679,8 @@ class RelativeStateFilter {
     Eigen::VectorXd innovation(1);
     innovation(0) = event.scalar - state_(2);
     Eigen::MatrixXd R(1, 1);
-    R(0, 0) = config_.range_sigma * config_.range_sigma;
+    const double sigma = event.scalar_low > 0.0 ? event.scalar_low : config_.range_sigma;
+    R(0, 0) = sigma * sigma;
     return update(innovation, H, R, /*gate=*/false, /*is_replay=*/false, /*was_applied=*/true);
   }
 
