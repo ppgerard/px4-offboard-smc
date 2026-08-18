@@ -215,7 +215,14 @@ protected:
   const double cone_tag_max_age_ = 0.3;  // no fresh tag, no descent [s]
 
   // ---- Phase 3: commit --------------------------------------------------------
-  const double commit_altitude_ = 0.20;      // commit below this altitude (~0.10 m clearance) [m]
+  // Commit above the rangefinder's blind zone, not below it. The lidar's minimum
+  // range is 0.1 m and it sits 0.145 m under base_link, so it returns inf below
+  // about 0.245 m of body height -- and vehicle_local_position.dist_bottom_valid
+  // stays TRUE through the gap, because EKF2 coasts on its terrain state. At the
+  // old 0.20 m the commit decision was taken on a coasted altitude; at 0.30 m it
+  // is taken on a live measurement. The terminal descent below it is unchanged
+  // and needs no altitude: frozen XY, fixed rate, contact-based exit.
+  const double commit_altitude_ = 0.30;      // commit below this altitude (~0.20 m clearance) [m]
   const double commit_xy_error_max_ = 0.10;  // XY alignment required to commit [m]
   const double commit_tag_max_age_ = 0.5;    // tag measurement must be fresher than this [s]
   const double commit_wait_timeout_ = 5.0;   // commit regardless after waiting this long [s]
@@ -404,11 +411,25 @@ protected:
   }
 
   // ============ Fused Position Estimation (100Hz prediction + 15Hz correction) ============
+  //
+  // The tag corrects XY ONLY. Altitude comes from the EKF, which fuses the
+  // rangefinder (EKF2_RNG_CTRL 2, lever arm in EKF2_RNG_POS_Z) and tracks
+  // groundtruth to about a centimetre -- against roughly 10-20 cm from a
+  // monocular tag at 3 m, which also carries the camera extrinsic's error
+  // directly. Every altitude failure this project has had came from the tag
+  // path: a false contact that disarmed in mid-air at an estimated 0.284 m, an
+  // impossible -0.305 m at the commit timeout, and a ~4 cm camera_offset_body.z
+  // bias that shifted commit_altitude_ with it. None of those are observable
+  // when Z is the EKF's.
+  //
+  // estimated_position_W_ is seeded from odometry and propagated by odometry
+  // deltas, so leaving Z uncorrected makes it exactly the EKF altitude -- height
+  // of the body origin above the local origin, which is the pad on flat ground.
+  // The tag keeps XY, which is the thing only the tag can supply.
   void correctFusedPositionWithTag(const Eigen::Vector3d& tag_position) {
-    // Correction step: apply tag measurement
-    // Innovation-based correction with limited gain to smooth out jumps
-    Eigen::Vector3d innovation = tag_position - estimated_position_W_;
-    estimated_position_W_ += fusion_alpha_ * innovation;
+    const Eigen::Vector2d innovation_xy =
+        tag_position.head<2>() - estimated_position_W_.head<2>();
+    estimated_position_W_.head<2>() += fusion_alpha_ * innovation_xy;
   }
 
   // ============ Initialization Delay Handling ============
