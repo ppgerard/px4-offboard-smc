@@ -22,6 +22,7 @@ public:
     filter_sigma_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_sigma", 10);
     filter_nis_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_nis", 10);
     filter_residual_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_residual", 10);
+    camera_bias_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_camera_bias", 10);
   }
 
   // Publish current odometry state
@@ -174,6 +175,13 @@ public:
                   static_cast<double>(corners), timestamp);
   }
 
+  // The camera mounting error the filter has learned [m], body axes. A calibration
+  // output rather than telemetry: whatever z settles to is a correction to
+  // camera_offset_body.z, and it is the number a bench measurement should match.
+  void publishCameraBias(const Eigen::Vector3d& bias, double sigma_z, uint64_t timestamp) {
+    publishVector(camera_bias_pub_, bias(0), bias(2), sigma_z, timestamp);
+  }
+
 private:
   void publishVector(const rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr& pub,
                      double x, double y, double z, uint64_t timestamp) {
@@ -197,6 +205,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_sigma_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_nis_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_residual_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr camera_bias_pub_;
 };
 
 #endif  // DIAGNOSTICS_PUBLISHER_H

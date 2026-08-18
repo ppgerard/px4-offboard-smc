@@ -14,7 +14,22 @@
 //   x = [ p_rel (3)   vehicle body origin relative to the platform origin, world axes [m]
 //         v_rel (3)   its derivative; on a static pad, the vehicle velocity   [m/s]
 //         psi_pf(1)   platform yaw relative to the world x axis               [rad]
-//         b_v   (3)   bias on the navigation velocity measurement             [m/s] ]
+//         b_v   (3)   bias on the navigation velocity measurement             [m/s]
+//         b_cam (3)   error in the camera's mounting offset, body axes         [m] ]
+//
+// b_cam is the calibration the filter used to ASSUME. r_camera_body is read off
+// the airframe (or, here, the SDF) and is never exactly right; the error is fixed
+// in metres, so in pixels it grows as 1/range -- 2 px at 3 m and 36 px at 0.3 m
+// for a single centimetre. That is why it was worth an inflated R term
+// (extrinsic_sigma) and why the inflation hurt most near the ground, discounting
+// the tag in the one phase with no other lateral reference.
+//
+// Estimating it moves that uncertainty from R into P, where it belongs: it is one
+// unknown constant, not fresh noise on every frame. It is observable for exactly
+// the reason it hurts -- a descent sweeps the range by 10x, and a fixed metric
+// offset changes its pixel signature across that sweep while a genuine position
+// error does not. It is also expressed in BODY axes, so any yaw the vehicle turns
+// separates it further from p_rel, which lives in world axes.
 //
 // b_v is a MEASUREMENT bias, not a force: it is what EKF2's velocity is wrong by,
 // which is a slowly drifting quantity rather than white noise. It is NOT f_ext --
@@ -308,12 +323,53 @@ struct RelativeStateFilterConfig {
   // the clamp: an unbounded bias state turns a large position innovation into a
   // runaway.
   double velocity_bias_max = 0.30;  // [m/s]
+
+  // ---- Camera mounting bias (b_cam) -----------------------------------------
+  // On by default: unlike b_v, this one is a fixed physical constant rather than a
+  // drifting quantity, so it cannot be integrated into a runaway, and the term it
+  // replaces in R is the one measured to be dominating the close-range
+  // conservatism.
+  bool estimate_camera_bias = true;
+  // Per-axis, and only the boresight is non-zero -- because only the boresight is
+  // OBSERVABLE on this mission. Measured offline, and it inverts the intuition:
+  //
+  //   - The LATERAL offset (x, y) shifts the whole image sideways, which is
+  //     exactly what a p_rel error does. Nothing separates them but vehicle
+  //     rotation, and a landing barely rotates: yaw is pinned to the platform
+  //     heading by project constraint and the tilt in wind is a few degrees. With
+  //     +-5 deg of yaw the state does not converge at all, and it absorbs position
+  //     error while failing to (5.1 cm vs 4.5 cm below 0.5 m). Even +-57 deg of
+  //     deliberate yaw only recovers about a third of it.
+  //   - The BORESIGHT offset (z) changes the RANGE to the pad, and therefore the
+  //     apparent SCALE of the marker -- and the altitude is independently pinned
+  //     by the rangefinder. So "the beam says 1.2 m but the tag looks like 1.25 m"
+  //     is information about the mounting and nothing else. It converges to within
+  //     1 mm of a 2 cm error, with no rotation needed.
+  //
+  // Which is a pleasing result: the boresight component is the one this project
+  // actually had an open question about (camera_offset_body.z), and it is the one
+  // the rangefinder makes identifiable. Range diversity, incidentally, does NOT
+  // help -- a descent scales the pixel effect of a mounting error and a position
+  // error identically, which is where the original argument for this state was
+  // wrong.
+  Eigen::Vector3d initial_camera_bias_sigma{0.0, 0.0, 0.03};  // [m]
+  // Nearly zero: the camera does not move on the airframe. Non-zero only so the
+  // state can still respond slowly on a long flight rather than freezing on an
+  // early, badly conditioned estimate.
+  double camera_bias_noise_density = 0.0005;  // [m/sqrt(s)]
+  // A bound, for the same reason b_v has one: a state that enters the measurement
+  // model can absorb an error that belongs elsewhere. Nothing on this airframe is
+  // mounted 10 cm from where the SDF says.
+  double camera_bias_max = 0.10;  // [m]
+  // What R still has to carry once b_cam is a state: the part of the extrinsic
+  // error three translation states cannot represent, chiefly boresight rotation.
+  double extrinsic_residual_sigma = 0.005;  // [m]
   double initial_yaw_sigma = 0.6;       // [rad]
 };
 
 class RelativeStateFilter {
  public:
-  static constexpr int kStateDim = 10;
+  static constexpr int kStateDim = 13;
   using StateVector = Eigen::Matrix<double, kStateDim, 1>;
   using StateMatrix = Eigen::Matrix<double, kStateDim, kStateDim>;
 
@@ -342,7 +398,8 @@ class RelativeStateFilter {
 
   void initialize(double time, const Eigen::Vector3d &position_relative,
                   const Eigen::Vector3d &velocity_relative, double platform_yaw,
-                  const Eigen::Vector3d &velocity_bias = Eigen::Vector3d::Zero()) {
+                  const Eigen::Vector3d &velocity_bias = Eigen::Vector3d::Zero(),
+                  const Eigen::Vector3d &camera_bias = Eigen::Vector3d::Zero()) {
     state_.setZero();
     state_.segment<3>(0) = position_relative;
     state_.segment<3>(3) = velocity_relative;
@@ -358,6 +415,8 @@ class RelativeStateFilter {
     covariance_.block<3, 3>(7, 7) = Eigen::Matrix3d::Identity() *
                                     config_.initial_velocity_bias_sigma *
                                     config_.initial_velocity_bias_sigma;
+    state_.segment<3>(10) = camera_bias;
+    covariance_.block<3, 3>(10, 10) = cameraBiasPrior().array().square().matrix().asDiagonal();
 
     time_ = time;
     initialized_ = true;
@@ -478,6 +537,15 @@ class RelativeStateFilter {
   Eigen::Vector3d velocityRelative() const { return state_.segment<3>(3); }
   double platformYaw() const { return state_(6); }
   Eigen::Vector3d velocityBias() const { return state_.segment<3>(7); }
+  // The mounting error the filter has learned, and how sure it is of it. Published,
+  // because it is a calibration output: it is the number a bench measurement of the
+  // camera mount should agree with.
+  Eigen::Vector3d cameraBias() const { return state_.segment<3>(10); }
+  Eigen::Vector3d cameraBiasStdDev() const {
+    return Eigen::Vector3d(std::sqrt(std::max(covariance_(10, 10), 0.0)),
+                           std::sqrt(std::max(covariance_(11, 11), 0.0)),
+                           std::sqrt(std::max(covariance_(12, 12), 0.0)));
+  }
 
   Eigen::Vector3d positionStdDev() const {
     return Eigen::Vector3d(std::sqrt(std::max(covariance_(0, 0), 0.0)),
@@ -677,6 +745,14 @@ class RelativeStateFilter {
     Q.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * (qa * dt);
     Q(6, 6) = qpsi * dt;
     Q.block<3, 3>(7, 7) = Eigen::Matrix3d::Identity() * (qb * dt);
+    // Process noise only on the axes that are being estimated: an axis with no
+    // prior is pinned at zero, and giving it noise would let it wander into the
+    // position states it cannot be told apart from.
+    const double qc = config_.camera_bias_noise_density * config_.camera_bias_noise_density;
+    const Eigen::Vector3d prior = cameraBiasPrior();
+    for (int i = 0; i < 3; ++i) {
+      Q(10 + i, 10 + i) = prior(i) > 0.0 ? qc * dt : 0.0;
+    }
 
     covariance_ = F * covariance_ * F.transpose() + Q;
     symmetrize();
@@ -721,8 +797,23 @@ class RelativeStateFilter {
     R += attitude_jacobian * (config_.attitude_sigma * config_.attitude_sigma) *
          attitude_jacobian.transpose();
 
-    // Camera mounting uncertainty, likewise common to the whole frame.
-    R += extrinsic_jacobian * (config_.extrinsic_sigma * config_.extrinsic_sigma) *
+    // Camera mounting uncertainty, likewise common to the whole frame -- but only
+    // while nothing is estimating it. Once b_cam is a state the uncertainty lives
+    // in P, and leaving the full term here as well would count one unknown
+    // constant twice and keep the tag discounted exactly where it was already
+    // being discounted. What stays behind is the part three translation states
+    // cannot represent, chiefly boresight rotation.
+    // Per axis: an axis being estimated keeps only the residual here, because its
+    // uncertainty now lives in P and counting it twice would keep the tag
+    // discounted exactly where it was already being discounted. An axis that is
+    // NOT estimated keeps the full term, because nothing else is carrying it.
+    const Eigen::Vector3d prior = cameraBiasPrior();
+    Eigen::Vector3d extrinsic_sigma;
+    for (int i = 0; i < 3; ++i) {
+      extrinsic_sigma(i) = prior(i) > 0.0 ? config_.extrinsic_residual_sigma
+                                          : config_.extrinsic_sigma;
+    }
+    R += extrinsic_jacobian * extrinsic_sigma.array().square().matrix().asDiagonal() *
          extrinsic_jacobian.transpose();
 
     // Unknown pipeline delay, projected the same way: an unmodelled delay dt puts
@@ -818,7 +909,10 @@ class RelativeStateFilter {
     // world vector into the optical frame.
     const Eigen::Matrix3d M = obs.R_world_body * obs.R_body_camera;
     const Eigen::Matrix3d Mt = M.transpose();
-    const Eigen::Vector3d camera_position = x.segment<3>(0) + obs.R_world_body * obs.r_camera_body;
+    // The mounting offset is the nominal one plus whatever b_cam has learned. With
+    // the state off, b_cam stays at zero and this is the nominal offset exactly.
+    const Eigen::Vector3d r_camera_body = obs.r_camera_body + x.segment<3>(10);
+    const Eigen::Vector3d camera_position = x.segment<3>(0) + obs.R_world_body * r_camera_body;
 
     innovation.resize(static_cast<int>(2 * n));
     H = Eigen::MatrixXd::Zero(static_cast<int>(2 * n), kStateDim);
@@ -849,6 +943,11 @@ class RelativeStateFilter {
       innovation.segment<2>(row) = obs.pixels[i] - pixel;
       H.block<2, 3>(row, 0) = -J_pix * Mt;
       H.block<2, 1>(row, 6) = J_pix * Mt * (dRz * obs.points_platform[i]);
+      // Same derivative the extrinsic term in R is built from, now used as a
+      // Jacobian instead: the offset is fixed in body axes, so it reaches the
+      // optical frame through R_bc alone. Axes with no prior have zero covariance,
+      // so their columns cannot move the state whatever this says.
+      H.block<2, 3>(row, 10) = -J_pix * obs.R_body_camera.transpose();
 
       if (attitude_jacobian != nullptr) {
         // Derivative with respect to a body-frame attitude perturbation
@@ -858,6 +957,7 @@ class RelativeStateFilter {
         //   dd_C/ddelta = R_bc' skew(u)
         const Eigen::Vector3d u =
             obs.R_world_body.transpose() * (corner_world - x.segment<3>(0));
+        (void)r_camera_body;
         attitude_jacobian->block<2, 3>(row, 0) =
             J_pix * obs.R_body_camera.transpose() * skew(u);
       }
@@ -951,6 +1051,8 @@ class RelativeStateFilter {
     // EKF2's position derivative does justifies more than this.
     state_.segment<3>(7) = state_.segment<3>(7).cwiseMax(-config_.velocity_bias_max)
                                .cwiseMin(config_.velocity_bias_max);
+    state_.segment<3>(10) = state_.segment<3>(10).cwiseMax(-config_.camera_bias_max)
+                                .cwiseMin(config_.camera_bias_max);
 
     // Joseph form: it costs one extra product and keeps the covariance symmetric
     // and positive definite through thousands of updates, which matters here
@@ -959,6 +1061,13 @@ class RelativeStateFilter {
     covariance_ = IKH * covariance_ * IKH.transpose() + K * R * K.transpose();
     symmetrize();
     return Result::kApplied;
+  }
+
+  // Prior standard deviation per camera-bias axis; zero means "not estimated",
+  // which pins the axis at nominal through both the covariance and Q.
+  Eigen::Vector3d cameraBiasPrior() const {
+    return config_.estimate_camera_bias ? config_.initial_camera_bias_sigma
+                                        : Eigen::Vector3d::Zero();
   }
 
   void symmetrize() { covariance_ = 0.5 * (covariance_ + covariance_.transpose()).eval(); }

@@ -131,6 +131,16 @@ public:
     this->declare_parameter("landing_parameters.filter.velocity_bias_noise_density", 0.0);
     this->declare_parameter("landing_parameters.filter.platform_yaw_noise_density", 0.01);
     this->declare_parameter("landing_parameters.filter.gate_probability", 0.999);
+    // The camera mounting error, estimated per axis. Only the boresight (z) is
+    // observable on a landing -- the rangefinder pins altitude, so a boresight
+    // error shows up as the marker being the wrong SIZE for the measured height,
+    // which nothing else explains. A lateral error just shifts the image, exactly
+    // like a position error, and only vehicle rotation separates those; this
+    // mission has none to spare, since the heading is pinned to the platform.
+    // Estimating the lateral axes anyway measurably costs accuracy, so they stay
+    // at zero and their uncertainty stays in R where it belongs.
+    this->declare_parameter("landing_parameters.filter.camera_bias_sigma_xy", 0.0);
+    this->declare_parameter("landing_parameters.filter.camera_bias_sigma_z", 0.03);
 
     camera_frame_id_ = this->get_parameter("landing_parameters.camera_frame_id").as_string();
     platform_frame_id_ = this->get_parameter("landing_parameters.platform_frame_id").as_string();
@@ -638,6 +648,13 @@ protected:
         this->get_parameter("landing_parameters.filter.platform_yaw_noise_density").as_double();
     config.gate_probability =
         this->get_parameter("landing_parameters.filter.gate_probability").as_double();
+    const double camera_bias_xy =
+        this->get_parameter("landing_parameters.filter.camera_bias_sigma_xy").as_double();
+    const double camera_bias_z =
+        this->get_parameter("landing_parameters.filter.camera_bias_sigma_z").as_double();
+    config.initial_camera_bias_sigma = Eigen::Vector3d(camera_bias_xy, camera_bias_xy,
+                                                       camera_bias_z);
+    config.estimate_camera_bias = config.initial_camera_bias_sigma.norm() > 0.0;
     filter_.setConfig(config);
 
     const auto ids = this->get_parameter("landing_parameters.tag_ids").as_integer_array();
@@ -1146,6 +1163,14 @@ protected:
         enterTouchdownPhase();
       }
       return;
+    }
+    if (filter_.config().estimate_camera_bias) {
+      const Eigen::Vector3d bias = filter_.cameraBias();
+      RCLCPP_INFO(this->get_logger(),
+                  "Camera mounting bias at touchdown: [%.3f %.3f %+.3f] m (sigma %.3f m on the "
+                  "boresight). Only z is observable here; if it has settled away from zero, that "
+                  "is a correction to landing_parameters.camera_offset_body.z.",
+                  bias(0), bias(1), bias(2), filter_.cameraBiasStdDev()(2));
     }
     RCLCPP_INFO(this->get_logger(),
                 "Touchdown after %.2f s of commit: estimated XY error=%.3f m, altitude=%.3f m "
@@ -1769,6 +1794,8 @@ protected:
       diagnostics_->publishFilterResidual(filter_.lastResidualRms(),
                                           filter_.lastResidualPredictedRms(), dof / 2,
                                           last_odometry_timestamp_);
+      diagnostics_->publishCameraBias(filter_.cameraBias(), filter_.cameraBiasStdDev()(2),
+                                      last_odometry_timestamp_);
     }
   }
 
