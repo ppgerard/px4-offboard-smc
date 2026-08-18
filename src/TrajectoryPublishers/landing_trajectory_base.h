@@ -90,6 +90,9 @@ public:
         ("/fmu/out/vehicle_land_detected", qos, std::bind(&LandingTrajectoryNodeBase::landDetectedCallback, this, std::placeholders::_1));
     vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>
         ("/fmu/out/vehicle_status_v1", qos, std::bind(&LandingTrajectoryNodeBase::vehicleStatusCallback, this, std::placeholders::_1));
+    // Rangefinder-derived height above terrain, for the altitude correction below.
+    local_position_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
+        ("/fmu/out/vehicle_local_position_v1", qos, std::bind(&LandingTrajectoryNodeBase::localPositionCallback, this, std::placeholders::_1));
 
     // Publishers
     trajectory_publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>
@@ -323,6 +326,18 @@ protected:
   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr groundtruth_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_position_sub_;
+
+  // Rangefinder altitude. dist_bottom is height above terrain of the body origin
+  // once EKF2_RNG_POS_Z models the lever arm, which is what this pipeline means
+  // by altitude on a flat pad.
+  double range_altitude_ = 0.0;
+  bool range_altitude_fresh_ = false;
+  // Below this the beam is inside its blind zone (0.1 m minimum range plus the
+  // 0.145 m mount offset) and EKF2 is coasting on EKF2_MIN_RNG rather than
+  // measuring. dist_bottom_valid stays TRUE through that, so it cannot be the
+  // test -- the reading's own magnitude is the only honest signal.
+  const double range_min_trusted_altitude_ = 0.25;  // [m]
   rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_detected_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -1278,6 +1293,44 @@ protected:
       RCLCPP_INFO(this->get_logger(), "Fused position estimate initialized from odometry");
       RCLCPP_INFO(this->get_logger(), "Waiting %.1f seconds before starting Phase 1 trajectory...",
                   initialization_delay_seconds_);
+    }
+  }
+
+  // Altitude is PX4's terrain-relative estimate, taken as-is.
+  //
+  // dist_bottom is already an EKF2 state -- the terrain estimate, lever-arm and
+  // tilt corrected and filtered -- not a raw beam. Blending it into an
+  // odometry-propagated value with a hand-picked gain (this used to use 0.2)
+  // filtered an already-filtered signal, added lag, and treated two outputs of
+  // the SAME filter, fed by the same sensor, as independent evidence. Assigning
+  // it directly is both simpler and more accurate: measured against groundtruth
+  // at 3 m, dist_bottom is out by ~5 mm where vehicle_local_position.z is out by
+  // 50-165 mm, and on the ground z is low by 0.18-0.25 m.
+  //
+  // Below range_min_trusted_altitude_ the beam is inside its blind zone (0.1 m
+  // minimum range plus the 0.145 m mount offset) and EKF2 is coasting on
+  // EKF2_MIN_RNG rather than measuring. dist_bottom_valid stays TRUE through
+  // that, so the reading's own magnitude is the only honest test. Past it we
+  // simply stop assigning and odometryCallback's delta propagation carries the
+  // last measured value forward -- continuous by construction, no step and no
+  // blend, because the value it continues from is the one just assigned.
+  //
+  // NOTE this is an interim. It is still EKF2's fusion of the beam, consumed
+  // second-hand. Roadmap item 7 should RELOCATE the rangefinder rather than add
+  // it again: EKF2_RNG_CTRL 0, fuse the raw distance_sensor in the landing filter
+  // with tilt correction and a range-dependent R, and keep EKF2's GPS/baro height
+  // as a genuinely independent cross-check. Fusing the same beam in both filters
+  // is double-counting, which matters once a real covariance sets the chi-squared
+  // gate.
+  void localPositionCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg) {
+    range_altitude_fresh_ = msg->dist_bottom_valid && std::isfinite(msg->dist_bottom) &&
+                            msg->dist_bottom > range_min_trusted_altitude_;
+    if (!range_altitude_fresh_) {
+      return;
+    }
+    range_altitude_ = msg->dist_bottom;
+    if (trajectory_initialized_) {
+      estimated_position_W_(2) = range_altitude_;
     }
   }
 
