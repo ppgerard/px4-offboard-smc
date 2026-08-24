@@ -1,41 +1,27 @@
-# PX4 Low Level Offboard Control using ROS 2
+# px4-offboard-smc
 
-This package is an example of how to control a [PX4](https://docs.px4.io/main/en/) Multi-rotor Vehicle in [offboard](https://docs.px4.io/main/en/flight_modes/offboard.html) mode with **Low-level commands** through ROS 2. 
+Sliding-mode control for a T2 Cruza tiltrotor VTOL, precision-landing on an
+AprilTag platform in PX4 offboard mode. Master's thesis work.
 
-By Low-level commands, we mean that the commands that are sent to PX4 are either:
-1. [Attitude Setpoints](https://docs.px4.io/main/en/msg_docs/VehicleAttitudeSetpoint.html) (Collective Thrust + Attitude), 
+Two control laws are implemented — classical SMC and super-twisting SMC
+(`controller_type:=smc|stsmc`), with stsmc as the primary controller. Landing
+runs a 4-phase state machine (approach, vision descent, commit, touchdown)
+driven by a relative-state EKF fused from AprilTag detections, with an
+external-force observer for wind rejection.
 
-2. [Thrust](https://docs.px4.io/main/en/msg_docs/VehicleThrustSetpoint.html) + [Torque setpoints](https://docs.px4.io/main/en/msg_docs/VehicleTorqueSetpoint.html)
+## Layout
 
-3. [Direct Actuator commands](https://docs.px4.io/main/en/msg_docs/ActuatorMotors.html) (throttles of the motors). 
+- `src/`, `include/` — controller node and the two control laws
+- `src/TrajectoryPublishers/` — trajectory generation and the landing state machine
+- `config/` — controller gains and vehicle parameters
+- `launch/` — ROS 2 launch files
+- `scripts/visualizer.py` — plotting helper
 
-You can switch between the different control modes using ROS 2 parameter.
+## Build
 
-This videos below shows a simulated quadrotor controlled with this package with [Direct Actuator commands](https://docs.px4.io/main/en/msg_docs/ActuatorMotors.html).
+Standard ROS 2 / colcon package (`px4_offboard_lowlevel`), built inside a
+workspace alongside PX4's `px4_msgs` and `apriltag_msgs`.
 
-![Direct-Actuator-commands](./instructions/media/iris-sitl-act-cmds-harmonic.gif)
-
-# Contents
-## Package Setup
-Guide on the installation of the low level controller package and its dependencies. 
-[View Package Setup Instructions](instructions/package_setup.md)
-
-## Explanation
-Explanation of the controller node and where you can implement your own controller. 
-[View Explanation](instructions/explanation.md)
-
-## Simulation Demo
-Instructions to run the demo using the included circle trajector generator.
-[View Simulation Demo Instructions](instructions/demo.md)
-
-# Acknowledgments
-
-This work from the SMART research group in Saxion University of Applied Sciences was supported in part by:
-* Regioorgaan SIA under project **RAAK-PRO MARS4EARTH** (RAAK.PRO03.112):
-* Horizon Europe CSA under project: **AeroSTREAM** (Grant Agreement number: 101071270).
-
-<p align="left">
-  <img src="./instructions/media/logos.png" alt="aerostream-logo"/>
-</p>
-
-This package was inspired by many open-source package form the PX4 Community, so would like to thank all the contributors of this great community.
+```
+colcon build --packages-select px4_offboard_lowlevel
+```
