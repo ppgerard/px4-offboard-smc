@@ -6,6 +6,7 @@
 #include "geometry_msgs/msg/vector3_stamped.hpp"
 #include "px4_msgs/msg/vehicle_local_position.hpp"
 #include <eigen3/Eigen/Eigen>
+#include <cmath>
 #include <memory>
 
 class DiagnosticsPublisher {
@@ -23,6 +24,7 @@ public:
     filter_nis_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_nis", 10);
     filter_residual_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_residual", 10);
     camera_bias_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/filter_camera_bias", 10);
+    tag_health_pub_ = node_->create_publisher<geometry_msgs::msg::Vector3Stamped>("/landing/tag_health", 10);
   }
 
   // Publish current odometry state
@@ -182,6 +184,20 @@ public:
     publishVector(camera_bias_pub_, bias(0), bias(2), sigma_z, timestamp);
   }
 
+  // The tag-loss ladder (item 5 / §07): which tier, how stale the last ACCEPTED
+  // measurement is, and how uncertain the estimate has become as a result.
+  // Losing the tag used to produce no signal at all -- the descent simply stopped
+  // and the aircraft hovered, which from outside is indistinguishable from a
+  // vehicle that is merely holding station. x is the tier (0 coast, 1 hold,
+  // 2 reacquire, 3 abort), y the age in seconds, z the XY sigma in metres.
+  void publishTagHealth(int tier, double age_seconds, double sigma_xy, uint64_t timestamp) {
+    // An age of infinity is the correct answer before the first detection and an
+    // unplottable one; -1 says "never seen" without putting a non-finite value on
+    // a topic every consumer would then have to guard.
+    publishVector(tag_health_pub_, static_cast<double>(tier),
+                  std::isfinite(age_seconds) ? age_seconds : -1.0, sigma_xy, timestamp);
+  }
+
 private:
   void publishVector(const rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr& pub,
                      double x, double y, double z, uint64_t timestamp) {
@@ -206,6 +222,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_nis_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr filter_residual_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr camera_bias_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr tag_health_pub_;
 };
 
 #endif  // DIAGNOSTICS_PUBLISHER_H

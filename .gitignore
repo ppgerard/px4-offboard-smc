@@ -48,3 +48,4 @@ Thumbs.db
 # Spécifique au  projet
 # ======================
 src/controller_backup.cpp
+test/

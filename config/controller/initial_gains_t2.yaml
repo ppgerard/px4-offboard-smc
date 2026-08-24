@@ -14,6 +14,58 @@
         Phi_x: 0.3
         Phi_y: 0.3
         Phi_z: 0.1
+
+        # ===== External-force observer (roadmap item 8, review §05) =====
+        # Bandwidth [rad/s] of the momentum-based disturbance observer whose
+        # estimate is fed forward as -f_ext_hat in I_a_d. Shared by BOTH control
+        # laws. 0.0 disables it, which is how it is A/B'd against one binary.
+        #
+        # THE 11.6 Hz CONSTRAINT ON THIS GAIN IS GONE, MEASURED 20 Aug. It was
+        # real when it was found on 19 Aug and it does not reproduce now, and the
+        # reason is dated rather than mysterious: the omega_ref low-pass below
+        # shipped the DAY AFTER that sweep, and it cuts exactly the path that
+        # turned this observer's velocity noise into 11.6 Hz torque.
+        #
+        #   m*K_o [N per m/s]  ->  I_a_d  ->  B_z_d direction  ->  R_d
+        #     differenced at 100 Hz -> omega_ref -> tau via I*Lambda_R
+        #
+        # Doubling the bandwidth still doubles the force noise (2.49 -> 4.97 N
+        # per m/s, which no filter changes), but the 2 Hz pole cuts the
+        # conversion to 17% at 11.6 Hz, so the net is ~0.34x. Measured, stsmc,
+        # still air, n=4 per side: EVERY chattering median is equal or lower at
+        # 2.0 than at 1.0, the tilt rate limiter saturates on 0.00% of steps in
+        # both, and the motor spectrum does NOT collapse onto 11.6 Hz (median
+        # peak 24.3 Hz against the 11.5-11.7 Hz signature of the old failure).
+        # smc, the rig the constraint was originally measured on, agrees.
+        #
+        # Landing, stsmc, n=6 tail-on and n=3 nose-on: 2.0 lands every run in
+        # both directions with touchdown XY indistinguishable from 1.0. So 2.0
+        # is now AVAILABLE and is not measurably BETTER -- the 19 Aug tail-on
+        # advantage did not reproduce either, which is unsurprising since it was
+        # measured on a loop that has since changed. Left at 1.0 for that reason,
+        # not because raising it is unsafe. See CLAUDE.md, "The 11.6 Hz ceiling
+        # on the observer bandwidth was the reference differentiation".
+        f_ext_observer_gain: 1.0
+
+        # ===== Reference-rate filter on omega_ref [Hz]; 0.0 disables =====
+        # The desired attitude is the DIRECTION of I_a_d, and omega_ref is that
+        # attitude differenced at 100 Hz. I_a_d carries every feedback term the law
+        # computes -- including the translational super-twisting output, whose time
+        # derivative is unbounded as s -> 0 (slope K1/(2*sqrt(|s|)), plus w
+        # integrating a sign()). So the one signal a super-twisting law
+        # deliberately keeps continuous-but-not-smooth was being fed straight into
+        # a differentiator, and the result re-entered tau with gain I*Lambda_R.
+        #
+        # Measured, stsmc, still-air hover: omega_ref_y carried 8.4x the
+        # high-frequency energy of the ACTUAL body rate, peaking at 11.7 Hz -- the
+        # limit cycle this project has chased since the chattering work began.
+        # Filtering it at 2 Hz cuts that HF content to 7%, tau_y TV/s to 15%, and
+        # the tilt rate-limiter saturation from 12.2% of steps to 0.8%.
+        #
+        # A reference angular velocity is only real below a few Hz on this mission:
+        # static platform, slow approach, yaw pinned to the platform heading. Above
+        # that it is the differentiator's own noise. Shared by both control laws.
+        omega_ref_filter_hz: 2.0
         # SMC Rotational Control Parameters
         # Lambda_R: Natural frequency for attitude dynamics
         Lambda_R_x: 5.0
@@ -45,10 +97,48 @@
         STA_Lambda_R_x: 5.0
         STA_Lambda_R_y: 5.0
         STA_Lambda_R_z: 2.0
-        # STA_K1_R/K2_R: rotational super-twisting reaching-law gains
-        STA_K1_R_x: 0.5
-        STA_K1_R_y: 0.5
-        STA_K1_R_z: 0.15
-        STA_K2_R_x: 0.1
-        STA_K2_R_y: 0.1
-        STA_K2_R_z: 0.03
+        # STA_K1_R/K2_R: rotational super-twisting reaching-law gains.
+        # HALVED from the original 0.5/0.5/0.15 and 0.1/0.1/0.03. Two reasons, one
+        # theoretical and one measured:
+        #   - §05's argument, now that item 8 estimates the disturbance: the
+        #     reaching gains only have to bound the ESTIMATION ERROR, not the
+        #     disturbance itself, which is the standard route to smaller gains.
+        #   - measured: with omega_ref filtered, halving these takes tau_y TV/s from
+        #     15% of baseline to 4%, the tilt rate limiter from 0.8% of steps to
+        #     0.00%, and the servo's slew duty from 15% of its rate limit to 4.0%.
+        # Touchdown XY IMPROVED with them (1.4 cm vs 4.4 cm baseline, n=3).
+        #
+        # The TRANSLATIONAL K1/K2 above are deliberately NOT halved: they are the
+        # outer loop's authority against wind, and halving them as well cost a
+        # factor of two on touchdown XY (9.7 cm, n=3). The attitude loop is where
+        # the chattering lives; the translational loop is where the precision does.
+        #
+        # DO NOT QUARTER THESE. It was tried on 20 Aug and it is the most
+        # tempting bad idea in this file: in still air it is a clean 3x win on
+        # every chattering criterion at once (motor HF 0.00058 -> 0.00020, tilt
+        # HF 0.061 -> 0.016, slew duty 3.9% -> 1.3%, no range overlap at n=4)
+        # with station keeping unchanged. It then LANDED 0 OF 3 in a 5 m/s
+        # tail-on wind: the aircraft cannot hold the descent cone (0.34 m against
+        # a 0.33 m cone at 0.95 m), the tag leaves frame, and the ladder climbs
+        # and aborts.
+        #
+        # The still-air rig cannot see that cost BY CONSTRUCTION, and this is the
+        # general lesson: K2_R drives the rotational integral state w_R_, which
+        # is what cancels a steady aerodynamic moment. Still air has no steady
+        # moment, so the rig that scores chattering has nothing for the reaching
+        # gains to reject and reports their removal as free. Any cut to these
+        # must be flown tail-on before it is believed.
+        STA_K1_R_x: 0.25
+        STA_K1_R_y: 0.25
+        STA_K1_R_z: 0.075
+        STA_K2_R_x: 0.05
+        STA_K2_R_y: 0.05
+        STA_K2_R_z: 0.015
+
+    diagnostics:
+        # /landing/sliding_surface, ON by default like every other diagnostic
+        # here. It exists as a switch only so the diagnostic's own cost can be
+        # measured: this node publishes four diagnostic topics per 100 Hz cycle
+        # and the chattering metrics are sensitive to loop jitter, so the rig has
+        # to be able to answer "does instrumenting it change it" about itself.
+        publish_sliding_surface: true

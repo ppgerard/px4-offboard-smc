@@ -62,6 +62,7 @@
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
 #include "relative_state_filter.h"
+#include "reference_model.h"
 
 using namespace std::chrono_literals;
 
@@ -89,6 +90,12 @@ public:
     this->declare_parameter("landing_parameters.rangefinder_offset_body.y", 0.0);
     this->declare_parameter("landing_parameters.rangefinder_offset_body.z", -0.145);
     this->declare_parameter("landing_parameters.rangefinder_max_tilt_deg", 20.0);
+    // Reference generator (roadmap item 11). Bandwidth in rad/s; 0.0 keeps the
+    // old low-pass-and-difference path, so the two A/B against one binary.
+    this->declare_parameter("landing_parameters.reference_model_bandwidth", 0.0);
+    this->declare_parameter("landing_parameters.reference_model_damping", 1.0);
+    this->declare_parameter("landing_parameters.reference_model_max_jerk_xy", 8.0);
+    this->declare_parameter("landing_parameters.reference_model_max_jerk_z", 4.0);
     this->declare_parameter("landing_parameters.rangefinder_sigma_base", 0.02);
     this->declare_parameter("landing_parameters.rangefinder_sigma_scale", 0.01);
     this->declare_parameter("landing_parameters.rangefinder_sigma_lever", 0.01);
@@ -142,6 +149,17 @@ public:
     this->declare_parameter("landing_parameters.filter.camera_bias_sigma_xy", 0.0);
     this->declare_parameter("landing_parameters.filter.camera_bias_sigma_z", 0.03);
 
+    reference_model_.configure(
+        this->get_parameter("landing_parameters.reference_model_bandwidth").as_double(),
+        this->get_parameter("landing_parameters.reference_model_damping").as_double());
+    reference_model_max_jerk_xy_ =
+        this->get_parameter("landing_parameters.reference_model_max_jerk_xy").as_double();
+    reference_model_max_jerk_z_ =
+        this->get_parameter("landing_parameters.reference_model_max_jerk_z").as_double();
+    RCLCPP_INFO(this->get_logger(),
+                "Reference generator (item 11): %s, bandwidth %.1f rad/s, damping %.2f",
+                reference_model_.enabled() ? "3rd-order model" : "legacy LPF + difference",
+                reference_model_.omega(), reference_model_.zeta());
     camera_frame_id_ = this->get_parameter("landing_parameters.camera_frame_id").as_string();
     platform_frame_id_ = this->get_parameter("landing_parameters.platform_frame_id").as_string();
     world_frame_id_ = this->get_parameter("landing_parameters.world_frame_id").as_string();
@@ -164,6 +182,15 @@ public:
         this->get_parameter("landing_parameters.camera_offset_body.z").as_double());
 
     configureEstimator();
+
+    // The ladder's geometry is the guidance's geometry. Copied here rather than
+    // duplicated as literals so a change to the descent cone cannot leave the
+    // failsafe reasoning about a cone the aircraft is not flying, and so the
+    // "never climb below the commit height" rule is anchored to the actual commit
+    // altitude rather than to a number that happens to match it today.
+    tag_loss_thresholds_.cone_slope = cone_slope_;
+    tag_loss_thresholds_.cone_radius_min = cone_radius_min_;
+    tag_loss_thresholds_.no_escalation_below = commit_altitude_;
 
     // TF2 buffer and listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -326,6 +353,10 @@ protected:
   // off-centre pauses the descent rather than racing it to the ground.
   const double cone_slope_ = 0.30;       // cone radius gained per metre of height [m/m]
   const double cone_radius_min_ = 0.05;  // cone radius at the pad [m]
+  // A fresh tag to BEGIN the descent. Deliberately stricter than what the
+  // tag-loss ladder below allows once the descent is under way: starting is a
+  // decision that can always wait for a real measurement, continuing is one that
+  // has to weigh the cost of stopping. See updateTagHealth().
   const double cone_tag_max_age_ = 0.3;  // no fresh tag, no descent [s]
 
   // ---- Phase 3: commit --------------------------------------------------------
@@ -349,6 +380,45 @@ protected:
   const double touchdown_stall_speed_ = 0.10;   // filtered descent rate below this counts as stopped [m/s]
   const double touchdown_stall_time_ = 0.7;     // evidence to accumulate before calling contact [s]
   const double disarm_retry_period_ = 0.5;      // resend DISARM this often [s]
+
+  // ---- Tag loss: the health signal and the four-tier ladder (item 5, §07) -----
+  //
+  // Coast / Hold / Reacquire / Abort, driven by the FILTER rather than by a
+  // clock. Two of its outputs matter here and neither has a clock equivalent:
+  //
+  //   - Freshness is the age of the last measurement the chi-squared gate
+  //     ACCEPTED (tagAge(), in the EKF modes). A stream of rejected detections
+  //     therefore reads as a lost tag, which is right: "measurements arrive and
+  //     disagree with the estimate" is a mis-decode or a drifted filter, not a
+  //     healthy tag, and a TF timestamp cannot tell the two apart.
+  //   - positionStdDev() says how much that staleness is actually WORTH. Measured
+  //     on this filter, the XY sigma grows 0.040 m converged -> 0.047 m at 0.3 s
+  //     -> 0.060 m at 1 s -> 0.107 m at 5 s, and it does not depend on height.
+  //     The descent cone does: its radius runs from 0.95 m at 3 m to 0.14 m at
+  //     the commit altitude. So a flat 0.3 s buys a metre of margin high up and
+  //     almost none at the pad, which is exactly the proxy §07 asks to replace.
+  //
+  // Hence the Coast -> Hold boundary is the cone test below, with the clock only
+  // as a floor (a blink is never a failure) and a ceiling (nothing coasts
+  // forever). The higher tiers keep §07's clock thresholds, because "how long am
+  // I willing to fly with no perception at all" is a mission bound rather than an
+  // accuracy one, and they are additionally raised by geometry: climbing only
+  // helps if the tag cannot be in frame from where the aircraft already is.
+  // The decision itself lives in relative_state_filter.h, ROS-free and unit
+  // tested: it is the safety-critical part and it should not need a simulator to
+  // exercise. The thresholds are built once, below, from the same cone constants
+  // the guidance uses, so the two cannot drift apart.
+  using TagHealth = landing::TagLossTier;
+
+  landing::TagLossThresholds tag_loss_thresholds_;
+  const double reacquire_climb_rate_ = 0.3;   // [m/s], §07
+
+  TagHealth tag_health_ = TagHealth::kCoast;
+  TagHealth tag_health_reported_ = TagHealth::kCoast;
+  int reacquire_attempts_ = 0;
+  bool aborted_ = false;
+  double health_sigma_xy_ = 0.0;   // [m] what the ladder is reading
+  double health_age_ = 0.0;        // [s] ... and the freshness beside it
 
   // Hysteresis timer for transition Phase 1 -> Phase 2
   std::chrono::high_resolution_clock::time_point phase2_transition_start_time_;
@@ -413,6 +483,12 @@ protected:
   enum class Estimator { kComplementary, kFilterPose, kFilterPixels };
   Estimator estimator_ = Estimator::kComplementary;
   landing::RelativeStateFilter filter_;
+  // Third-order reference generator (item 11). Owns the velocity and acceleration
+  // the guidance used to reconstruct by differencing; the position integration
+  // stays in the phase logic, because Phase 1 and Phase 2 anchor it differently.
+  landing::ReferenceModel reference_model_;
+  double reference_model_max_jerk_xy_ = 8.0;
+  double reference_model_max_jerk_z_ = 4.0;
   Eigen::Vector3d filter_position_W_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d filter_velocity_W_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d filter_sigma_ = Eigen::Vector3d::Zero();
@@ -570,6 +646,21 @@ protected:
       vector(0) *= scale;
       vector(1) *= scale;
     }
+  }
+
+  // Limits handed to the reference generator. The velocity and acceleration
+  // bounds are the phase's own, so enabling the model cannot quietly fly a
+  // profile the phase never authorised; only the jerk bound is new.
+  landing::ReferenceModelLimits referenceLimits(double v_xy, double v_z,
+                                                double a_xy, double a_z) const {
+    landing::ReferenceModelLimits limits;
+    limits.max_velocity_xy = v_xy;
+    limits.max_velocity_z = v_z;
+    limits.max_acceleration_xy = a_xy;
+    limits.max_acceleration_z = a_z;
+    limits.max_jerk_xy = reference_model_max_jerk_xy_;
+    limits.max_jerk_z = reference_model_max_jerk_z_;
+    return limits;
   }
 
   void saturateZ(Eigen::Vector3d& vector, double max_val) {
@@ -919,6 +1010,7 @@ protected:
       r_position_W_ = drone_position_W_;
       r_velocity_W_.setZero();
       r_acceleration_W_.setZero();
+      reference_model_.reset();
       publishTrajectoryPoint();
       onSetpointPublished();
       return true;  // Still in initialization delay
@@ -939,6 +1031,13 @@ protected:
       filter_.predict(nodeSeconds());
       refreshFilterOutputs();
     }
+
+    // Where the tag-loss ladder stands this cycle. Computed unconditionally so
+    // the signal is published in every phase and every state, including the ones
+    // that do not act on it -- a diagnostic that goes quiet in the situation it
+    // exists to explain is how the last two of these took a session each to find.
+    updateTagHealth();
+    reportTagHealthTransition();
 
     // Handle initialization delay phase (publish drone's own position for 5 seconds)
     if (handleInitializationDelay()) {
@@ -978,6 +1077,20 @@ protected:
       airborne_ = true;
     }
 
+    // ABORT: hand the aircraft back to PX4. Only ever reached from Phase 2, which
+    // is the only phase that descends on the tag -- see abortIfTagLost() for why
+    // the other three are deliberately out of scope.
+    if (aborted_ || (phase_ == Phase::PHASE_2 && abortIfTagLost())) {
+      // Diagnostics keep flowing; setpoints do not. PX4 drops out of offboard
+      // ~500 ms after the stream stops (COM_OF_LOSS_T) and runs its own failsafe,
+      // and controller_node.cpp's nav_state gate stops actuating for the same
+      // reason. That is the whole mechanism: there is no command to send that
+      // means "you fly now".
+      publishPlatformPosition();
+      publishDiagnostics();
+      return;
+    }
+
     // Phase-specific trajectory generation and transitions
     switch (phase_) {
       case Phase::PHASE_1:
@@ -1011,6 +1124,77 @@ protected:
 
     // Publish diagnostic topics
     publishDiagnostics();
+  }
+
+  // Log every move on the ladder, in both directions. A recovery is as
+  // interesting as a loss: "descent resumed after 2.1 s" is the line that says
+  // the failsafe did its job, and its absence is the line that says it did not.
+  void reportTagHealthTransition() {
+    if (tag_health_ == tag_health_reported_) {
+      return;
+    }
+    const bool escalating = tag_health_ > tag_health_reported_;
+    RCLCPP_WARN(this->get_logger(),
+                "Tag health %s -> %s (age %.2f s, sigma %.3f m, altitude %.2f m, XY %.2f m, "
+                "%.0f%% of measurements gated out, NIS/dof %.2f)",
+                tagHealthName(tag_health_reported_), tagHealthName(tag_health_), health_age_,
+                health_sigma_xy_, landingEstimate()(2), landingEstimate().head<2>().norm(),
+                filter_.rejectFraction() * 100.0,
+                filter_.lastNIS() / std::max(filter_.lastNISDof(), 1));
+    if (!escalating && tag_health_ == TagHealth::kCoast) {
+      RCLCPP_INFO(this->get_logger(), "Tag reacquired; descent released (%d reacquire attempt(s) "
+                  "used of %d).", reacquire_attempts_, tag_loss_thresholds_.max_attempts);
+    }
+    tag_health_reported_ = tag_health_;
+  }
+
+  // The top of the ladder. Returns true once, when the abort latches.
+  //
+  // Scope is deliberately Phase 2 only, and it is worth saying why the other
+  // three are excluded rather than leaving it to be re-derived:
+  //
+  //   Phase 1 must keep flying the odometry hold point when it has no tag. That
+  //   is a bounded, deterministic SEARCH, not a dead-reckoned steer -- it aims at
+  //   a fixed point in the local frame, normally the pad the vehicle launched
+  //   from. Freezing XY there was tried and reverted (1638337): it parks the
+  //   aircraft with the camera on empty ground and it can never acquire. Aborting
+  //   there would be the same mistake in a louder form, since the descent gate
+  //   already refuses to release on a stale tag, so a Phase 1 with no tag can
+  //   loiter and search but can never descend. There is nothing unsafe to stop.
+  //
+  //   Phases 3 and 4 are below the commit altitude, where updateTagHealth()
+  //   already caps the tier at Hold: both markers are out of frame in the last
+  //   ~25 cm of every landing, so "tag lost" there is the normal case.
+  bool abortIfTagLost() {
+    if (tag_health_ != TagHealth::kAbort) {
+      return false;
+    }
+
+    // "Landed" cannot come from VehicleLandDetected -- it is meaningless in
+    // offboard direct-actuator mode, where both of its stages read a throttle
+    // value nobody publishes (it has reported ground contact at 0.71 m in
+    // flight, and called a landing seconds after liftoff). Use the same contact
+    // evidence the commit phase uses. An aircraft that is already down should be
+    // disarmed, not handed to a PX4 failsafe that will try to fly it.
+    if (contactHeld()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Tag lost %.1f s, but the vehicle is already down (contact held at %.2f m); "
+                  "disarming rather than aborting to PX4.",
+                  health_age_, landingEstimate()(2));
+      enterTouchdownPhase();
+      return false;
+    }
+
+    aborted_ = true;
+    RCLCPP_ERROR(this->get_logger(),
+                 "ABORT: no usable tag for %.1f s after %d reacquire attempt(s) of %d "
+                 "(altitude %.2f m, XY %.2f m, sigma %.3f m, %.0f%% gated out). Offboard "
+                 "setpoints STOP now -- PX4 takes the aircraft on its own offboard-loss "
+                 "failsafe. Nothing this node publishes from here on will fly it.",
+                 health_age_, reacquire_attempts_, tag_loss_thresholds_.max_attempts,
+                 landingEstimate()(2), landingEstimate().head<2>().norm(), health_sigma_xy_,
+                 filter_.rejectFraction() * 100.0);
+    return true;
   }
 
   void checkPhase1To2Transition() {
@@ -1295,21 +1479,104 @@ protected:
     saturateXY(desired_velocity, max_velocity_xy_);
     saturateZ(desired_velocity, max_velocity_z_);
 
-    // Store previous velocity for acceleration calculation
-    Eigen::Vector3d r_velocity_W_prev = r_velocity_W_;
+    if (reference_model_.enabled()) {
+      // Item 11. The model carries the acceleration as a STATE, so a step in the
+      // steering estimate -- which is how a tag measurement arrives, not noise --
+      // moves the jerk and cannot reach m*r_a. The old path below made the
+      // acceleration proportional to this raw command at a gain of
+      // lpf_alpha/dt = 20, i.e. 49.7 N per metre of estimate jump.
+      reference_model_.update(desired_velocity,
+                              referenceLimits(max_velocity_xy_, max_velocity_z_,
+                                              max_acceleration_xy_, max_acceleration_z_),
+                              dt_);
+      r_velocity_W_ = reference_model_.velocity();
+      r_acceleration_W_ = reference_model_.acceleration();
+    } else {
+      // Store previous velocity for acceleration calculation
+      Eigen::Vector3d r_velocity_W_prev = r_velocity_W_;
 
-    // Apply low-pass filter to velocity to avoid command spikes
-    r_velocity_W_ = applyLowPassFilter(desired_velocity, r_velocity_W_, lpf_alpha_velocity_);
+      // Apply low-pass filter to velocity to avoid command spikes
+      r_velocity_W_ = applyLowPassFilter(desired_velocity, r_velocity_W_, lpf_alpha_velocity_);
 
-    // Calculate acceleration from velocity change
-    r_acceleration_W_ = (r_velocity_W_ - r_velocity_W_prev) / dt_;
+      // Calculate acceleration from velocity change
+      r_acceleration_W_ = (r_velocity_W_ - r_velocity_W_prev) / dt_;
 
-    // Saturate acceleration: limit XY norm and Z separately
-    saturateXY(r_acceleration_W_, max_acceleration_xy_);
-    saturateZ(r_acceleration_W_, max_acceleration_z_);
+      // Saturate acceleration: limit XY norm and Z separately
+      saturateXY(r_acceleration_W_, max_acceleration_xy_);
+      saturateZ(r_acceleration_W_, max_acceleration_z_);
+    }
 
     // Integrate setpoint from actual drone position to keep trajectory anchored to reality
     r_position_W_ = drone_position_W_ + r_velocity_W_ * dt_;
+  }
+
+  static const char *tagHealthName(TagHealth health) {
+    switch (health) {
+      case TagHealth::kCoast: return "COAST";
+      case TagHealth::kHold: return "HOLD";
+      case TagHealth::kReacquire: return "REACQUIRE";
+      case TagHealth::kAbort: return "ABORT";
+    }
+    return "?";
+  }
+
+  // The cone the descent is gated on, and the patch of ground the camera can see.
+  // Both are radii at the current height, which is what lets a threshold in
+  // metres of sigma mean the same thing at 3 m and at 0.3 m.
+  double coneRadius(double height) const { return cone_slope_ * height + cone_radius_min_; }
+  double cameraFootprintRadius(double height) const {
+    return tag_loss_thresholds_.footprint_slope * height;
+  }
+
+  // The steering estimate's own XY uncertainty. Zero when the filter has nothing
+  // to say yet -- it has not been initialised, or has never had a measurement --
+  // in which case the clock bounds below are the whole ladder. Zero is the safe
+  // value there: it makes the geometric tests permissive and leaves
+  // coast_max_seconds_ to stop the descent regardless.
+  double estimatorSigmaXY() const {
+    if (!filter_initialized_ || !filter_measurement_received_) {
+      return 0.0;
+    }
+    return filter_sigma_.head<2>().norm();
+  }
+
+  // Where on the ladder this cycle sits. Computed every cycle in every phase, so
+  // the signal is always published; which phases ACT on it is decided at the call
+  // sites, and deliberately narrow -- see abortIfTagLost().
+  void updateTagHealth() {
+    health_age_ = tagAge();
+    health_sigma_xy_ = estimatorSigmaXY();
+
+    // The abort is LATCHED. Keep publishing the age and the sigma -- they are
+    // still the truth about the estimator, and an operator watching the aircraft
+    // go around wants them -- but freeze the tier. Letting it de-escalate on a
+    // reacquisition put "Tag reacquired; descent released" in the log of a flight
+    // this node had already stopped flying, which reads exactly like a landing
+    // that resumed and is the opposite of what happened.
+    if (aborted_) {
+      tag_health_ = TagHealth::kAbort;
+      return;
+    }
+
+    landing::TagLossInputs inputs;
+    inputs.age = health_age_;
+    inputs.sigma_xy = health_sigma_xy_;
+    inputs.height = landingEstimate()(2);
+    inputs.xy_error = landingEstimate().head<2>().norm();
+    inputs.attempts_used = reacquire_attempts_;
+    inputs.ever_acquired = measurementEverReceived();
+
+    const TagHealth health = landing::tagLossTier(inputs, tag_loss_thresholds_);
+    if (health != tag_health_) {
+      // An attempt is a climb STARTED, counted on the way in, so a landing that
+      // loses the tag repeatedly runs out of attempts rather than climbing for
+      // ever. It is deliberately not reset on reacquisition: §07 caps the
+      // attempts per landing, not per outage.
+      if (health == TagHealth::kReacquire) {
+        ++reacquire_attempts_;
+      }
+      tag_health_ = health;
+    }
   }
 
   // Descent rate the alignment currently earns: full rate on the axis of the
@@ -1319,19 +1586,20 @@ protected:
   double coneDescentLimit() {
     const double height = std::max(landingEstimate()(2), 0.0);
     const double xy_error = landingEstimate().head<2>().norm();
-    const double cone_radius = cone_slope_ * height + cone_radius_min_;
+    const double cone_radius = coneRadius(height);
     const double alignment = std::clamp(1.0 - xy_error / cone_radius, 0.0, 1.0);
 
-    // Stands in for the estimator confidence a covariance would give us.
-    if (!tagIsFresh(cone_tag_max_age_)) {
-      // Say so. A descent that stops because the tag went stale is otherwise
-      // indistinguishable from a vehicle simply hovering, and the aircraft will
-      // sit there until something else intervenes. Silence here is what made a
-      // vehicle parked 4.5 m off the pad look like a controller problem.
+    // Freshness is the ladder's business now. This used to test tagAge() against
+    // cone_tag_max_age_ here and return 0, which paused the descent, told nobody
+    // and escalated to nothing -- a vehicle could hold that way indefinitely. The
+    // pause is still exactly what Coast -> Hold does; it now has a name, a
+    // published tier and somewhere to go next.
+    if (tag_health_ != TagHealth::kCoast) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-                           "Descent paused: no tag measurement for %.1f s (need < %.1f s). "
-                           "Altitude %.2f m, XY %.2f m by the last estimate.",
-                           tagAge(), cone_tag_max_age_, landingEstimate()(2), xy_error);
+                           "Descent paused (%s): tag age %.1f s, estimate sigma %.3f m against a "
+                           "%.2f m cone at %.2f m altitude, XY %.2f m by the last estimate.",
+                           tagHealthName(tag_health_), health_age_, health_sigma_xy_, cone_radius,
+                           height, xy_error);
       return 0.0;
     }
     if (alignment <= 0.0) {
@@ -1366,22 +1634,59 @@ protected:
       desired_velocity(2) = std::max(desired_velocity(2), 0.0);
     }
 
-    // Store previous velocity for acceleration calculation
-    Eigen::Vector3d r_velocity_W_prev = r_velocity_W_;
+    // Reacquire: climb to widen the footprint. coneDescentLimit() has already
+    // stopped the descent for any tier past Coast, so this only ever adds the
+    // climb -- and only up to the Phase 1 hold altitude, which is the height the
+    // approach was flown at and therefore the height the tag was last seen from.
+    // The XY steering above is untouched: the aircraft keeps station on the last
+    // estimate while it climbs, so a reacquisition finds it still over the pad.
+    //
+    // Nothing here can run below the commit altitude: updateTagHealth() caps the
+    // tier at Hold down there, so this branch is unreachable in the terminal
+    // phase by construction rather than by a second check that could drift out of
+    // agreement with the first.
+    if (tag_health_ == TagHealth::kReacquire) {
+      const double climb = landingEstimate()(2) < phase_1_target_(2) ? reacquire_climb_rate_ : 0.0;
+      desired_velocity(2) = climb;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "REACQUIRE (attempt %d of %d): tag lost %.1f s, climbing at %.1f m/s "
+                           "from %.2f m towards %.1f m to widen the footprint (%.2f m radius "
+                           "here, estimate %.2f m off centre).",
+                           reacquire_attempts_, tag_loss_thresholds_.max_attempts, health_age_,
+                           climb, landingEstimate()(2), phase_1_target_(2),
+                           cameraFootprintRadius(std::max(landingEstimate()(2), 0.0)),
+                           landingEstimate().head<2>().norm());
+    }
 
-    Eigen::Vector3d velocity_change = desired_velocity - r_velocity_W_prev;
-    saturateXY(velocity_change, max_acceleration_xy_ * dt_);
-    saturateZ(velocity_change, max_acceleration_z_ * dt_);
-    r_velocity_W_ += velocity_change;
+    if (reference_model_.enabled()) {
+      // Same model, the descent phase's own limits. The explicit rate limiter
+      // below is not needed here: the acceleration bound is enforced inside the
+      // model, on a state, rather than on a difference taken after the fact.
+      reference_model_.update(desired_velocity,
+                              referenceLimits(phase2_max_velocity_xy_, phase2_max_velocity_z_,
+                                              phase2_max_acceleration_xy_,
+                                              phase2_max_acceleration_z_),
+                              dt_);
+      r_velocity_W_ = reference_model_.velocity();
+      r_acceleration_W_ = reference_model_.acceleration();
+    } else {
+      // Store previous velocity for acceleration calculation
+      Eigen::Vector3d r_velocity_W_prev = r_velocity_W_;
 
-    r_velocity_W_ = applyLowPassFilter(r_velocity_W_, r_velocity_W_prev, lpf_alpha_velocity_);
+      Eigen::Vector3d velocity_change = desired_velocity - r_velocity_W_prev;
+      saturateXY(velocity_change, max_acceleration_xy_ * dt_);
+      saturateZ(velocity_change, max_acceleration_z_ * dt_);
+      r_velocity_W_ += velocity_change;
 
-    // Calculate acceleration from velocity change
-    r_acceleration_W_ = (r_velocity_W_ - r_velocity_W_prev) / dt_;
+      r_velocity_W_ = applyLowPassFilter(r_velocity_W_, r_velocity_W_prev, lpf_alpha_velocity_);
 
-    // Saturate acceleration: limit XY norm and Z separately
-    saturateXY(r_acceleration_W_, phase2_max_acceleration_xy_);
-    saturateZ(r_acceleration_W_, phase2_max_acceleration_z_);
+      // Calculate acceleration from velocity change
+      r_acceleration_W_ = (r_velocity_W_ - r_velocity_W_prev) / dt_;
+
+      // Saturate acceleration: limit XY norm and Z separately
+      saturateXY(r_acceleration_W_, phase2_max_acceleration_xy_);
+      saturateZ(r_acceleration_W_, phase2_max_acceleration_z_);
+    }
 
     // Integrate setpoint from actual tag position to keep trajectory anchored to reality
     r_position_W_ = r_position_W_ + r_velocity_W_ * dt_;
@@ -1779,6 +2084,13 @@ protected:
     diagnostics_->publishPlatformYaw(platform_yaw_filtered_, platform_yaw_raw_,
                                      filter_platform_yaw_, last_odometry_timestamp_);
 
+    // The tag-loss ladder. Published unconditionally -- before the first
+    // detection as much as after one -- because "no tag has ever arrived" is
+    // precisely the state this signal exists to make visible, and it is the state
+    // in which every gate above it is silent.
+    diagnostics_->publishTagHealth(static_cast<int>(tag_health_), health_age_, health_sigma_xy_,
+                                   last_odometry_timestamp_);
+
     // The EKF's own error, its claimed uncertainty and its innovation statistics.
     // Published only once it has actually been fed something: a filter running on
     // dead reckoning alone has an estimate, but scoring it would measure the
@@ -1840,13 +2152,19 @@ protected:
     // Differentiating the position keeps the estimate consistent with the signal
     // the tag is there to correct, which is the whole point of a relative filter.
     const rclcpp::Time odometry_arrival = this->now();
-    if (filter_initialized_ && last_odometry_arrival_valid_) {
+    bool velocity_from_position_valid = false;
+    Eigen::Vector3d velocity_from_position = Eigen::Vector3d::Zero();
+    if (last_odometry_arrival_valid_) {
       const double interval = (odometry_arrival - last_odometry_arrival_).seconds();
       // Too short and the difference is quantisation noise; too long and the
       // vehicle has manoeuvred inside the interval. Either way, skip it rather
       // than feed the filter a number it will believe.
       if (interval > 0.005 && interval < 0.2) {
-        filter_.addVelocity(nodeSeconds(), delta_position / interval);
+        velocity_from_position = delta_position / interval;
+        velocity_from_position_valid = true;
+        if (filter_initialized_) {
+          filter_.addVelocity(nodeSeconds(), velocity_from_position);
+        }
       }
     }
     last_odometry_arrival_ = odometry_arrival;
@@ -1855,8 +2173,21 @@ protected:
     drone_position_W_ = position;
     drone_velocity_W_ = velocity;
     // Low-passed for the contact check, which must not restart on single samples.
-    drone_velocity_filtered_z_ = applyLowPassFilterScalar(velocity(2), drone_velocity_filtered_z_,
-                                                          lpf_alpha_odometry_vz_);
+    //
+    // Differentiated from the POSITION, for the same reason the filter above is:
+    // PX4's reported velocity and PX4's own position disagree, and here the
+    // disagreement is not a nuisance but the difference between landing and
+    // timing out. Sitting stationary on the pad PX4 reports vz = +0.135 m/s
+    // against a groundtruth 0.0 -- above touchdown_stall_speed_ (0.10) -- so
+    // descent_stopped could never become true and the commit ended on its
+    // timeout instead of on contact, measured at 7.86 s against the usual ~2 s.
+    // The position difference over the same messages does not carry that bias.
+    // Held through an unusable interval rather than reset, so a dropped or
+    // duplicated message cannot inject a spurious zero.
+    if (velocity_from_position_valid) {
+      drone_velocity_filtered_z_ = applyLowPassFilterScalar(
+          velocity_from_position(2), drone_velocity_filtered_z_, lpf_alpha_odometry_vz_);
+    }
     drone_orientation_W_ = orientation;
     drone_angular_velocity_W_ = angular_velocity;
     last_odometry_timestamp_ = odom_msg->timestamp;
@@ -1875,6 +2206,7 @@ protected:
       r_position_W_ = position;
       r_velocity_W_.setZero();
       r_acceleration_W_.setZero();
+      reference_model_.reset();
 
       // Initialize fused position estimate from odometry
       estimated_position_W_ = position;

@@ -46,11 +46,28 @@ constexpr double kTiltRateLimitRadPerStep =
 
 // Tricopter (t2) arm geometry [m]. Shared by the allocation matrix and the
 // tau_z -> front-tilt computation, which must stay consistent with each other.
-constexpr double kTricopterArm1X = 0.1815;
-constexpr double kTricopterArm1Y = 0.22;
-constexpr double kTricopterArm2X = 0.1815;
-constexpr double kTricopterArm2Y = 0.22;
-constexpr double kTricopterArm3X = 0.4185;
+// Rotor arms measured from the CENTRE OF MASS -- which is what makes them moment
+// arms, and the whole point: the resultant thrust passes through wherever the
+// allocation believes the CG to be, so if that point is not the real CG, hovering
+// costs a CONSTANT moment.
+//
+// These are the gz model's actual rotor positions, and they are correct only
+// because model.sdf now places the composite CG on the model origin (see the
+// comment on base_link's inertial pose there). PX4's own mixer already assumed
+// exactly that -- CA_ROTOR0_PX 0.20, CA_ROTOR2_PX -0.4 are the rotor link
+// positions -- so model, PX4 and this node now agree with each other.
+//
+// The old values (0.1815 / 0.4185) put this node's moment reference 18.5 mm
+// forward of the origin while the model's CG sat at +8.09 mm, and PX4's sat at 0.
+// Measured in still-air hover under both control laws: tau_y = +0.2275 N.m with
+// the old arms, -0.2284 N.m with these arms against the OLD model, and
+// -0.0319 N.m with these arms against the corrected model -- all three matching
+// 24.4 N times the offset to within 15%.
+constexpr double kTricopterArm1X = 0.20;
+constexpr double kTricopterArm1Y = 0.215;
+constexpr double kTricopterArm2X = 0.20;
+constexpr double kTricopterArm2Y = 0.215;
+constexpr double kTricopterArm3X = 0.40;
 constexpr double kTricopterArm1Z = 0.0;
 constexpr double kTricopterArm2Z = 0.0;
 
@@ -118,6 +135,25 @@ ControllerNode::ControllerNode()
         wrench_publisher_ =
         this->create_publisher<geometry_msgs::msg::WrenchStamped>
             ("/landing/wrench", 10);
+        f_ext_publisher_ =
+        this->create_publisher<geometry_msgs::msg::WrenchStamped>
+            ("/landing/f_ext", 10);
+        attitude_reference_publisher_ =
+        this->create_publisher<geometry_msgs::msg::WrenchStamped>
+            ("/landing/attitude_reference", 10);
+        // Defaults ON, like every other diagnostic here. The switch exists so
+        // the diagnostic's OWN cost can be measured: this node publishes four
+        // diagnostic topics per 100 Hz cycle, and the chattering metrics are
+        // sensitive to loop jitter, so "does instrumenting it change it" is a
+        // question the rig has to be able to answer about itself.
+        this->declare_parameter("diagnostics.publish_sliding_surface", true);
+        publish_sliding_surface_ =
+            this->get_parameter("diagnostics.publish_sliding_surface").as_bool();
+        if (publish_sliding_surface_) {
+            sliding_surface_publisher_ =
+            this->create_publisher<geometry_msgs::msg::WrenchStamped>
+                ("/landing/sliding_surface", 10);
+        }
 
         // Timers
         std::chrono::duration<double> offboard_period(0.33);
@@ -209,6 +245,22 @@ void ControllerNode::loadParams() {
     controller_->setInertiaMatrix(_inertia_matrix);
     controller_->setGravity(_gravity);
     controller_->setPitchTrim(_pitch_trim_rad);
+
+    // Shared by both control laws, so it is read here rather than inside either
+    // branch below -- the stsmc path returns early. Zero disables the observer,
+    // which is what makes it A/B-able against one binary.
+    this->declare_parameter("control_gains.f_ext_observer_gain", 0.0);
+    const double f_ext_gain = this->get_parameter("control_gains.f_ext_observer_gain").as_double();
+    controller_->setExternalForceGain(f_ext_gain);
+    RCLCPP_INFO(this->get_logger(), "External-force observer (item 8): %s, gain %.2f rad/s",
+                f_ext_gain > 0.0 ? "ON" : "OFF", f_ext_gain);
+
+    // Also shared by both laws: the low-pass on omega_ref. Zero disables it.
+    this->declare_parameter("control_gains.omega_ref_filter_hz", 0.0);
+    const double omega_ref_hz = this->get_parameter("control_gains.omega_ref_filter_hz").as_double();
+    controller_->setReferenceRateFilterHz(omega_ref_hz);
+    RCLCPP_INFO(this->get_logger(), "Reference-rate filter on omega_ref: %s, %.2f Hz",
+                omega_ref_hz > 0.0 ? "ON" : "OFF", omega_ref_hz);
 
     if (controller_type_ == "stsmc") {
         // ===== STSMC CONTROLLER GAINS (fully independent from the SMC gains below) =====
@@ -695,6 +747,48 @@ void ControllerNode::publishWrenchMsg(const Eigen::VectorXd& wrench, uint64_t ti
     msg.wrench.force.z = wrench(3);
 
     wrench_publisher_->publish(msg);
+
+    // Same stamp, same frame: the disturbance the law was working against when
+    // it produced the wrench above.
+    geometry_msgs::msg::WrenchStamped f_ext_msg;
+    f_ext_msg.header = msg.header;
+    const Eigen::Vector3d f_ext = controller_->externalForceEstimate();
+    f_ext_msg.wrench.force.x = f_ext(0);
+    f_ext_msg.wrench.force.y = f_ext(1);
+    f_ext_msg.wrench.force.z = f_ext(2);
+    f_ext_publisher_->publish(f_ext_msg);
+
+    // Same stamp again: the desired-attitude derivative and the force command it
+    // was taken from. Diagnostic only -- see referenceAngularVelocity().
+    geometry_msgs::msg::WrenchStamped att_msg;
+    att_msg.header = msg.header;
+    const Eigen::Vector3d omega_ref = controller_->referenceAngularVelocity();
+    const Eigen::Vector3d i_a_d = controller_->desiredAcceleration();
+    att_msg.wrench.torque.x = omega_ref(0);
+    att_msg.wrench.torque.y = omega_ref(1);
+    att_msg.wrench.torque.z = omega_ref(2);
+    att_msg.wrench.force.x = i_a_d(0);
+    att_msg.wrench.force.y = i_a_d(1);
+    att_msg.wrench.force.z = i_a_d(2);
+    attitude_reference_publisher_->publish(att_msg);
+
+    // Same stamp again: the two sliding surfaces, which say which chattering
+    // mechanism the law is actually operating in. torque = s_R [rad/s],
+    // force = s [m/s]. See ControllerBase::slidingSurface().
+    if (!publish_sliding_surface_) {
+        return;
+    }
+    geometry_msgs::msg::WrenchStamped s_msg;
+    s_msg.header = msg.header;
+    const Eigen::Vector3d s_trans = controller_->slidingSurface();
+    const Eigen::Vector3d s_rot = controller_->rotationalSlidingSurface();
+    s_msg.wrench.torque.x = s_rot(0);
+    s_msg.wrench.torque.y = s_rot(1);
+    s_msg.wrench.torque.z = s_rot(2);
+    s_msg.wrench.force.x = s_trans(0);
+    s_msg.wrench.force.y = s_trans(1);
+    s_msg.wrench.force.z = s_trans(2);
+    sliding_surface_publisher_->publish(s_msg);
 }
 
 void ControllerNode::updateControllerOutput() {

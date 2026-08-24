@@ -206,6 +206,112 @@ inline double blindZoneCeiling(double min_range, const Eigen::Matrix3d &R_world_
   return min_range * R_world_body(2, 2) - lever_z;
 }
 
+// ---- The tag-loss ladder (roadmap item 5, §07) ------------------------------
+//
+// Kept here, ROS-free and beside the filter, because its inputs ARE the filter's
+// outputs and because a failsafe that can only be exercised by a three-minute
+// SITL flight is a failsafe nobody exercises. The node supplies the numbers; this
+// decides the tier, and test/relative_state_filter_test.cpp checks it in a
+// millisecond.
+//
+// Two of the inputs have no clock equivalent, which is the whole reason item 5
+// was ordered after item 7:
+//
+//   - `age` is the age of the last measurement the chi-squared gate ACCEPTED, so
+//     a stream of REJECTED detections reads as a lost tag rather than a healthy
+//     one. An occlusion and a mis-decode are different failures and a TF
+//     timestamp cannot tell them apart.
+//   - `sigma_xy` says what that staleness is worth in metres. It is compared
+//     against the two lengths that actually bound the decisions being made: the
+//     descent cone at the current height, and the patch of ground the camera can
+//     see from it. A fixed age cannot do that -- the cone runs from 0.95 m at 3 m
+//     to 0.14 m at the commit altitude while sigma grows the same way regardless,
+//     so one number cannot mean the same thing at both ends.
+enum class TagLossTier { kCoast = 0, kHold = 1, kReacquire = 2, kAbort = 3 };
+
+struct TagLossThresholds {
+  double coast_min_seconds = 0.3;   // below this it is a blink; do nothing [s]
+  // Above this, stop descending whatever the cone says. It has to sit BELOW
+  // reacquire_seconds or the Hold rung is unreachable: the ladder would step
+  // straight from Coast to a climb, which is the one response that throws away
+  // the approach's alignment. Caught by the offline case rather than in flight.
+  double coast_max_seconds = 1.0;   // [s]
+  double reacquire_seconds = 1.5;   // §07's climb threshold [s]
+  double abort_seconds = 5.0;       // §07's abort threshold [s]
+  // How much of the covariance to believe. Two sigma, because the covariance is
+  // measured OPTIMISTIC in exactly this regime: the offline blackout case has the
+  // error reaching ~2.1 sigma while dead reckoning, the drift being correlated
+  // where the filter models it as a random walk.
+  double sigma_margin = 2.0;
+  double cone_slope = 0.30;        // [m/m] must match the guidance cone
+  double cone_radius_min = 0.05;   // [m]
+  double footprint_slope = 1.19;   // [m/m] ground radius the camera sees per metre of height
+  // Below this height the ladder cannot escalate past Hold. Both markers leave
+  // the frame in the last ~25 cm of EVERY landing, so the terminal phase is
+  // permanently "tag lost" by construction: a climb there is a manoeuvre in
+  // ground effect on a target that was never going to be visible, and an abort
+  // there throws away a landing that is already all but complete.
+  double no_escalation_below = 0.30;  // [m], the commit altitude
+  int max_attempts = 3;               // §07
+};
+
+struct TagLossInputs {
+  double age = 0.0;         // [s] since the last ACCEPTED measurement; may be infinite
+  double sigma_xy = 0.0;    // [m] estimator XY standard deviation; 0 when unavailable
+  double height = 0.0;      // [m] above the pad
+  double xy_error = 0.0;    // [m] estimated horizontal offset from the pad
+  int attempts_used = 0;    // reacquire climbs already spent this landing
+  bool ever_acquired = false;
+};
+
+inline TagLossTier tagLossTier(const TagLossInputs &in, const TagLossThresholds &t) {
+  // Before the first detection the aircraft is SEARCHING, not coasting: the age
+  // is infinite by construction and the response belongs to the approach phase,
+  // which flies a bounded odometry hold point and looks. Running the ladder here
+  // would abort every ordinary run a few seconds after it started.
+  if (!in.ever_acquired) {
+    return TagLossTier::kCoast;
+  }
+
+  const double height = in.height > 0.0 ? in.height : 0.0;
+  const double cone_radius = t.cone_slope * height + t.cone_radius_min;
+  const double footprint_radius = t.footprint_slope * height;
+  // Where the aircraft might be, rather than where it is claimed to be.
+  const double reach = in.xy_error + t.sigma_margin * in.sigma_xy;
+
+  TagLossTier tier = TagLossTier::kCoast;
+  if (in.age >= t.coast_min_seconds) {
+    // Past a blink. Whether coasting is still safe is a question about the
+    // descent this estimate is steering: keep coasting while the aircraft can
+    // still be asserted, to sigma_margin sigma, to be inside the cone it is
+    // descending through. That tightens on its own as the cone narrows.
+    const bool inside_cone_with_confidence = reach < cone_radius;
+    if (in.age >= t.coast_max_seconds || !inside_cone_with_confidence) {
+      tier = TagLossTier::kHold;
+    }
+  }
+
+  // Climbing only helps when the tag CANNOT be in frame from here. If it is
+  // inside the footprint and simply not being decoded, altitude buys nothing and
+  // the climb costs the approach its alignment.
+  if (tier == TagLossTier::kHold) {
+    const bool out_of_footprint = reach > footprint_radius;
+    if (in.age >= t.reacquire_seconds || out_of_footprint) {
+      tier = TagLossTier::kReacquire;
+    }
+  }
+
+  if (tier == TagLossTier::kReacquire &&
+      (in.age >= t.abort_seconds || in.attempts_used > t.max_attempts)) {
+    tier = TagLossTier::kAbort;
+  }
+
+  if (height < t.no_escalation_below && tier > TagLossTier::kHold) {
+    tier = TagLossTier::kHold;
+  }
+  return tier;
+}
+
 struct RelativeStateFilterConfig {
   // ---- Process noise --------------------------------------------------------
   // The filter is fed no acceleration input, so the whole vehicle acceleration is

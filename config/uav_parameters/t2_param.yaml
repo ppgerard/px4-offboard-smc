@@ -25,6 +25,29 @@
       SIM_GZ_EC_MAX: 1500        # rad/s, corresponds to SIM_GZ_EC_MAX from PX4 parameters
       SIM_GZ_EC_MIN: 0           # rad/s, corresponds to SIM_GZ_EC_MIN from PX4 parameters 10 AVANT
     landing_parameters:
+      # ===== Reference generation (roadmap item 11) =====
+      # Bandwidth [rad/s] of the third-order reference model. 0.0 keeps the old
+      # low-pass-and-difference path, so the two A/B against one binary.
+      #
+      # The old path made the reference ACCELERATION proportional to the raw
+      # velocity command at a gain of lpf_alpha/dt = 20, so a step in the steering
+      # estimate reached the force feedforward at 49.7 N per metre -- measured at
+      # 1.115 N peak against a 0.026 N mean in a steady hold, from a 2.2 cm jump.
+      # The tag updates discretely, so those steps are not noise to be filtered;
+      # they are how the measurement arrives. Here the acceleration is a STATE, so
+      # a jump moves the jerk instead, and max_jerk bounds how fast the
+      # feedforward can move at all: one step can change it by at most
+      # m*j_max*dt = 0.199 N, whatever the jump.
+      #
+      # 8 rad/s is well above the translational loop's own ~1.5 rad/s (Lambda) and
+      # well below the ~20-25 rad/s the old filter ran at, which was far faster
+      # than anything downstream could use.
+      reference_model_bandwidth: 8.0
+      reference_model_damping: 1.0        # critically damped: a velocity reference
+                                          # that overshoots commands the vehicle
+                                          # past the point it was asked to reach
+      reference_model_max_jerk_xy: 8.0    # [m/s^3]
+      reference_model_max_jerk_z: 4.0     # [m/s^3]
       camera_frame_id: "t2_cruza_vtol_0/camera_link/imager"
       platform_frame_id: "platform"
       world_frame_id: "world"

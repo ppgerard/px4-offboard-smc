@@ -94,6 +94,13 @@ private:
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_publisher_;
+    // The external-force observer's estimate, in the world frame. A wind vector
+    // in newtons: the one signal that separates "the disturbance is large" from
+    // "the loop is not using what it already knows".
+    rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr f_ext_publisher_;
+    rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr attitude_reference_publisher_;
+    rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr sliding_surface_publisher_;
+    bool publish_sliding_surface_ = true;
     
     // Topic names
     std::string command_pose_topic_;

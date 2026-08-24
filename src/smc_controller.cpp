@@ -63,6 +63,14 @@ void SmcController::calculateControllerOutput(
     // r_yaw = 0.5;
     // r_acceleration_W_ << 0, 0, 0;
 
+    // Composite control (§05): the observer cancels the slow, large part of the
+    // disturbance and the switching term is left to handle only the fast
+    // residual. Without it the ONLY steady horizontal force this law can make
+    // against a steady wind is -K_s*sat(), which saturates at K_s = 1.0 N =
+    // 2.35 deg of lean, so the aircraft parks wherever the proportional chain
+    // happens to balance the wind -- measured at 0.19-0.24 m of standoff in
+    // 5 m/s, against a 0.3 m descent gate.
+    updateExternalForceEstimate();
 
     // Compute translational tracking errors.
     const Eigen::Vector3d e_p =
@@ -74,6 +82,7 @@ void SmcController::calculateControllerOutput(
     const Eigen::Vector3d s = 
                 e_v + Lambda.cwiseProduct(e_p);
     
+    s_last_ = s;   // diagnostic only
     Eigen::Vector3d sat_vec = s.cwiseQuotient(phi);
     sat_vec = sat_vec.cwiseMax(-1.0).cwiseMin(1.0);
 
@@ -86,9 +95,11 @@ void SmcController::calculateControllerOutput(
                 + _uav_mass * _gravity * Eigen::Vector3d::UnitZ() 
                 + _uav_mass * r_acceleration_W_
                 - _uav_mass * Lambda.cwiseProduct(e_v)
-                - K_s.cwiseProduct(sat_vec);
+                - K_s.cwiseProduct(sat_vec)
+                - f_ext_hat_;
 
     thrust = projectedThrust(I_a_d);
+    noteAppliedThrust(thrust);
     Eigen::Vector3d B_z_d;
     B_z_d = I_a_d;
     B_z_d.normalize();
@@ -132,6 +143,14 @@ void SmcController::calculateControllerOutput(
 
     R_d_prev_ = R_d_w;
 
+    // See setReferenceRateFilterHz(): omega_ref is a 100 Hz derivative of an
+    // attitude built from the FULL force command, so it carries the feedback's
+    // high-frequency content and not just the reference's. Off by default.
+    omega_ref = filterReferenceRate(omega_ref);
+
+    omega_ref_last_ = omega_ref;   // diagnostic only
+    i_a_d_last_ = I_a_d;           // diagnostic only
+
     
     Eigen::Quaterniond q_temp(R_d_w);
     *desired_quaternion = q_temp;
@@ -162,6 +181,7 @@ void SmcController::calculateControllerOutput(
     // RCLCPP_INFO_STREAM(rclcpp::get_logger("controller"), "d_3: [" << B_z_d.transpose() << "]");
 
     Eigen::Vector3d s_R = e_omega + Lambda_R.cwiseProduct(e_R);
+    s_R_last_ = s_R;   // diagnostic only
     Eigen::Vector3d sat_vec_R = s_R.cwiseQuotient(phi_R);
     sat_vec_R = sat_vec_R.cwiseMax(-1.0).cwiseMin(1.0);
     
