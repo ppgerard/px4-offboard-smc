@@ -114,6 +114,7 @@ install(TARGETS px4_offboard_landing_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS
+  scripts/identification.py
   scripts/visualizer.py
   DESTINATION lib/${PROJECT_NAME}
 )
