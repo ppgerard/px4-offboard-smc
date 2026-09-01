@@ -123,6 +123,15 @@ private:
     int _PWM_MAX;
     int _SIM_GZ_EC_MAX;
     int _SIM_GZ_EC_MIN;
+    // Tilt servo travel and channel assignment. Parameters rather than constants
+    // because SITL and the real T2 differ on BOTH: the gz airframe has 4 control
+    // surfaces and -7 deg of negative tilt travel, the vehicle has 3 and -5 deg.
+    // PX4 assigns servo functions control-surfaces-first, so the tilt index is
+    // CA_SV_CS_COUNT.
+    double tilt_min_deg_ = -7.0;
+    double tilt_max_deg_ = 90.0;
+    int tilt_1_servo_index_ = 4;
+    int tilt_2_servo_index_ = 5;
     // commanded tilt angles (radians) computed by the controller and published
     double tilt_1_rad_ = 0.0;
     double tilt_2_rad_ = 0.0;

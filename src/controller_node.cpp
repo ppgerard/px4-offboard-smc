@@ -37,8 +37,6 @@
 #include <algorithm>
 
 namespace {
-constexpr double kTiltMinDeg = -7.0;
-constexpr double kTiltMaxDeg = 90.0;
 constexpr double kDegToRad = M_PI / 180.0;
 constexpr double kRadToDeg = 180.0 / M_PI;
 constexpr double kTiltRateLimitRadPerStep =
@@ -71,17 +69,32 @@ constexpr double kTricopterArm3X = 0.40;
 constexpr double kTricopterArm1Z = 0.0;
 constexpr double kTricopterArm2Z = 0.0;
 
-double servoNormToTiltRad(double norm)
+// The tilt travel is a PROPERTY OF THE AIRFRAME, not a constant of this code, and
+// SITL and the real T2 disagree about it: the gz airframe sets
+// CA_SV_TL0/TL1_MINA -7, the vehicle's own parameters say -5. It has to match in
+// every place that maps an angle to a normalized servo command, or a commanded
+// tilt is not the angle the joint takes -- the disagreement that once cost a
+// 4 deg pitch bias.
+//
+// Note these bounds do NOT come from CA_SV_TL*_MINA/MAXA at runtime. In offboard
+// direct-actuator mode PX4's allocator is bypassed entirely, so the value written
+// to actuator_servos goes straight to the output scaling: -1 maps to
+// PWM_MAIN_MIN<n> and +1 to PWM_MAIN_MAX<n>. What these must agree with is the
+// PHYSICAL angle the servo reaches at those two PWM values, which on the vehicle
+// is set by its per-output travel calibration (MIN 1150 / MAX 2025 on one tilt,
+// 1000 / 1875 on the other). Measure it with an inclinometer on the bench; do not
+// assume the CA_ parameters describe it.
+double servoNormToTiltRad(double norm, double tilt_min_deg, double tilt_max_deg)
 {
     const double clamped_norm = std::clamp(norm, -1.0, 1.0);
-    const double tilt_deg = kTiltMinDeg + 0.5 * (clamped_norm + 1.0) * (kTiltMaxDeg - kTiltMinDeg);
+    const double tilt_deg = tilt_min_deg + 0.5 * (clamped_norm + 1.0) * (tilt_max_deg - tilt_min_deg);
     return tilt_deg * kDegToRad;
 }
 
-double tiltRadToServoNorm(double tilt_rad)
+double tiltRadToServoNorm(double tilt_rad, double tilt_min_deg, double tilt_max_deg)
 {
-    const double tilt_deg = std::clamp(tilt_rad * kRadToDeg, kTiltMinDeg, kTiltMaxDeg);
-    const double norm = 2.0 * (tilt_deg - kTiltMinDeg) / (kTiltMaxDeg - kTiltMinDeg) - 1.0;
+    const double tilt_deg = std::clamp(tilt_rad * kRadToDeg, tilt_min_deg, tilt_max_deg);
+    const double norm = 2.0 * (tilt_deg - tilt_min_deg) / (tilt_max_deg - tilt_min_deg) - 1.0;
     return std::clamp(norm, -1.0, 1.0);
 }
 }
@@ -184,6 +197,10 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.omega_to_pwm_coefficient.x_2", 0.0);
     this->declare_parameter("uav_parameters.omega_to_pwm_coefficient.x_1", 0.0);
     this->declare_parameter("uav_parameters.omega_to_pwm_coefficient.x_0", 0.0);
+    this->declare_parameter("uav_parameters.tilt_min_deg", -7.0);
+    this->declare_parameter("uav_parameters.tilt_max_deg", 90.0);
+    this->declare_parameter("uav_parameters.tilt_1_servo_index", 4);
+    this->declare_parameter("uav_parameters.tilt_2_servo_index", 5);
 
     double _uav_mass = this->get_parameter("uav_parameters.mass").as_double();
     _arm_length = this->get_parameter("uav_parameters.arm_length").as_double();
@@ -205,6 +222,31 @@ void ControllerNode::loadParams() {
     double _inertia_ixy = this->get_parameter("uav_parameters.inertia.ixy").as_double();
     double _inertia_ixz = this->get_parameter("uav_parameters.inertia.ixz").as_double();
     double _inertia_iyz = this->get_parameter("uav_parameters.inertia.iyz").as_double();
+    tilt_min_deg_ = this->get_parameter("uav_parameters.tilt_min_deg").as_double();
+    tilt_max_deg_ = this->get_parameter("uav_parameters.tilt_max_deg").as_double();
+    tilt_1_servo_index_ = this->get_parameter("uav_parameters.tilt_1_servo_index").as_int();
+    tilt_2_servo_index_ = this->get_parameter("uav_parameters.tilt_2_servo_index").as_int();
+    // ActuatorServos carries 8 channels; an out-of-range index would read or
+    // write past the array, and on the write side it would silently leave a tilt
+    // servo commanded to zero while the other tracked -- an asymmetric tilt is
+    // the yaw axis on this airframe, so it is not a small error.
+    if (tilt_1_servo_index_ < 0 || tilt_1_servo_index_ > 7 ||
+        tilt_2_servo_index_ < 0 || tilt_2_servo_index_ > 7 ||
+        tilt_1_servo_index_ == tilt_2_servo_index_) {
+        RCLCPP_ERROR(this->get_logger(),
+            "Invalid tilt servo indices (%d, %d): must be distinct and within [0, 7]. "
+            "Falling back to 4 and 5.", tilt_1_servo_index_, tilt_2_servo_index_);
+        tilt_1_servo_index_ = 4;
+        tilt_2_servo_index_ = 5;
+    }
+    if (!(tilt_max_deg_ > tilt_min_deg_)) {
+        RCLCPP_ERROR(this->get_logger(),
+            "uav_parameters.tilt_max_deg (%.1f) must exceed tilt_min_deg (%.1f); "
+            "falling back to [-7, 90].", tilt_max_deg_, tilt_min_deg_);
+        tilt_min_deg_ = -7.0;
+        tilt_max_deg_ = 90.0;
+    }
+
     double _omega_to_pwm_coefficient_x_2 = this->get_parameter("uav_parameters.omega_to_pwm_coefficient.x_2").as_double();
     double _omega_to_pwm_coefficient_x_1 = this->get_parameter("uav_parameters.omega_to_pwm_coefficient.x_1").as_double();
     double _omega_to_pwm_coefficient_x_0 = this->get_parameter("uav_parameters.omega_to_pwm_coefficient.x_0").as_double();
@@ -495,7 +537,7 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         }
 
         // Keep physical angles in radians internally; convert to normalized only when publishing.
-        const double tilt_1_desired = std::clamp(computed_tilt_rad, kTiltMinDeg * kDegToRad, -kTiltMinDeg * kDegToRad);
+        const double tilt_1_desired = std::clamp(computed_tilt_rad, tilt_min_deg_ * kDegToRad, -tilt_min_deg_ * kDegToRad);
         allocation_saturated_ = allocation_saturated_ || tilt_1_desired != computed_tilt_rad;
 
         // Rate limiting
@@ -650,19 +692,24 @@ void ControllerNode::vehicle_odometryCallback(const px4_msgs::msg::VehicleOdomet
 }
 
 void ControllerNode::servosStatusCallback(const px4_msgs::msg::ActuatorServos::SharedPtr servos_msg) {
-    constexpr int kTilt1ServoIndex = 4;  // Servo 5 (1-based)
-    constexpr int kTilt2ServoIndex = 5;  // Servo 6 (1-based)
+    // Which servo channels carry the tilts is airframe-dependent, and SITL and
+    // the real T2 differ. PX4 assigns servo functions CONTROL SURFACES FIRST,
+    // THEN TILTS (ActuatorEffectivenessTiltrotorVTOL::getEffectivenessMatrix), so
+    // the index is CA_SV_CS_COUNT. The gz airframe has 4 control surfaces, giving
+    // tilts on Servo 5/6 (indices 4/5); the vehicle has CA_SV_CS_COUNT 3, giving
+    // tilts on Servo 4/5 (indices 3/4) -- confirmed by its per-output travel
+    // calibration sitting on exactly those two channels.
 
     if (_num_of_arms != 3) {
         return;
     }
 
     // Read measured servo normalized values (these are measurements, not commands)
-    const double measured_tilt_1_norm = std::clamp(static_cast<double>(servos_msg->control[kTilt1ServoIndex]), -1.0, 1.0);
-    const double measured_tilt_2_norm = std::clamp(static_cast<double>(servos_msg->control[kTilt2ServoIndex]), -1.0, 1.0);
+    const double measured_tilt_1_norm = std::clamp(static_cast<double>(servos_msg->control[tilt_1_servo_index_]), -1.0, 1.0);
+    const double measured_tilt_2_norm = std::clamp(static_cast<double>(servos_msg->control[tilt_2_servo_index_]), -1.0, 1.0);
     // Convert measurements to radians
-    const double measured_tilt_1_rad = servoNormToTiltRad(measured_tilt_1_norm);
-    const double measured_tilt_2_rad = servoNormToTiltRad(measured_tilt_2_norm);
+    const double measured_tilt_1_rad = servoNormToTiltRad(measured_tilt_1_norm, tilt_min_deg_, tilt_max_deg_);
+    const double measured_tilt_2_rad = servoNormToTiltRad(measured_tilt_2_norm, tilt_min_deg_, tilt_max_deg_);
     // store measured tilts separately from commanded tilts
     measured_tilt_1_rad_ = measured_tilt_1_rad;
     measured_tilt_2_rad_ = measured_tilt_2_rad;
@@ -714,17 +761,23 @@ void ControllerNode::publishActuatorMotorsMsg(const Eigen::VectorXd& throttles) 
 void ControllerNode::publishActuatorServosMsg(double tilt_1_rad, double tilt_2_rad) {
     px4_msgs::msg::ActuatorServos actuator_servos_msg;
 
-    const double tilt_1_norm = tiltRadToServoNorm(tilt_1_rad);
-    const double tilt_2_norm = tiltRadToServoNorm(tilt_2_rad);
+    const double tilt_1_norm = tiltRadToServoNorm(tilt_1_rad, tilt_min_deg_, tilt_max_deg_);
+    const double tilt_2_norm = tiltRadToServoNorm(tilt_2_rad, tilt_min_deg_, tilt_max_deg_);
 
     auto safe_servo = [](double v){
         if (!std::isfinite(v)) return 0.0f;
         return (float)std::clamp(v, -1.0, 1.0);
     };
-    actuator_servos_msg.control = { 0.0f, 0.0f, 0.0f, 0.0f,
-                                    safe_servo(tilt_1_norm),
-                                    safe_servo(tilt_2_norm),
+    // Non-tilt channels are held at 0.0 (centred control surfaces) and the two
+    // unused tail channels at NaN, exactly as before -- only WHICH channels carry
+    // the tilts is now configurable. With the SITL indices (4, 5) this produces a
+    // byte-identical message to the version that flew every result in CLAUDE.md,
+    // which is what lets the hardware change be adopted without re-validating the
+    // simulator numbers.
+    actuator_servos_msg.control = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
                                     std::nanf("1"), std::nanf("1") };
+    actuator_servos_msg.control[tilt_1_servo_index_] = safe_servo(tilt_1_norm);
+    actuator_servos_msg.control[tilt_2_servo_index_] = safe_servo(tilt_2_norm);
     actuator_servos_msg.timestamp = this->now().nanoseconds() / 1000;
     actuator_servos_publisher_->publish(actuator_servos_msg);
 }

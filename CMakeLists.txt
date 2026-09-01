@@ -50,6 +50,16 @@ add_executable(px4_offboard_landing_node
   src/TrajectoryPublishers/px4_offboard_landing_node.cpp
 )
 
+# Indoor / no-GNSS bring-up: the tag becomes EKF2's horizontal aiding source, and
+# a bounded hover profile exercises the control law without the landing stack.
+add_executable(tag_ev_bridge_node
+  src/tag_ev_bridge_node.cpp
+)
+
+add_executable(indoor_hover_node
+  src/TrajectoryPublishers/indoor_hover_node.cpp
+)
+
 # Add dependencies for the executables
 ament_target_dependencies(offboard_controller_node
   rclcpp
@@ -85,6 +95,23 @@ ament_target_dependencies(landing_trajectory_node
   Eigen3
 )
 
+ament_target_dependencies(tag_ev_bridge_node
+  rclcpp
+  geometry_msgs
+  px4_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  Eigen3
+)
+
+ament_target_dependencies(indoor_hover_node
+  rclcpp
+  geometry_msgs
+  trajectory_msgs
+  px4_msgs
+  Eigen3
+)
+
 ament_target_dependencies(px4_offboard_landing_node
   rclcpp
   geometry_msgs
@@ -111,6 +138,12 @@ install(TARGETS landing_trajectory_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS px4_offboard_landing_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS tag_ev_bridge_node
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS indoor_hover_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS

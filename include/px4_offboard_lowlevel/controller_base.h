@@ -167,11 +167,17 @@ public:
     const Eigen::Vector3d &rotationalSlidingSurface() const { return s_R_last_; }
 
     // Setters
+    //
+    // velocity_W is already in world axes: px4_frame_conversions.h resolves the
+    // message's velocity_frame. It used to arrive here as a body-frame quantity
+    // and be rotated by R_B_W_, which is correct only at zero heading -- the one
+    // condition SITL always satisfies and hardware never does. See the note on
+    // eigenOdometryFromPX4Msg().
     void setOdometry(const Eigen::Vector3d &position_W, const Eigen::Quaterniond &orientation_B_W,
-        const Eigen::Vector3d &velocity_B, const Eigen::Vector3d &angular_velocity_B){
+        const Eigen::Vector3d &velocity_W, const Eigen::Vector3d &angular_velocity_B){
         R_B_W_ = orientation_B_W.toRotationMatrix();
         position_W_ = position_W;
-        velocity_W_ = R_B_W_ * velocity_B;
+        velocity_W_ = velocity_W;
         angular_velocity_B_ = angular_velocity_B;
     }
 

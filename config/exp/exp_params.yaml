@@ -1,11 +1,29 @@
 /**:
   ros__parameters:
+    # Hardware: px4Inverse() maps rotor speed -> PWM with the identified rotor
+    # curve in t2_hw_param.yaml, then normalises over [PWM_MIN, PWM_MAX]. That is
+    # only the right mapping if PX4 itself maps the actuator_motors value to PWM
+    # linearly over the SAME range -- so PWM_MIN/PWM_MAX here must equal the
+    # vehicle's PWM_MAIN_MIN<n>/PWM_MAIN_MAX<n> on the MOTOR outputs, and
+    # THR_MDL_FAC must be 0 (it is, on this vehicle).
     sitl_mode: false
     topics_names:
       command_pose_topic: "command/pose"
       command_traj_topic: "command/trajectory"
       odometry_topic: "fmu/out/vehicle_odometry"
-      status_topic: "fmu/out/vehicle_status"
+      # Versioned topic names. px4_msgs and the flashed firmware must agree on
+      # the suffix AND on the field layout: this workspace's px4_msgs declares
+      # VehicleStatus MESSAGE_VERSION 3 while the firmware tree declares 1, and it
+      # only works because arming_state and nav_state both sit BEFORE the first
+      # field v3 added (nav_state_display). Anything read after that point would
+      # be garbage. Pin px4_msgs to whatever is flashed.
+      status_topic: "/fmu/out/vehicle_status_v1"
+      servos_status_topic: "/fmu/out/actuator_servos"
       offboard_control_topic: "/fmu/in/offboard_control_mode"
       vehicle_command_topic: "/fmu/in/vehicle_command"
       actuator_control_topic: "/fmu/in/actuator_motors"
+      # These two were MISSING from this file, which is not a harmless omission:
+      # the node declares them with the default string "default", so the tilt
+      # servo publisher was created on a topic literally named `default` and the
+      # tilts were never commanded. On a tricopter tiltrotor that is the yaw axis.
+      servos_control_topic: "/fmu/in/actuator_servos"

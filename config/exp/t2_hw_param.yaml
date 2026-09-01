@@ -1,0 +1,148 @@
+# Real T2 Cruza tiltrotor, Pixracer Pro, PX4 v1.16.0-rc.
+#
+# Derived from the vehicle's own parameter dump where the dump settles it, and
+# MARKED "MEASURE" where it does not. Every MEASURE item is a number the
+# simulator supplied for free and the aircraft will not.
+#
+# Read the differences from t2_param.yaml first -- they are the whole point of a
+# separate file, and three of them are flight-critical.
+/**:
+  ros__parameters:
+    uav_parameters:
+      # MEASURE. 2.486 kg is the Gazebo model. Weigh the aircraft as flown:
+      # battery, Raspberry Pi 5, camera, cabling. Mass sets hover thrust
+      # directly, and the external-force observer absorbs the error up to
+      # kFextMaxHoverFraction (30% of weight) before it simply saturates.
+      mass: 2.486
+      arm_length: 0.25             # NOT USED for num_of_arms 3
+      num_of_arms: 3
+      # MEASURE (or take from CAD). Gazebo model values. Inertia enters the
+      # attitude loop through I*Lambda_R and the STA gains; a 30% error there is
+      # a 30% gain error on the axis concerned.
+      inertia:
+        ixx: 0.0808685
+        iyy: 0.1256707
+        izz: 0.2036992
+        ixy: 0.0
+        ixz: 0.0
+        iyz: 0.0
+      # These two agree with the vehicle's own allocation parameters, which is
+      # the one cross-check available without a thrust stand:
+      #   CA_ROTOR0_KM 0.05  -> moment_constant 0.05
+      #   CA_ROTOR*_CT 13.0  -> thrust at full scale; see thrust_constant below.
+      moment_constant: 0.05
+      # MEASURE ON A THRUST STAND. 1.6e-05 N.s^2/rad^2 is the Gazebo rotor.
+      # The vehicle's CA_ROTOR*_CT is 13.0 N at full command, which for three
+      # rotors is 39 N against a ~24.4 N hover -- consistent with a ~63% hover
+      # command, but CT is PX4's own linear-in-command coefficient and is NOT
+      # this quadratic-in-omega constant. They are different models; do not
+      # convert one into the other and call it identified.
+      thrust_constant: 1.6e-05
+      gravity: 9.81
+      pitch_trim_deg: 0.0
+      # MEASURE ON A THRUST STAND. These coefficients are currently IDENTICAL to
+      # the x500's in x500_param.yaml -- they were copied and have never been
+      # identified for the T2's motor/prop/battery combination. px4Inverse()
+      # depends on them entirely on hardware.
+      #
+      # The cheap first cut: hover the aircraft manually, read the steady
+      # actuator_motors value from the ULog, and solve for the omega that gives
+      # mg/3 per rotor. That single point plus the quadratic shape gets the hover
+      # command right, which is most of what matters for a hover test.
+      omega_to_pwm_coefficient:
+        x_2: 0.001142
+        x_1: 0.2273
+        x_0: 914.2
+      # FROM THE VEHICLE: PWM_MAIN_MIN/MAX on the motor outputs (MAIN3, MAIN7,
+      # MAIN8 -> functions 103, 102, 101) are 1100 and 1900. The 1075/1950 in
+      # t2_param.yaml is the SITL airframe and would misscale every throttle.
+      PWM_MIN: 1100
+      PWM_MAX: 1900
+      # Unused when sitl_mode is false; kept so one node reads either file.
+      SIM_GZ_EC_MAX: 1500
+      SIM_GZ_EC_MIN: 0
+      # FROM THE VEHICLE, and this is the flight-critical one.
+      #
+      # PX4 assigns servo output functions CONTROL SURFACES FIRST, THEN TILTS
+      # (ActuatorEffectivenessTiltrotorVTOL::getEffectivenessMatrix). The gz
+      # airframe has CA_SV_CS_COUNT 4, putting the tilts on Servo 5 and 6 =
+      # indices 4 and 5. This vehicle has CA_SV_CS_COUNT 3, putting them on
+      # Servo 4 and 5 = indices 3 and 4.
+      #
+      # Confirmed independently by the output map: MAIN6 -> function 204
+      # (Servo 4) and MAIN5 -> function 205 (Servo 5) are the only two outputs
+      # with individually calibrated travel (1000/1875 and 1150/2025), which is
+      # what per-servo tilt trim looks like. Everything else is 1100/1900.
+      #
+      # With the SITL indices the code would write tilt_1 to Servo 5, tilt_2 to
+      # an unmapped Servo 6, and leave Servo 4 commanded to 0.0 -- one tilt
+      # frozen while the other tracks. Differential tilt IS the yaw axis here.
+      tilt_1_servo_index: 3
+      tilt_2_servo_index: 4
+      # FROM THE VEHICLE: CA_SV_TL0_MINA/MAXA are -5 and 90, against the SITL
+      # airframe's -7 and 90.
+      #
+      # VERIFY ON THE BENCH ANYWAY. In offboard direct-actuator mode PX4's
+      # allocator is bypassed, so CA_SV_TL*_MINA/MAXA are NOT applied to what we
+      # publish: the value goes straight to output scaling, where -1 is
+      # PWM_MAIN_MIN<n> and +1 is PWM_MAIN_MAX<n>. What these numbers must match
+      # is the PHYSICAL angle at those two PWM values. Command -1, 0 and +1 with
+      # the props off and measure the tilt with an inclinometer.
+      tilt_min_deg: -5.0
+      tilt_max_deg: 90.0
+
+    landing_parameters:
+      # Shared with tag_ev_bridge_node so the estimator's input and the guidance
+      # that consumes its output cannot disagree about the camera.
+      #
+      # MEASURE BOTH. The frame id comes from the real camera_info header, and
+      # the offset is the optical centre in body FLU. The -0.10 below is the
+      # Gazebo mount (mono_cam at <pose>0 0 -0.10 0 1.5707 0</pose>).
+      camera_frame_id: "camera_link_optical"
+      platform_frame_id: "platform"
+      world_frame_id: "world"
+      camera_offset_body:
+        x: 0.0
+        y: 0.0
+        z: -0.10
+      # VERIFY AGAINST THE REAL MOUNTING. These two angles build R_b_cam (see
+      # camera_extrinsics.h) and default to the SITL mounting. A 180 deg error
+      # about the boresight here inverts BOTH lateral axes, which reads as the
+      # aircraft being on the opposite side of the pad -- it lived in this
+      # project undetected through three roadmap items, because a synthetic tag
+      # shares the constant with the code it feeds and the error cancels.
+      #
+      # Check it on the ground: park the aircraft a known distance north-east of
+      # the tag with the camera seeing it, and confirm /landing/ev_position has
+      # the signs you expect on both axes before arming.
+      camera_rotation_z_deg: 90.0
+      camera_rotation_x_deg: 180.0
+
+      detections_topic: "/apriltag/detections"
+      camera_info_topic: "/camera/camera/camera_info"
+      # MEASURE. The lidar is a Benewake TFmini (SENS_TFMINI_CFG 103) on this
+      # aircraft, not the SITL LW20, so both the mounting and the minimum range
+      # differ. Note the vehicle currently has EKF2_RNG_POS_X/Y/Z all at 0.0 and
+      # EKF2_RNG_CTRL 1 (conditional) -- the same two defects the SITL work found
+      # and fixed, still present here. Set the lever arm and use 2 (always on).
+      rangefinder_offset_body:
+        x: 0.10
+        y: 0.0
+        z: -0.145
+
+      tag_ids: [2, 1]
+      tag_families: ["Custom48h12", "36h11"]
+      tag_sizes: [0.6, 0.16]
+      tag_positions_x: [0.0, 0.0]
+      tag_positions_y: [0.0, 0.0]
+      tag_positions_z: [0.0, 0.0]
+
+    # External-vision bridge. Loose on purpose: an over-tight sigma is what makes
+    # EKF2 gate the tag out during motion, and a starved EV fusion falls back to
+    # the fake-position anchor silently. EKF2_EVP_NOISE is a LOWER bound on these.
+    ev_bridge:
+      sigma_xy_base: 0.03
+      sigma_xy_per_metre: 0.02
+      sigma_z_base: 0.05
+      sigma_z_per_metre: 0.03
+      max_range: 8.0
