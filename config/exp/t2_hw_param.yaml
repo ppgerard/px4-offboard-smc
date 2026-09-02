@@ -113,10 +113,15 @@
       # Shared with tag_ev_bridge_node so the estimator's input and the guidance
       # that consumes its output cannot disagree about the camera.
       #
-      # MEASURE BOTH. The frame id comes from the real camera_info header, and
-      # the offset is the optical centre in body FLU. The -0.10 below is the
-      # Gazebo mount (mono_cam at <pose>0 0 -0.10 0 1.5707 0</pose>).
-      camera_frame_id: "camera_link_optical"
+      # FROM THE Pi's OWN STACK, not guessed. camera_ros declares
+      # frame_id with a default of "camera" (CameraNode.cpp: declare_parameter
+      # <std::string>("frame_id", "camera")) and the launch file on the Pi does not
+      # override it, so the image header carries "camera". The detector copies that
+      # header onto the platform transform verbatim
+      # (AprilTagNode.cpp: platform_tf.header = msg_img->header), so "camera" is
+      # the TF parent this node must look up. It was "camera_link_optical" here,
+      # which is the Gazebo name and would have failed every lookup silently.
+      camera_frame_id: "camera"
       platform_frame_id: "platform"
       world_frame_id: "world"
       camera_offset_body:
@@ -136,6 +141,18 @@
       camera_rotation_z_deg: 90.0
       camera_rotation_x_deg: 180.0
 
+      # Both confirmed against the Pi's camera_36h11.launch.yml: the apriltag node
+      # runs in namespace "apriltag" (-> /apriltag/detections) and camera_ros in
+      # namespace "camera" with node name "camera" (-> /camera/camera/camera_info).
+      #
+      # NOTE ON K vs P. The detector is fed the RECTIFIED image from
+      # image_proc::RectifyNode but the UNRECTIFIED camera_info, and both it and
+      # this node read K. For a rectified image the correct intrinsics are P. If
+      # the lens has real distortion those differ by a few percent, which is a
+      # straight scale error on every range and position. Check with
+      #   ros2 topic echo /camera/camera/camera_info --once
+      # and compare k[0], k[4], k[2], k[5] against p[0], p[5], p[2], p[6]. If they
+      # differ materially, republish a camera_info whose K equals P.
       detections_topic: "/apriltag/detections"
       camera_info_topic: "/camera/camera/camera_info"
       # MEASURE. The lidar is a Benewake TFmini (SENS_TFMINI_CFG 103) on this
