@@ -1,0 +1,30 @@
+# Everything needed on the Raspberry Pi 5 for the indoor no-GNSS test.
+#
+#   mkdir -p ~/t2_ws/src && cd ~/t2_ws
+#   vcs import src < t2_indoor.repos
+#   colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+#
+# px4_msgs is pinned to release/1.16 to match the flashed firmware (v1.16.0-rc).
+# This is NOT cosmetic: the uXRCE-DDS client derives each topic's "_v<N>" suffix
+# from the FIRMWARE's own message version (generate_topic_name() appends nothing
+# when that version is 0), and it also decides the wire layout. A px4_msgs from a
+# different release subscribes to names that never deliver, or deserialises the
+# right bytes into the wrong fields. Neither failure announces itself.
+#
+# camera_ros and libcamera are deliberately ABSENT. The versions already built on
+# the Pi (camera_ros 7125869 "rel_05" against libcamera v0.5.2+rpt20250903) are
+# consistent with each other and with a working camera. Rebuilding either against
+# a newer system libcamera is the most likely way to break a camera that works.
+repositories:
+  px4-offboard-smc:
+    type: git
+    url: git@github.com:ppgerard/px4-offboard-smc.git
+    version: feature/indoor-ev-hover
+  apriltag_ros_enhanced:
+    type: git
+    url: git@github.com:ppgerard/apriltag_ros_enhanced.git
+    version: master
+  px4_msgs:
+    type: git
+    url: https://github.com/PX4/px4_msgs.git
+    version: release/1.16
