@@ -234,10 +234,29 @@ class TagEvBridgeNode : public rclcpp::Node {
     have_last_stamp_ = true;
     last_stamp_ = stamp;
 
+    Eigen::Vector3d r_plat_cam_cam;
+    r_plat_cam_cam << transform.transform.translation.x,
+                      transform.transform.translation.y,
+                      transform.transform.translation.z;
+
+    // The tag in BODY FLU. Published FIRST, and deliberately before the attitude
+    // gate below, because it does not use the attitude: it is
+    // R_b_cam * r_plat_cam + r_cam_b, camera geometry and nothing else. That is
+    // what makes it the right signal for validating R_b_cam -- and it means the
+    // extrinsic can be checked on a bench with only the camera and this node, with
+    // no flight controller connected and nothing that could arm.
+    const Eigen::Vector3d r_plat_b_b = R_b_cam_ * r_plat_cam_cam + r_cam_b_b_;
+    geometry_msgs::msg::Vector3 body_diag;
+    body_diag.x = r_plat_b_b(0);
+    body_diag.y = r_plat_b_b(1);
+    body_diag.z = r_plat_b_b(2);
+    tag_body_pub_->publish(body_diag);
+
     if (attitude_history_.empty()) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "Tag transform available but no vehicle attitude yet; "
-                           "cannot resolve it into world axes.");
+                           "Tag seen and /landing/tag_in_body is publishing, but there is no "
+                           "vehicle attitude yet, so no external vision can be sent. Fine for "
+                           "the extrinsic check; connect the flight controller to fly.");
       return;
     }
 
@@ -262,11 +281,6 @@ class TagEvBridgeNode : public rclcpp::Node {
 
     const Eigen::Matrix3d R_W_B = orientation.toRotationMatrix();
 
-    Eigen::Vector3d r_plat_cam_cam;
-    r_plat_cam_cam << transform.transform.translation.x,
-                      transform.transform.translation.y,
-                      transform.transform.translation.z;
-
     // Vehicle position relative to the tag, in world (ENU) axes. Identical
     // expression to landing_trajectory_base.h's updateTagPosition(): the tag
     // translation is resolved with the EKF attitude, NOT with the PnP rotation.
@@ -274,7 +288,6 @@ class TagEvBridgeNode : public rclcpp::Node {
     // is where the planar ambiguity lives -- it can wobble degrees between frames
     // while the translation stays put, and at 2 m a degree is ~3.5 cm of injected
     // position noise. See item 3 in CLAUDE.md.
-    const Eigen::Vector3d r_plat_b_b = R_b_cam_ * r_plat_cam_cam + r_cam_b_b_;
     const Eigen::Vector3d p_enu = -(R_W_B * r_plat_b_b);
 
     const double range = r_plat_cam_cam.norm();
@@ -284,12 +297,6 @@ class TagEvBridgeNode : public rclcpp::Node {
                            range, max_range_);
       return;
     }
-
-    geometry_msgs::msg::Vector3 body_diag;
-    body_diag.x = r_plat_b_b(0);
-    body_diag.y = r_plat_b_b(1);
-    body_diag.z = r_plat_b_b(2);
-    tag_body_pub_->publish(body_diag);
 
     geometry_msgs::msg::Vector3 diag;
     diag.x = p_enu(0);
