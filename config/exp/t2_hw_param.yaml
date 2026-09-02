@@ -9,22 +9,40 @@
 /**:
   ros__parameters:
     uav_parameters:
-      # MEASURE. 2.486 kg is the Gazebo model. Weigh the aircraft as flown:
-      # battery, Raspberry Pi 5, camera, cabling. Mass sets hover thrust
-      # directly, and the external-force observer absorbs the error up to
-      # kFextMaxHoverFraction (30% of weight) before it simply saturates.
+      # MEASURE, and there is a live discrepancy to resolve first: the CAD mass
+      # properties read 2363.35 g, this file and t2_param.yaml say 2486 g -- 5.2%
+      # apart. The CAD's INERTIA matches the config to seven digits, so the two
+      # came from the same model and only the mass has moved since.
+      #
+      # Weigh the aircraft as flown (battery, Pi 5, camera, cabling, tape) rather
+      # than trusting either. Mass sets hover thrust directly, and the
+      # external-force observer absorbs the error up to kFextMaxHoverFraction
+      # (30% of weight) before it saturates -- so a 5% error is not dangerous,
+      # but it is a permanent feedforward bias standing in for nothing.
       mass: 2.486
       arm_length: 0.25             # NOT USED for num_of_arms 3
       num_of_arms: 3
-      # MEASURE (or take from CAD). Gazebo model values. Inertia enters the
-      # attitude loop through I*Lambda_R and the STA gains; a 30% error there is
-      # a 30% gain error on the axis concerned.
+      # FROM CAD, and confirmed against it: the diagonal matches the mass
+      # properties to seven digits (80868508.29 g.mm^2 = 0.0808685 kg.m^2, etc).
+      #
+      # ixz is the ONE off-diagonal worth carrying, and the airframe's own
+      # symmetry says why. The aircraft is symmetric about x, so the x-z plane is
+      # a symmetry plane, which forces ixy = iyz = 0 exactly -- and the CAD agrees,
+      # putting both at 0.07% and 0.015% of sqrt(Ii*Ij), i.e. numerical dust. That
+      # symmetry does NOT constrain ixz, the fore-aft/vertical product, and the
+      # CAD puts it at 1.97%. It shows up in the CAD's principal axes as
+      # Ix = (1.00, 0.00, -0.02): the principal axis tilted ~1.1 deg from body x.
+      #
+      # 2% is well inside what the sliding-mode reaching gains are there to
+      # reject, and every chattering and landing result in CLAUDE.md was measured
+      # with it at zero, so this is not expected to change anything measurable.
+      # It is carried because it is free and it is real.
       inertia:
         ixx: 0.0808685
         iyy: 0.1256707
         izz: 0.2036992
         ixy: 0.0
-        ixz: 0.0
+        ixz: -0.0025341
         iyz: 0.0
       # These two agree with the vehicle's own allocation parameters, which is
       # the one cross-check available without a thrust stand:
