@@ -7,16 +7,31 @@ procedure.
 ## 1. Workspace
 
 ```bash
-mkdir -p ~/t2_ws/src && cd ~/t2_ws
-git clone -b feature/indoor-ev-hover git@github.com:ppgerard/px4-offboard-smc.git src/px4-offboard-smc
-vcs import src < src/px4-offboard-smc/t2_indoor.repos     # or clone the other two by hand
+mkdir -p ~/t2_ws/src && cd ~/t2_ws/src
+git clone -b feature/indoor-ev-hover git@github.com:ppgerard/px4-offboard-smc.git
+git clone git@github.com:ppgerard/apriltag_ros_enhanced.git
+git clone https://github.com/PX4/px4_msgs.git
+cd px4_msgs && git checkout 56f8019425a16af2941df5a9288834398681e394 && cd ../..
+
 source /opt/ros/jazzy/setup.bash
+source ~/<YOUR OLD WORKSPACE>/install/setup.bash    # camera_ros + libcamera, see below
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-`camera_ros` and `libcamera` are **not** in the repos file on purpose. Keep the
-builds already on the Pi.
+Verified from scratch: the three repos build clean in ~4 min on a desktop, so
+allow 10-15 on the Pi. `t2_indoor.repos` describes the same set if you prefer
+`vcs import src < src/px4-offboard-smc/t2_indoor.repos`, but plain clones are
+listed first because `vcs` is not installed everywhere.
+
+**You must overlay your existing workspace**, and the order above matters.
+`camera_ros` and `libcamera` are deliberately NOT in the new workspace, so the
+launch can only find them through the old one. Do not be tempted to
+`apt install ros-jazzy-camera-ros ros-jazzy-libcamera` instead: the apt libcamera
+is upstream, while a Raspberry Pi camera needs the Pi's own fork -- which is
+exactly what you built (`libcamera v0.5.2+rpt20250903`, `camera_ros` rel_05).
+Those two are consistent with each other and with a working camera; leave them
+alone.
 
 ## 2. Before anything is armed
 
@@ -49,10 +64,60 @@ ros2 topic echo /tf --once | grep -A3 platform      # must show `platform`
 # and watch the detector for: "The camera is not calibrated!"
 ```
 
+Reproduced deliberately on a machine without a calibration, so you know what it
+looks like -- note that the failure cascades and only the FIRST line names the
+real cause:
+
+```
+[camera_calibration_parsers] Unable to open camera calibration file [...1920x1080.yaml]
+[camera.camera] Camera calibration file ... not found
+[camera.rectify] Rectified topic '/camera/image_rect' requested but camera
+                 publishing '/camera/camera/camera_info' is uncalibrated
+```
+
+No rectified image means no detections, no `platform` TF, no EV, no position.
+
 **K vs P.** The detector gets the rectified image but the unrectified
 `camera_info`, and both it and this stack read `K`. Compare `k[0],k[4],k[2],k[5]`
 against `p[0],p[5],p[2],p[6]` in `/camera/camera/camera_info`. If they differ
 materially, that is a percent-level scale error on every range.
+
+**Check the camera feed before anything else.** Start it on its own:
+
+```bash
+ros2 launch apriltag_ros camera_36h11.launch.yml
+```
+
+then, in another terminal:
+
+```bash
+ros2 topic hz /camera/camera/image_raw          # expect ~15 Hz
+ros2 topic echo /camera/camera/camera_info --once
+ros2 topic echo /apriltag/detections            # tags, with corner pixels
+ros2 topic echo /tf --once | grep -A3 platform  # the transform the EV bridge needs
+```
+
+For an actual picture, headless over SSH:
+
+```bash
+ros2 run image_view image_saver --ros-args \
+  -r image:=/camera/image_rect -p filename_format:=/tmp/frame%04i.jpg
+```
+
+then look at `/tmp/frame0000.jpg`. With a display or X forwarding,
+`ros2 run rqt_image_view rqt_image_view` is easier.
+
+**Watch the camera_ros startup log for a resolution adjustment.** If the sensor
+cannot give exactly what the launch asks for, camera_ros silently picks the
+nearest and says so once:
+
+```
+stream configuration adjusted from "1920x1200-..." to "1920x1080-..."
+```
+
+That matters more than it looks: the calibration filename contains the
+resolution, so an adjusted stream looks for a calibration file that does not
+exist, and you get the uncalibrated chain below.
 
 **Link rate.**
 
