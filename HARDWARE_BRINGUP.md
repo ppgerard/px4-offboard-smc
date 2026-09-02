@@ -13,10 +13,22 @@ git clone git@github.com:ppgerard/apriltag_ros_enhanced.git
 git clone https://github.com/PX4/px4_msgs.git
 cd px4_msgs && git checkout 56f8019425a16af2941df5a9288834398681e394 && cd ../..
 
+cp -r ~/<OLD WORKSPACE>/src/camera_ros ~/t2_ws/src/       # see below
+
 source /opt/ros/jazzy/setup.bash
-source ~/<YOUR OLD WORKSPACE>/install/setup.bash    # camera_ros + libcamera, see below
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
+```
+
+**Do NOT source the old workspace.** It contains its own `px4_msgs` (release/1.15,
+which predates message versioning), and building or running with two different
+`px4_msgs` on `AMENT_PREFIX_PATH` is how you get code compiled against one struct
+layout loading the shared library of another. The layouts genuinely differ, so
+the failure is silent garbage in message fields rather than a link error. If you
+already built with it sourced, throw the build away and redo it in a clean shell:
+
+```bash
+cd ~/t2_ws && rm -rf build install log
 ```
 
 Verified from scratch: the three repos build clean in ~4 min on a desktop, so
@@ -24,14 +36,36 @@ allow 10-15 on the Pi. `t2_indoor.repos` describes the same set if you prefer
 `vcs import src < src/px4-offboard-smc/t2_indoor.repos`, but plain clones are
 listed first because `vcs` is not installed everywhere.
 
-**You must overlay your existing workspace**, and the order above matters.
-`camera_ros` and `libcamera` are deliberately NOT in the new workspace, so the
-launch can only find them through the old one. Do not be tempted to
-`apt install ros-jazzy-camera-ros ros-jazzy-libcamera` instead: the apt libcamera
-is upstream, while a Raspberry Pi camera needs the Pi's own fork -- which is
-exactly what you built (`libcamera v0.5.2+rpt20250903`, `camera_ros` rel_05).
-Those two are consistent with each other and with a working camera; leave them
-alone.
+**Copy `camera_ros` in; leave `libcamera` alone.** camera_ros is a normal ament
+package and finds libcamera through pkg-config
+(`pkg_check_modules(libcamera REQUIRED libcamera>=0.1)`), not through the
+workspace, so rebuilding it here produces an equivalent binary. Check what it will
+link against BEFORE building:
+
+```bash
+pkg-config --modversion libcamera        # expect 0.5.2 (the Pi's rpt build)
+pkg-config --variable=prefix libcamera
+```
+
+If that resolves to something else, fix `PKG_CONFIG_PATH` first -- silently
+relinking camera_ros against upstream libcamera loses Raspberry Pi camera support.
+
+Copying the **libcamera source** into `src/` does nothing: it has only
+`meson.build`, and colcon identifies packages by `package.xml` / `CMakeLists.txt`
+/ `setup.py`, so it is ignored outright. It has to stay a meson install.
+
+Do not `apt install ros-jazzy-camera-ros ros-jazzy-libcamera` as a shortcut: the
+apt libcamera is upstream, and a Raspberry Pi camera needs the Pi's fork.
+
+**Everything else comes from apt**, so no overlay is needed: `apriltag`,
+`apriltag_msgs`, `image_proc`, `camera_info_manager`, `cv_bridge`,
+`image_transport`, `image_view` are all in `/opt/ros/jazzy`.
+
+**Watch out for the apt `ros-jazzy-apriltag-ros`.** It has the same package name
+as `apriltag_ros_enhanced` and may already be installed. The workspace wins once
+sourced, but if you forget to `source install/setup.bash` you will silently get
+the apt one -- which has no `platform` frame support at all. Confirm with
+`ros2 pkg prefix apriltag_ros`; it must point at your workspace.
 
 ## 2. Before anything is armed
 
