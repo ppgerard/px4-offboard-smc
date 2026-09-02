@@ -30,6 +30,14 @@ ros2 topic list | grep fmu/out
 If `vehicle_local_position` has no `_v1`, set `topics_names.local_position_topic`
 in `config/exp/t2_hw_param.yaml`. Same for `status_topic`. No rebuild needed.
 
+**The camera calibration is keyed on the RESOLUTION.** camera_ros builds the
+calibration name as `<model>_<camera id>_<WIDTHxHEIGHT>` (CameraNode.cpp, "format
+camera name for calibration file"), so the file in `~/.ros/camera_info/` is
+resolution-specific and camera_info_manager does not rescale. Nothing needs doing
+to it when you clone a new workspace -- it lives outside the workspace -- **as
+long as the resolution stays 1920x1200**, which the launch file now pins. Change
+the resolution and you must recalibrate.
+
 **Camera calibration is a hard prerequisite.** The detector publishes the
 `platform` transform only when `calibrated` is true, and the EV bridge is built
 on that transform. No calibration means no platform TF, no external vision, and

@@ -4,12 +4,28 @@
 #   vcs import src < t2_indoor.repos
 #   colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 #
-# px4_msgs is pinned to release/1.16 to match the flashed firmware (v1.16.0-rc).
-# This is NOT cosmetic: the uXRCE-DDS client derives each topic's "_v<N>" suffix
-# from the FIRMWARE's own message version (generate_topic_name() appends nothing
-# when that version is 0), and it also decides the wire layout. A px4_msgs from a
-# different release subscribes to names that never deliver, or deserialises the
-# right bytes into the wrong fields. Neither failure announces itself.
+# px4_msgs is pinned to the exact commit the SITL work was validated against.
+# DO NOT change it without checking `ros2 topic list | grep fmu/out` first.
+#
+# The version has to match the FLASHED FIRMWARE, and the obvious choice is wrong.
+# release/1.16 looks right for a v1.16.0-rc firmware, but it declares
+# VehicleLocalPosition as MESSAGE_VERSION 0, which means the unversioned topic
+# name -- while the aircraft demonstrably publishes vehicle_local_position_v1.
+# The commit below declares it as 1, which matches. (The px4_msgs currently on
+# the Pi is release/1.15, which predates message versioning entirely and is
+# therefore older than the firmware it is talking to.)
+#
+# Two independent things depend on getting this right, and neither failure
+# announces itself: the uXRCE-DDS client derives each topic's "_v<N>" suffix from
+# the firmware's own message version (generate_topic_name() appends nothing when
+# that version is 0), so a mismatch subscribes to a name that never delivers; and
+# the struct layout must agree, or the right bytes land in the wrong fields.
+#
+# Known imperfect: this commit declares VehicleStatus as MESSAGE_VERSION 3. If
+# the aircraft publishes vehicle_status_v1 rather than _v3, the layouts differ
+# after nav_state_display -- which is harmless here ONLY because arming_state and
+# nav_state, the two fields this stack reads, both sit before that point. Check
+# the topic list and say so if it reads _v1.
 #
 # camera_ros and libcamera are deliberately ABSENT. The versions already built on
 # the Pi (camera_ros 7125869 "rel_05" against libcamera v0.5.2+rpt20250903) are
@@ -27,4 +43,4 @@ repositories:
   px4_msgs:
     type: git
     url: https://github.com/PX4/px4_msgs.git
-    version: release/1.16
+    version: 56f8019425a16af2941df5a9288834398681e394
