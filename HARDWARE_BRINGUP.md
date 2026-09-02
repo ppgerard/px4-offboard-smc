@@ -239,6 +239,63 @@ controller reads — measured in SITL as a 49 m departure while the estimate
 reported a perfect hold. Keep a finger on the mode switch and rehearse "tag out
 of frame" as an abort.
 
+## Pre-flight checklist
+
+Grouped by risk, not by convenience. Everything in A is done with props OFF.
+
+### A. Bench, powered, props off
+
+- [ ] `ros2 topic list | grep fmu/out` -- confirm the `_v<N>` suffixes match
+      `topics_names.*` in the yaml (`vehicle_local_position_v1` confirmed; check
+      `vehicle_status` too).
+- [ ] `ros2 pkg prefix apriltag_ros` points at the workspace, not `/opt/ros/jazzy`.
+- [ ] `ros2 topic hz /fmu/out/vehicle_odometry` -- wants >=100 Hz. This is the
+      controller's input; below that the loop is starved.
+- [ ] `camera_info`: width/height really 1920x1200 (no "stream configuration
+      adjusted" line), and `k[]` vs `p[]` compared.
+- [ ] **Tag size measured with a ruler** -- the black square's outer edge, not the
+      printed sheet. PnP range scales linearly with it.
+- [ ] `/landing/tag_in_body` signs, with `camera_only:=true`. This is the only
+      end-to-end check of `R_b_cam`; the detector-level TF check validates the
+      camera but not the body rotation.
+- [ ] **`camera_offset_body.z`**, now checkable since the scale is right: park the
+      aircraft at a known height over the tag and compare the tag-derived range
+      against `/fmu/out/distance_sensor`. They should agree once the lidar/camera
+      lever arm is accounted for. A residual difference IS the offset error.
+- [ ] **Tilt servos**: arm into offboard, props off, and confirm BOTH tilts move.
+      They are on Servo 4 and 5 (`tilt_1_servo_index: 3`, `tilt_2_servo_index: 4`)
+      because `CA_SV_CS_COUNT` is 3 on this aircraft. If one sits still while the
+      other tracks, the indices are wrong -- and differential tilt is the yaw axis.
+- [ ] **Tilt travel**: command -1 / 0 / +1 and measure the physical angle with an
+      inclinometer. `CA_SV_TL*_MINA/MAXA` are NOT applied in direct-actuator mode,
+      so `tilt_min_deg`/`tilt_max_deg` must match what the servo physically does.
+- [ ] `/landing/wrench` responds in the right sense when you tilt the airframe by
+      hand. It publishes before the offboard gate, so nothing needs to be armed.
+- [ ] PX4 parameter block above applied.
+
+### B. Manual flight, RC only, no offboard
+
+- [ ] Hover in Altitude mode and **keep the ULog**. Read the steady
+      `actuator_motors` value: this config predicts **~0.65**, and it is the
+      single most likely thing to be wrong, because `omega_to_pwm_coefficient` is
+      still the x500's. A large discrepancy means the aircraft will jump or sag at
+      handover. Correct `x_0` so the curve passes through the measured point.
+- [ ] While hovering over the tag, confirm the estimator has actually taken the
+      tag: `cs_ev_pos: True` in `estimator_status_flags`, `xy_valid: True`, and
+      sane innovations in `estimator_aid_src_ev_pos`.
+- [ ] **Position mode, then let go of the sticks.** No offboard, none of this
+      project's control code. If it cannot hold here, the estimate is the problem
+      and nothing measured afterwards means anything.
+
+### C. Offboard
+
+- [ ] `controller_type:=px4` hold, then `enable_steps:=true`.
+- [ ] `controller_type:=stsmc` hold, then steps.
+
+Losing the tag loses the whole horizontal estimate, mid-flight, with no warning on
+any topic the controller reads. Rehearse it as an abort: hand back to Altitude
+mode on the RC.
+
 ## Still open
 
 - Hover once and compare the steady `actuator_motors` value against the ~0.65
