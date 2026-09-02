@@ -73,6 +73,20 @@ public:
     // Vehicle-specific AprilTag/camera mounting parameters. Values below are
     // declared with the previous t2 defaults; override per-vehicle via
     // config/uav_parameters/{t2,x500}_param.yaml (landing_parameters.*).
+    // PX4 topic names carry a MESSAGE VERSION SUFFIX, and it is derived from the
+    // FIRMWARE's own message definition, not from px4_msgs: generate_topic_name()
+    // appends "_v<N>" when the version is non-zero and NOTHING when it is 0. The
+    // versions differ between PX4 releases -- the SITL tree here publishes
+    // vehicle_local_position_v1, while px4_msgs release/1.16 (matching the
+    // vehicle's v1.16.0-rc firmware) declares that message as version 0, i.e. no
+    // suffix at all. Subscribing to the wrong name is silent: the topic simply
+    // never delivers, and dist_bottom / the offboard gate quietly stop existing.
+    //
+    // Check on the aircraft with `ros2 topic list | grep fmu/out` and set these to
+    // match, rather than rebuilding.
+    this->declare_parameter("topics_names.status_topic", "/fmu/out/vehicle_status_v1");
+    this->declare_parameter("topics_names.local_position_topic",
+                            "/fmu/out/vehicle_local_position_v1");
     this->declare_parameter("landing_parameters.camera_frame_id", "t2_cruza_vtol_0/camera_link/imager");
     this->declare_parameter("landing_parameters.platform_frame_id", "platform");
     this->declare_parameter("landing_parameters.world_frame_id", "world");
@@ -209,11 +223,15 @@ public:
     // Touchdown detection and disarm confirmation for the terminal descent
     land_detected_sub_ = this->create_subscription<px4_msgs::msg::VehicleLandDetected>
         ("/fmu/out/vehicle_land_detected", qos, std::bind(&LandingTrajectoryNodeBase::landDetectedCallback, this, std::placeholders::_1));
+    const std::string status_topic =
+        this->get_parameter("topics_names.status_topic").as_string();
+    const std::string local_position_topic =
+        this->get_parameter("topics_names.local_position_topic").as_string();
     vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>
-        ("/fmu/out/vehicle_status_v1", qos, std::bind(&LandingTrajectoryNodeBase::vehicleStatusCallback, this, std::placeholders::_1));
+        (status_topic, qos, std::bind(&LandingTrajectoryNodeBase::vehicleStatusCallback, this, std::placeholders::_1));
     // Rangefinder-derived height above terrain, for the altitude correction below.
     local_position_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
-        ("/fmu/out/vehicle_local_position_v1", qos, std::bind(&LandingTrajectoryNodeBase::localPositionCallback, this, std::placeholders::_1));
+        (local_position_topic, qos, std::bind(&LandingTrajectoryNodeBase::localPositionCallback, this, std::placeholders::_1));
     // The RAW beam, for the EKF. dist_bottom above is EKF2's terrain estimate --
     // the same beam, already fused and filtered -- and consuming both would have
     // the EKF treat two outputs of one filter as independent evidence. See

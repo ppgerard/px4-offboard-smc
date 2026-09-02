@@ -82,6 +82,12 @@ class IndoorHoverNode : public rclcpp::Node {
     // once would have PX4 acting on whichever OffboardControlMode arrived last,
     // so the launch file does not start the controller in this mode.
     use_px4_controller_ = this->declare_parameter<bool>("hover.use_px4_controller", false);
+    // See the note in landing_trajectory_base.h: the "_v<N>" suffix comes from the
+    // FIRMWARE's message version, is absent when that version is 0, and differs
+    // between PX4 releases. A wrong name here means offboard entry is never
+    // detected, so the profile never engages and the reference never latches.
+    const std::string status_topic = this->declare_parameter<std::string>(
+        "topics_names.status_topic", "/fmu/out/vehicle_status_v1");
 
     buildSequence();
 
@@ -92,7 +98,7 @@ class IndoorHoverNode : public rclcpp::Node {
         "/fmu/out/vehicle_odometry", qos,
         std::bind(&IndoorHoverNode::odometryCallback, this, std::placeholders::_1));
     status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
-        "/fmu/out/vehicle_status_v1", qos,
+        status_topic, qos,
         std::bind(&IndoorHoverNode::statusCallback, this, std::placeholders::_1));
 
     publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>(
