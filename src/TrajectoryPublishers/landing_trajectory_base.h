@@ -58,6 +58,7 @@
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include "px4_offboard_lowlevel/camera_extrinsics.h"
 #include "px4_offboard_lowlevel/control_config.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
 #include "diagnostics_publisher.h"
@@ -87,6 +88,8 @@ public:
     this->declare_parameter("topics_names.status_topic", "/fmu/out/vehicle_status_v1");
     this->declare_parameter("topics_names.local_position_topic",
                             "/fmu/out/vehicle_local_position_v1");
+    this->declare_parameter("landing_parameters.camera_rotation_z_deg", 90.0);
+    this->declare_parameter("landing_parameters.camera_rotation_x_deg", 180.0);
     this->declare_parameter("landing_parameters.camera_frame_id", "t2_cruza_vtol_0/camera_link/imager");
     this->declare_parameter("landing_parameters.platform_frame_id", "platform");
     this->declare_parameter("landing_parameters.world_frame_id", "world");
@@ -298,9 +301,14 @@ public:
     // written to mirror this same constant, so the error cancelled there and
     // only ever appeared against a real camera. Measured before the fix: the
     // estimate read [-1.93 -1.23 2.69] with the vehicle truly at [1.99 0.90 3.04].
-    Eigen::AngleAxisd rot_z(M_PI / 2.0, Eigen::Vector3d::UnitZ());
-    Eigen::AngleAxisd rot_x(M_PI, Eigen::Vector3d::UnitX());
-    R_b_cam_ = (rot_x * rot_z).toRotationMatrix();
+    // Built from the SAME parameters and the SAME helper as tag_ev_bridge_node.
+    // It was hardcoded here while the bridge read the parameters, which meant
+    // changing camera_rotation_*_deg silently moved the estimator's input without
+    // moving the guidance that consumes its output -- two copies of a camera
+    // rotation, which is the exact failure the 180 deg bug above was.
+    R_b_cam_ = px4_offboard::bodyFromCameraOptical(
+        this->get_parameter("landing_parameters.camera_rotation_z_deg").as_double(),
+        this->get_parameter("landing_parameters.camera_rotation_x_deg").as_double());
 
     // Initialize Phase 1
     phase_ = Phase::PHASE_1;
