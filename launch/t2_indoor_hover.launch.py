@@ -1,4 +1,4 @@
-"""Indoor / no-GNSS STSMC hover test.
+"""Indoor / no-GNSS hover test, flyable with the SMC/STSMC or with PX4's own controller.
 
 Three nodes and nothing else:
 
@@ -21,8 +21,10 @@ parameter block, and set the same values on the vehicle:
   EKF2_EV_CTRL 1      bit 0, horizontal position only -- height stays on
                       baro/rangefinder, which do not need GNSS
   EKF2_GPS_CTRL 0     no GNSS indoors
-  EKF2_HGT_REF 0      baro reference; range as an AID (EKF2_RNG_CTRL 2), never as
-                      the reference -- CLAUDE.md records that fly-away
+  EKF2_HGT_REF 2      rangefinder as the height reference, baro as an aid. Baro
+                      as the reference was measured drifting 0.6 m over a 60 s
+                      hover and flew the aircraft into the ground while the
+                      estimate read 0.70 m.
   EKF2_EV_DELAY       the measured camera+detector latency, in ms
 """
 
@@ -35,6 +37,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -50,7 +53,11 @@ def generate_launch_description():
         DeclareLaunchArgument('mode', default_value='sitl',
                               description='sitl or hw'),
         DeclareLaunchArgument('controller_type', default_value='stsmc',
-                              description='smc or stsmc'),
+                              description="smc, stsmc, or 'px4' to fly the identical "
+                                          "profile with PX4's own position controller. "
+                                          "Fly px4 FIRST on any new airframe: it separates "
+                                          "'is the estimate good enough' from 'is the "
+                                          "control law good enough'."),
         DeclareLaunchArgument('enable_steps', default_value='false',
                               description='Run the step sequence after the hold. '
                                           'Leave false for a first flight.'),
@@ -63,8 +70,13 @@ def generate_launch_description():
     ]
 
     mode = LaunchConfiguration('mode')
-    is_sitl = EqualsSubstitution(mode, 'sitl')
-    is_hw = PythonExpression(["'", mode, "' != 'sitl'"])
+    ctrl = LaunchConfiguration('controller_type')
+    # PX4's own controller and offboard_controller_node are mutually exclusive:
+    # one publishes OffboardControlMode with position=true, the other with
+    # direct_actuator=true, and PX4 acts on whichever arrived last.
+    use_px4 = PythonExpression(["'", ctrl, "' == 'px4'"])
+    is_sitl = PythonExpression(["'", mode, "' == 'sitl' and '", ctrl, "' != 'px4'"])
+    is_hw = PythonExpression(["'", mode, "' != 'sitl' and '", ctrl, "' != 'px4'"])
 
     def controller(config_uav, config_topics, condition):
         return Node(
@@ -99,8 +111,9 @@ def generate_launch_description():
             executable='indoor_hover_node',
             name='indoor_hover',
             parameters=[{
-                'hover.altitude': LaunchConfiguration('altitude'),
-                'hover.enable_steps': LaunchConfiguration('enable_steps'),
+                'hover.altitude': ParameterValue(LaunchConfiguration('altitude'), value_type=float),
+                'hover.enable_steps': ParameterValue(LaunchConfiguration('enable_steps'), value_type=bool),
+                'hover.use_px4_controller': ParameterValue(use_px4, value_type=bool),
             }],
             output='screen',
         ),

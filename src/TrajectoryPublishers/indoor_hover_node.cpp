@@ -42,6 +42,8 @@
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
 
 #include "px4_offboard_lowlevel/control_config.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
@@ -68,6 +70,18 @@ class IndoorHoverNode : public rclcpp::Node {
     // "went there".
     max_radius_ = this->declare_parameter<double>("hover.max_radius", 0.8);
     max_altitude_ = this->declare_parameter<double>("hover.max_altitude", 2.0);
+    // Fly the identical profile with PX4'S OWN position controller instead of the
+    // SMC: same hold point, same steps, same timing, same estimator underneath.
+    // That is what makes the two comparable -- and it is the order to fly them
+    // in, because if PX4 cannot hold station on this estimate then nothing
+    // measured about the SMC afterwards means anything.
+    //
+    // The two paths are mutually exclusive by construction: here we publish
+    // OffboardControlMode with position=true and a TrajectorySetpoint, while
+    // offboard_controller_node publishes direct_actuator=true. Both streaming at
+    // once would have PX4 acting on whichever OffboardControlMode arrived last,
+    // so the launch file does not start the controller in this mode.
+    use_px4_controller_ = this->declare_parameter<bool>("hover.use_px4_controller", false);
 
     buildSequence();
 
@@ -83,6 +97,16 @@ class IndoorHoverNode : public rclcpp::Node {
 
     publisher_ = this->create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>(
         "command/trajectory", 10);
+
+    if (use_px4_controller_) {
+      offboard_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>(
+          "/fmu/in/offboard_control_mode", 10);
+      setpoint_pub_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>(
+          "/fmu/in/trajectory_setpoint", 10);
+      offboard_timer_ = this->create_wall_timer(
+          std::chrono::duration<double>(0.33),
+          std::bind(&IndoorHoverNode::publishOffboardControlMode, this));
+    }
 
     timer_ = this->create_wall_timer(
         std::chrono::duration<double>(px4_offboard::kControlPeriodSeconds),
@@ -262,6 +286,26 @@ class IndoorHoverNode : public rclcpp::Node {
     point.velocities[0].linear.y = velocity(1);
     point.velocities[0].linear.z = velocity(2);
 
+    if (use_px4_controller_) {
+      // PX4 wants NED. r_position/r_velocity here are ENU, and the yaw is an ENU
+      // heading (x-axis East); PX4's yaw is NED (x-axis North), so the two differ
+      // by 90 degrees. Getting that wrong is a quarter turn, not noise.
+      px4_msgs::msg::TrajectorySetpoint sp{};
+      const Eigen::Vector3d p_ned = px4_frames::rotateVectorFromToENU_NED(position);
+      const Eigen::Vector3d v_ned = px4_frames::rotateVectorFromToENU_NED(velocity);
+      sp.position = {static_cast<float>(p_ned(0)), static_cast<float>(p_ned(1)),
+                     static_cast<float>(p_ned(2))};
+      sp.velocity = {static_cast<float>(v_ned(0)), static_cast<float>(v_ned(1)),
+                     static_cast<float>(v_ned(2))};
+      const float nan = std::nanf("1");
+      sp.acceleration = {nan, nan, nan};
+      sp.jerk = {nan, nan, nan};
+      sp.yaw = static_cast<float>(M_PI / 2.0 - yaw);
+      sp.yawspeed = nan;
+      sp.timestamp = static_cast<uint64_t>(this->now().nanoseconds() / 1000);
+      setpoint_pub_->publish(sp);
+    }
+
     // No accelerations field, deliberately. r_a enters I_a_d at full authority
     // (49.7 N per metre of reference jump through the legacy path), and a
     // constant-velocity slew has no acceleration worth feeding forward. Leaving
@@ -272,6 +316,23 @@ class IndoorHoverNode : public rclcpp::Node {
     publisher_->publish(point);
   }
 
+  void publishOffboardControlMode() {
+    px4_msgs::msg::OffboardControlMode msg{};
+    msg.position = true;
+    msg.velocity = true;
+    msg.acceleration = false;
+    msg.attitude = false;
+    msg.body_rate = false;
+    msg.thrust_and_torque = false;
+    msg.direct_actuator = false;
+    msg.timestamp = static_cast<uint64_t>(this->now().nanoseconds() / 1000);
+    offboard_mode_pub_->publish(msg);
+    RCLCPP_INFO_ONCE(this->get_logger(),
+                     "Flying with PX4's OWN position controller (offboard position setpoints). "
+                     "offboard_controller_node must NOT be running.");
+  }
+
+  bool use_px4_controller_ = false;
   double altitude_ = 1.2;
   double centre_x_ = 0.0;
   double centre_y_ = 0.0;
@@ -300,6 +361,9 @@ class IndoorHoverNode : public rclcpp::Node {
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr status_sub_;
   rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr publisher_;
+  rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_mode_pub_;
+  rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;
+  rclcpp::TimerBase::SharedPtr offboard_timer_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
