@@ -127,6 +127,21 @@ class TagEvBridgeNode : public rclcpp::Node {
     // quiet in the situation they exist to explain.
     ev_position_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>(
         "/landing/ev_position", 10);
+    // The tag's position in BODY FLU, before any world rotation. This is the
+    // topic that validates R_b_cam, and it is the only one that can: it does not
+    // pass through R_W_B, so it is independent of the vehicle's heading and of
+    // whatever the magnetometer thinks north is. /landing/ev_position cannot do
+    // the job -- a heading error and a camera-rotation error look identical there.
+    //
+    // Ground check, no flight needed. Park the aircraft over the tag and read it,
+    // then move the AIRCRAFT (not the tag) in a known BODY direction:
+    //   directly above the tag  ->  [ 0,  0, -h ]
+    //   moved 0.5 m FORWARD     ->  x goes to -0.5  (the tag is now behind you)
+    //   moved 0.5 m LEFT        ->  y goes to -0.5  (the tag is now to your right)
+    // Wrong signs on BOTH lateral axes is the 180 deg boresight error that cost
+    // this project three roadmap items. One axis wrong is a 90 deg error.
+    tag_body_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>(
+        "/landing/tag_in_body", 10);
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -270,6 +285,12 @@ class TagEvBridgeNode : public rclcpp::Node {
       return;
     }
 
+    geometry_msgs::msg::Vector3 body_diag;
+    body_diag.x = r_plat_b_b(0);
+    body_diag.y = r_plat_b_b(1);
+    body_diag.z = r_plat_b_b(2);
+    tag_body_pub_->publish(body_diag);
+
     geometry_msgs::msg::Vector3 diag;
     diag.x = p_enu(0);
     diag.y = p_enu(1);
@@ -362,6 +383,7 @@ class TagEvBridgeNode : public rclcpp::Node {
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
   rclcpp::Publisher<px4_msgs::msg::VehicleOdometry>::SharedPtr ev_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr ev_position_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr tag_body_pub_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::TimerBase::SharedPtr timer_;

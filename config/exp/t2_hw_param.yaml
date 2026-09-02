@@ -19,7 +19,7 @@
       # external-force observer absorbs the error up to kFextMaxHoverFraction
       # (30% of weight) before it saturates -- so a 5% error is not dangerous,
       # but it is a permanent feedforward bias standing in for nothing.
-      mass: 2.486
+      mass: 2.387
       arm_length: 0.25             # NOT USED for num_of_arms 3
       num_of_arms: 3
       # FROM CAD, and confirmed against it: the diagonal matches the mass
@@ -106,7 +106,7 @@
       # PWM_MAIN_MIN<n> and +1 is PWM_MAIN_MAX<n>. What these numbers must match
       # is the PHYSICAL angle at those two PWM values. Command -1, 0 and +1 with
       # the props off and measure the tilt with an inclinometer.
-      tilt_min_deg: -5.0
+      tilt_min_deg: -6.5
       tilt_max_deg: 90.0
 
     landing_parameters:
