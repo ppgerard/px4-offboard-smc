@@ -82,6 +82,19 @@ class IndoorHoverNode : public rclcpp::Node {
     // once would have PX4 acting on whichever OffboardControlMode arrived last,
     // so the launch file does not start the controller in this mode.
     use_px4_controller_ = this->declare_parameter<bool>("hover.use_px4_controller", false);
+    // Where the hold point IS.
+    //
+    //   "engage" (default) -- the vehicle's own XY at the moment offboard is
+    //                         entered. Hand over anywhere and it holds THERE.
+    //   "origin"           -- the fixed hover.centre_x/y in the EKF local frame,
+    //                         which indoors with the tag as EV is the pad.
+    //
+    // The default is "engage" because "origin" has a nasty outdoor failure mode:
+    // the local origin is wherever EKF2 initialised, so handing over 30 m away
+    // means the aircraft immediately sets off back to it at hover.slew_speed. In
+    // SITL the two are the same point and the behaviour is identical, which is
+    // exactly why this needed catching by reading rather than by testing.
+    centre_mode_ = this->declare_parameter<std::string>("hover.centre_mode", "engage");
     // See the note in landing_trajectory_base.h: the "_v<N>" suffix comes from the
     // FIRMWARE's message version, is absent when that version is 0, and differs
     // between PX4 releases. A wrong name here means offboard entry is never
@@ -169,14 +182,18 @@ class IndoorHoverNode : public rclcpp::Node {
       // identity heading would slew it to magnetic East.
       held_yaw_ = yawOf(orientation_);
       reference_ = drone_position_;
+      if (centre_mode_ != "origin") {
+        centre_x_ = drone_position_(0);
+        centre_y_ = drone_position_(1);
+      }
       sequence_index_ = 0;
       phase_start_ = this->now();
       engaged_ = true;
       RCLCPP_INFO(this->get_logger(),
                   "Offboard engaged: holding heading %.1f deg, reference seeded at "
-                  "[%.2f %.2f %.2f], target [%.2f %.2f %.2f].",
+                  "[%.2f %.2f %.2f], centre (%s) [%.2f %.2f], target altitude %.2f m.",
                   held_yaw_ * 180.0 / M_PI, reference_(0), reference_(1), reference_(2),
-                  centre_x_, centre_y_, altitude_);
+                  centre_mode_.c_str(), centre_x_, centre_y_, altitude_);
     }
     if (!offboard && offboard_active_) {
       RCLCPP_WARN(this->get_logger(), "Left offboard; holding the profile until re-engaged.");
@@ -339,6 +356,7 @@ class IndoorHoverNode : public rclcpp::Node {
   }
 
   bool use_px4_controller_ = false;
+  std::string centre_mode_ = "engage";
   double altitude_ = 1.2;
   double centre_x_ = 0.0;
   double centre_y_ = 0.0;
