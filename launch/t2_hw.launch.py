@@ -1,6 +1,6 @@
-"""Everything the real T2 needs indoors, in one launch.
+"""Everything the real T2 needs, in one launch. Indoors or outdoors.
 
-    ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py
+    ros2 launch px4_offboard_lowlevel t2_hw.launch.py
 
 Brings up, in this order:
 
@@ -10,7 +10,13 @@ Brings up, in this order:
   tag_ev_bridge_node        platform TF -> /fmu/in/vehicle_visual_odometry, so
                             EKF2 has a horizontal aiding source at all
   offboard_controller_node  the SMC/STSMC   (skipped when controller_type:=px4)
-  indoor_hover_node         the bounded hold-and-step profile
+  the trajectory source     indoor_hover_node (hold + steps), landing_trajectory_node
+                            (the real landing) or px4_offboard_landing_node (the
+                            same landing flown by PX4's own position controller)
+
+OUTDOORS, with GNSS: pass ev_bridge:=false and restore EKF2_GPS_CTRL 7,
+EKF2_EV_CTRL 0, EKF2_HGT_REF 1, NAV_RCL_ACT 2. That is the configuration every
+result in CLAUDE.md was measured with.
 
 It does NOT start the uXRCE-DDS agent -- that belongs to the link, not to this
 stack, and it has to be up before anything here is useful:
@@ -75,6 +81,13 @@ def generate_launch_description():
                                           'controller, no setpoints, nothing that can '
                                           'command the aircraft. This is the extrinsic '
                                           'check of step 1.'),
+        DeclareLaunchArgument('trajectory', default_value='hover',
+                              description='hover (hold + optional steps), landing (the '
+                                          'SMC/STSMC landing) or px4_landing (the same '
+                                          'landing guidance flown by PX4 itself).'),
+        DeclareLaunchArgument('estimator', default_value='ekf',
+                              description='Landing estimator that STEERS: ekf, '
+                                          'complementary or ekf_pose. Both always run.'),
         DeclareLaunchArgument('device', default_value='0',
                               description='camera_ros device index'),
         DeclareLaunchArgument('ev_bridge', default_value='true',
@@ -89,9 +102,20 @@ def generate_launch_description():
 
     # camera_only wins over everything: it must not be possible to ask for the
     # extrinsic check and get a node that publishes setpoints as well.
-    fly = PythonExpression(["'", camera_only, "' != 'true'"])
-    run_smc = PythonExpression(
-        ["'", camera_only, "' != 'true' and '", ctrl, "' != 'px4'"])
+    traj = LaunchConfiguration('trajectory')
+    armed = PythonExpression(["'", camera_only, "' != 'true'"])
+
+    def when(expr):
+        return IfCondition(PythonExpression(["'", camera_only, "' != 'true' and (", expr, ")"]))
+
+    # The controller is skipped for px4_landing (which sends TrajectorySetpoints
+    # straight to PX4) and for controller_type:=px4 -- in both cases PX4 flies, and
+    # running ours too would have two sources publishing OffboardControlMode.
+    run_smc = when(PythonExpression(
+        ["'", traj, "' != 'px4_landing' and '", ctrl, "' != 'px4'"]))
+    run_hover = when(PythonExpression(["'", traj, "' == 'hover'"]))
+    run_landing = when(PythonExpression(["'", traj, "' == 'landing'"]))
+    run_px4_landing = when(PythonExpression(["'", traj, "' == 'px4_landing'"]))
 
     return LaunchDescription(args + [
         IncludeLaunchDescription(
@@ -112,7 +136,7 @@ def generate_launch_description():
             executable='offboard_controller_node',
             name='offboard_controller',
             parameters=[hw_uav, hw_topics, gains, {'controller_type': ctrl}],
-            condition=IfCondition(run_smc),
+            condition=run_smc,
             output='screen',
         ),
         Node(
@@ -127,7 +151,25 @@ def generate_launch_description():
                 'hover.use_px4_controller': ParameterValue(
                     PythonExpression(["'", ctrl, "' == 'px4'"]), value_type=bool),
             }],
-            condition=IfCondition(fly),
+            condition=run_hover,
+            output='screen',
+        ),
+        Node(
+            package='px4_offboard_lowlevel',
+            executable='landing_trajectory_node',
+            name='landing_trajectory_publisher',
+            parameters=[hw_uav, hw_topics,
+                        {'landing_parameters.estimator': LaunchConfiguration('estimator')}],
+            condition=run_landing,
+            output='screen',
+        ),
+        Node(
+            package='px4_offboard_lowlevel',
+            executable='px4_offboard_landing_node',
+            name='px4_offboard_trajectory_publisher',
+            parameters=[hw_uav, hw_topics,
+                        {'landing_parameters.estimator': LaunchConfiguration('estimator')}],
+            condition=run_px4_landing,
             output='screen',
         ),
     ])

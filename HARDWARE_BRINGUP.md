@@ -210,7 +210,7 @@ Leave the RC failsafe and the kill switch alone.
 
 ```bash
 MicroXRCEAgent serial --dev /dev/ttyAMA0 -b 921600        # adjust to your wiring
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py camera_only:=true
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py camera_only:=true
 ros2 topic echo /landing/tag_in_body
 ```
 
@@ -229,7 +229,7 @@ Fix with `camera_rotation_z_deg` / `camera_rotation_x_deg` in the yaml.
 ## 5. Bench, props off
 
 ```bash
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py controller_type:=stsmc
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py controller_type:=stsmc
 ros2 topic echo /landing/wrench          # published before the offboard gate
 ```
 
@@ -248,14 +248,14 @@ horizontal aiding during the climb. Confirm `xy_valid` before handing over.
 
 ```bash
 # 1  PX4's own controller holds station on the tag
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py controller_type:=px4
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py controller_type:=px4
 
 # 2  same, with steps
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py controller_type:=px4 enable_steps:=true
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py controller_type:=px4 enable_steps:=true
 
 # 3  the STSMC
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py controller_type:=stsmc
-ros2 launch px4_offboard_lowlevel t2_hw_indoor.launch.py controller_type:=stsmc enable_steps:=true
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py controller_type:=stsmc
+ros2 launch px4_offboard_lowlevel t2_hw.launch.py controller_type:=stsmc enable_steps:=true
 ```
 
 Step 1 is the one not to skip: it uses none of this project's control code, so if
