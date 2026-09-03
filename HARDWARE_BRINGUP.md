@@ -162,6 +162,35 @@ ros2 topic hz /fmu/in/actuator_motors       # confirms we publish at 100 Hz
 
 ## 3. PX4 parameters
 
+### Outdoors, with GNSS
+
+This is the configuration every result in CLAUDE.md was measured with, so it is
+the better-validated one. Restore these four:
+
+| parameter | indoor value | **outdoor** | why |
+|---|---|---|---|
+| `EKF2_GPS_CTRL` | 0 | **7** | GNSS fusion back on |
+| `EKF2_EV_CTRL` | 1 | **0** | the tag is not the position source any more |
+| `EKF2_HGT_REF` | 2 (range) | **1** (GPS) | what the SITL work used; range stays an AID |
+| `NAV_RCL_ACT` | 3 (Land) | **2** (Return) | RTL is the right RC-loss action outdoors |
+
+And launch with `ev_bridge:=false`, so the bridge is not publishing into a topic
+nothing fuses.
+
+**Keep these at their new values -- they are not indoor-specific:**
+
+| parameter | value | why it stays |
+|---|---|---|
+| `EKF2_RNG_CTRL` | **2** | conditional aiding drops out above `EKF2_RNG_A_VMAX` = 1.0 m/s, which is exactly Phase 1's `max_velocity_xy_` -- it flickered through every approach |
+| `EKF2_RNG_POS_X/Y/Z` | measured | a physical lever arm; still unmeasured on this vehicle |
+| `COM_DISARM_LAND` | **0** | the land detector is meaningless in offboard direct-actuator mode, GNSS or not |
+| `EKF2_OF_CTRL` | **0** | no flow sensor is fitted either way |
+
+`EKF2_EVP_NOISE` and `EKF2_EV_DELAY` stop mattering once `EKF2_EV_CTRL` is 0;
+leave them wherever they are.
+
+### Indoors, no GNSS
+
 ```
 EKF2_EV_CTRL 1        bit 0 only: horizontal position
 EKF2_GPS_CTRL 0       no GNSS indoors

@@ -77,6 +77,11 @@ def generate_launch_description():
                                           'check of step 1.'),
         DeclareLaunchArgument('device', default_value='0',
                               description='camera_ros device index'),
+        DeclareLaunchArgument('ev_bridge', default_value='true',
+                              description='Feed the tag to EKF2 as external vision. '
+                                          'Set FALSE outdoors, where GNSS is the position '
+                                          'source and EKF2_EV_CTRL is 0 -- the bridge would '
+                                          'just be publishing into a topic nothing fuses.'),
     ]
 
     ctrl = LaunchConfiguration('controller_type')
@@ -99,6 +104,7 @@ def generate_launch_description():
             executable='tag_ev_bridge_node',
             name='tag_ev_bridge',
             parameters=[hw_uav],
+            condition=IfCondition(LaunchConfiguration('ev_bridge')),
             output='screen',
         ),
         Node(
