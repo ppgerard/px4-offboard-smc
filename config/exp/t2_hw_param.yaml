@@ -127,7 +127,7 @@
       camera_offset_body:
         x: 0.0
         y: 0.0
-        z: -0.10
+        z: 0.0
       # VERIFY AGAINST THE REAL MOUNTING. These two angles build R_b_cam (see
       # camera_extrinsics.h) and default to the SITL mounting. A 180 deg error
       # about the boresight here inverts BOTH lateral axes, which reads as the
@@ -145,14 +145,14 @@
       # runs in namespace "apriltag" (-> /apriltag/detections) and camera_ros in
       # namespace "camera" with node name "camera" (-> /camera/camera/camera_info).
       #
-      # NOTE ON K vs P. The detector is fed the RECTIFIED image from
-      # image_proc::RectifyNode but the UNRECTIFIED camera_info, and both it and
-      # this node read K. For a rectified image the correct intrinsics are P. If
-      # the lens has real distortion those differ by a few percent, which is a
-      # straight scale error on every range and position. Check with
-      #   ros2 topic echo /camera/camera/camera_info --once
-      # and compare k[0], k[4], k[2], k[5] against p[0], p[5], p[2], p[6]. If they
-      # differ materially, republish a camera_info whose K equals P.
+      # NOTE ON K vs P -- RESOLVED, nothing to do here. This used to be a real
+      # scale error: the detector was fed the RECTIFIED image (whose intrinsics
+      # are P) while this node read K, and on this lens they differ by 3-4%
+      # (K fx 1698.8 cx 1129.1, P fx 1749.7 cx 1142.6). The detector now runs
+      # on the RAW image and undistorts the four corners into K's frame, so the
+      # corners on /apriltag/detections and the K this node reads describe the
+      # same camera. Reading K here is now the correct thing to do -- do not
+      # "fix" it to P, and do not republish a camera_info whose K equals P.
       detections_topic: "/apriltag/detections"
       camera_info_topic: "/camera/camera/camera_info"
       # MEASURE. The lidar is a Benewake TFmini (SENS_TFMINI_CFG 103) on this
@@ -161,13 +161,23 @@
       # EKF2_RNG_CTRL 1 (conditional) -- the same two defects the SITL work found
       # and fixed, still present here. Set the lever arm and use 2 (always on).
       rangefinder_offset_body:
-        x: 0.10
+        x: 0.15
         y: 0.0
-        z: -0.145
+        z: 0.0
 
       tag_ids: [2, 1]
       tag_families: ["Custom48h12", "36h11"]
-      tag_sizes: [0.6, 0.16]
+      # MUST MATCH cfg/tags_36h11.yaml in apriltag_ros_enhanced. The two
+      # families do not measure their size the same way: what the size means is
+      # whatever the four detected corners span, which is the family's
+      # width_at_border out of total_width. 36h11 is 8/10, the OUTER edge of
+      # the black square. Custom48h12 is 6/10 with a reversed border, so it is
+      # the INNER white square -- the inside of the black border -- and its
+      # data bits sit outside that, which makes the printed tag look far
+      # bigger. One cell here is 5.83 cm: inner square 0.35, black extent
+      # 0.467, whole sheet 0.583. 0.467 was measured off the black and put
+      # tag_48 at 1.134 m while the coplanar tag_36 read 0.834 m.
+      tag_sizes: [0.35, 0.091]
       tag_positions_x: [0.0, 0.0]
       tag_positions_y: [0.0, 0.0]
       tag_positions_z: [0.0, 0.0]
