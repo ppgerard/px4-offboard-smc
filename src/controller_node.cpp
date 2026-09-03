@@ -241,6 +241,20 @@ void ControllerNode::loadParams() {
         tilt_1_servo_index_ = 4;
         tilt_2_servo_index_ = 5;
     }
+    // Announce the tilt configuration at startup. Not decoration: the yaw sign
+    // is invisible in flight until the aircraft spins, and a yaml that says -1
+    // proves nothing if the BINARY predates the parameter. This line is the only
+    // evidence that the value reached the code -- it cost a bench test to learn.
+    RCLCPP_INFO(this->get_logger(),
+        "Tilt config: yaw_sign %+.0f, travel [%.1f, %.1f] deg, servo indices %d and %d.",
+        tilt_yaw_sign_, tilt_min_deg_, tilt_max_deg_,
+        tilt_1_servo_index_, tilt_2_servo_index_);
+    if (tilt_yaw_sign_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(),
+            "tilt_yaw_sign is NEGATIVE: differential tilt is inverted relative to the "
+            "simulator's geometry. This is correct for the real T2 and wrong for gz.");
+    }
+
     if (!(tilt_max_deg_ > tilt_min_deg_)) {
         RCLCPP_ERROR(this->get_logger(),
             "uav_parameters.tilt_max_deg (%.1f) must exceed tilt_min_deg (%.1f); "
