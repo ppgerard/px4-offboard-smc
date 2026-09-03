@@ -71,9 +71,24 @@
       # path compensates for pack voltage (the mixer module has no battery scaling),
       # so expect about +/-8 us of drift across a flight. 859.6 is the mean.
       #
-      # STILL WORTH A THRUST STAND, or a second hover with a known added mass:
-      # one point cannot fit the slope, and the slope is what sets the z-loop gain.
-      # scripts/identification.py does the full job from an RCbenchmark CSV.
+      # THE SLOPE DOES NOT NEED A SECOND FLIGHT, and this was checked rather than
+      # assumed. The same log already spans 6.15-10.21 N per rotor (a 66% range
+      # around the 7.81 N hover, wider than a 500 g added mass would give), so the
+      # curve's SHAPE can be tested against it directly: pair the body-z specific
+      # force from sensor_combined -- which needs no altitude, and this flight's
+      # altitude was unusable -- with the commanded PWM.
+      #
+      # Refitting all three coefficients over that span comes out DEGENERATE
+      # (x_2 0.0122, x_1 -16.6, x_0 7229) and improves the residual from 50.1 to
+      # 46.8 us, i.e. three parameters buy 7%. The residual binned by thrust is
+      # flat to within its own scatter across the middle bins, so there is no
+      # systematic shape error to find -- only the offset was wrong, and it is
+      # corrected above. An offset-only fit over the whole flight independently
+      # gives x_0 = 869.1 against the 859.6 from the steady hovers: consistent.
+      #
+      # A thrust stand (scripts/identification.py, RCbenchmark CSV) would still do
+      # better, because it measures omega and can separate thrust_constant from
+      # this curve. Another hover would not.
       omega_to_pwm_coefficient:
         x_2: 0.001142
         x_1: 0.2273
