@@ -35,7 +35,7 @@ repositories:
   px4-offboard-smc:
     type: git
     url: git@github.com:ppgerard/px4-offboard-smc.git
-    version: feature/indoor-ev-hover
+    version: feature/t2-hardware-bringup
   apriltag_ros_enhanced:
     type: git
     url: git@github.com:ppgerard/apriltag_ros_enhanced.git

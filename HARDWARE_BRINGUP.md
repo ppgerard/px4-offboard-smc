@@ -8,7 +8,7 @@ procedure.
 
 ```bash
 mkdir -p ~/t2_ws/src && cd ~/t2_ws/src
-git clone -b feature/indoor-ev-hover git@github.com:ppgerard/px4-offboard-smc.git
+git clone -b feature/t2-hardware-bringup git@github.com:ppgerard/px4-offboard-smc.git
 git clone git@github.com:ppgerard/apriltag_ros_enhanced.git
 git clone https://github.com/PX4/px4_msgs.git
 cd px4_msgs && git checkout 56f8019425a16af2941df5a9288834398681e394 && cd ../..
