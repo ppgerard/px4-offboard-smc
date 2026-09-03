@@ -58,19 +58,26 @@
       thrust_constant: 1.6e-05
       gravity: 9.81
       pitch_trim_deg: 0.0
-      # MEASURE ON A THRUST STAND. These coefficients are currently IDENTICAL to
-      # the x500's in x500_param.yaml -- they were copied and have never been
-      # identified for the T2's motor/prop/battery combination. px4Inverse()
-      # depends on them entirely on hardware.
+      # x_0 IDENTIFIED from a manual hover (log_15_2026-9-3, five steady windows).
+      # x_2 and x_1 are still the x500's -- only the OFFSET has been fitted, which
+      # pins the operating point and not the slope.
       #
-      # The cheap first cut: hover the aircraft manually, read the steady
-      # actuator_motors value from the ULog, and solve for the omega that gives
-      # mg/3 per rotor. That single point plus the quadratic shape gets the hover
-      # command right, which is most of what matters for a hover test.
+      # Measured: mean PWM 1579.0 us against the 1633.6 us this curve predicted for
+      # a tilt-corrected 7.849 N per rotor, i.e. it over-predicted by 54.6 us
+      # (6.8% of the command range). x_0 914.2 -> 859.6.
+      #
+      # The correction is voltage-dependent, and visibly so: the windows at 21.87 V
+      # fit x_0 = 847-854 and those at 21.45 V fit 862-868. Nothing in the output
+      # path compensates for pack voltage (the mixer module has no battery scaling),
+      # so expect about +/-8 us of drift across a flight. 859.6 is the mean.
+      #
+      # STILL WORTH A THRUST STAND, or a second hover with a known added mass:
+      # one point cannot fit the slope, and the slope is what sets the z-loop gain.
+      # scripts/identification.py does the full job from an RCbenchmark CSV.
       omega_to_pwm_coefficient:
         x_2: 0.001142
         x_1: 0.2273
-        x_0: 914.2
+        x_0: 859.6
       # FROM THE VEHICLE: PWM_MAIN_MIN/MAX on the motor outputs (MAIN3, MAIN7,
       # MAIN8 -> functions 103, 102, 101) are 1100 and 1900. The 1075/1950 in
       # t2_param.yaml is the SITL airframe and would misscale every throttle.
