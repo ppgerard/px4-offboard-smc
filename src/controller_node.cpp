@@ -199,6 +199,7 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.omega_to_pwm_coefficient.x_0", 0.0);
     this->declare_parameter("uav_parameters.tilt_min_deg", -7.0);
     this->declare_parameter("uav_parameters.tilt_max_deg", 90.0);
+    this->declare_parameter("uav_parameters.tilt_yaw_sign", 1.0);
     this->declare_parameter("uav_parameters.tilt_1_servo_index", 4);
     this->declare_parameter("uav_parameters.tilt_2_servo_index", 5);
 
@@ -222,6 +223,7 @@ void ControllerNode::loadParams() {
     double _inertia_ixy = this->get_parameter("uav_parameters.inertia.ixy").as_double();
     double _inertia_ixz = this->get_parameter("uav_parameters.inertia.ixz").as_double();
     double _inertia_iyz = this->get_parameter("uav_parameters.inertia.iyz").as_double();
+    tilt_yaw_sign_ = this->get_parameter("uav_parameters.tilt_yaw_sign").as_double() < 0.0 ? -1.0 : 1.0;
     tilt_min_deg_ = this->get_parameter("uav_parameters.tilt_min_deg").as_double();
     tilt_max_deg_ = this->get_parameter("uav_parameters.tilt_max_deg").as_double();
     tilt_1_servo_index_ = this->get_parameter("uav_parameters.tilt_1_servo_index").as_int();
@@ -531,9 +533,31 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         const double tau_z_desired = wrench(2);
         const double tau_z_0 = _moment_constant * _thrust_constant * (-omega_sq[0] + omega_sq[1] - omega_sq[2]);
         const double denom = _thrust_constant * (kTricopterArm1Y * omega_sq[0] + kTricopterArm2Y * omega_sq[1]);
+        // tilt_yaw_sign_ is +1 in the simulator and -1 on the real T2, and that is
+        // MEASURED rather than assumed. The relationship it carries is whether a
+        // positive commanded tilt_1 (with tilt_2 = -tilt_1) produces a positive or
+        // a negative yaw moment, and it depends on which physical nacelle each
+        // servo channel drives and which way that servo rotates -- neither of which
+        // this code can see.
+        //
+        // Get it wrong and the yaw loop is POSITIVE feedback. Measured on the first
+        // hardware flight (log_20, 2026-09-03): within 0.2 s of offboard entry the
+        // aircraft was at -28 deg/s and accelerating, both tilt servos hit their
+        // +/-6.5 deg clamps by 2 s, and it reached -292 deg/s having turned 585 deg
+        // before the pilot took it back. Over the unsaturated samples the
+        // correlation between commanded differential tilt and yaw ACCELERATION was
+        // -0.882: the law asked for one sign and the airframe delivered the other.
+        //
+        // Roll and pitch stayed bounded throughout (-3.8 to +8 deg), which is what
+        // rules out a mirrored motor assignment -- that would have inverted roll
+        // too. The fault is specific to the tilt -> yaw path.
+        //
+        // The simulator cannot find this. Both gz tilt joints share <xyz>0 1 0</xyz>
+        // and the model's rotor ordering matches this code's convention, so +1 is
+        // self-consistent there and every SITL landing in CLAUDE.md flew with it.
         double computed_tilt_rad = 0.0;
         if (std::abs(denom) > 1e-9) {
-            computed_tilt_rad = (tau_z_desired - tau_z_0) / denom;
+            computed_tilt_rad = tilt_yaw_sign_ * (tau_z_desired - tau_z_0) / denom;
         }
 
         // Keep physical angles in radians internally; convert to normalized only when publishing.

@@ -132,6 +132,10 @@ private:
     double tilt_max_deg_ = 90.0;
     int tilt_1_servo_index_ = 4;
     int tilt_2_servo_index_ = 5;
+    // Sign of the differential-tilt -> yaw-torque relationship. +1 is the
+    // simulator's geometry; the real T2 measured -1 in flight. See the note at
+    // the tau_z -> tilt computation in controller_node.cpp.
+    double tilt_yaw_sign_ = 1.0;
     // commanded tilt angles (radians) computed by the controller and published
     double tilt_1_rad_ = 0.0;
     double tilt_2_rad_ = 0.0;

@@ -119,6 +119,14 @@
       # frozen while the other tracks. Differential tilt IS the yaw axis here.
       tilt_1_servo_index: 3
       tilt_2_servo_index: 4
+      # MEASURED IN FLIGHT, and it is the reason the first STSMC flight span up.
+      # A positive commanded differential tilt produces a NEGATIVE yaw moment on
+      # this aircraft, the opposite of the simulator. With +1 the yaw loop is
+      # positive feedback: log_20 reached -292 deg/s and 585 deg of rotation
+      # within 3 s of offboard entry, both tilt servos pinned at their clamps,
+      # while roll and pitch stayed bounded. Correlation between commanded
+      # differential and yaw acceleration: -0.882.
+      tilt_yaw_sign: -1.0
       # FROM THE VEHICLE: CA_SV_TL0_MINA/MAXA are -5 and 90, against the SITL
       # airframe's -7 and 90.
       #
