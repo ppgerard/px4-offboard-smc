@@ -52,6 +52,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 #include "px4_offboard_lowlevel/controller_base.h"
 #include "px4_offboard_lowlevel/px4_frame_conversions.h"
@@ -136,6 +137,9 @@ private:
     // simulator's geometry; the real T2 measured -1 in flight. See the note at
     // the tau_z -> tilt computation in controller_node.cpp.
     double tilt_yaw_sign_ = 1.0;
+    // Sign of each rotor's yaw-torque contribution in body FLU, i.e. its spin
+    // direction. Default is the simulator's aircraft; the real T2's tail differs.
+    double rotor_yaw_sign_[3] = {-1.0, 1.0, -1.0};
     // commanded tilt angles (radians) computed by the controller and published
     double tilt_1_rad_ = 0.0;
     double tilt_2_rad_ = 0.0;

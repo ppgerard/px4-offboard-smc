@@ -200,6 +200,8 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.tilt_min_deg", -7.0);
     this->declare_parameter("uav_parameters.tilt_max_deg", 90.0);
     this->declare_parameter("uav_parameters.tilt_yaw_sign", 1.0);
+    this->declare_parameter("uav_parameters.rotor_yaw_signs",
+                            std::vector<double>{-1.0, 1.0, -1.0});
     this->declare_parameter("uav_parameters.tilt_1_servo_index", 4);
     this->declare_parameter("uav_parameters.tilt_2_servo_index", 5);
 
@@ -224,6 +226,16 @@ void ControllerNode::loadParams() {
     double _inertia_ixz = this->get_parameter("uav_parameters.inertia.ixz").as_double();
     double _inertia_iyz = this->get_parameter("uav_parameters.inertia.iyz").as_double();
     tilt_yaw_sign_ = this->get_parameter("uav_parameters.tilt_yaw_sign").as_double() < 0.0 ? -1.0 : 1.0;
+    {
+        const auto signs = this->get_parameter("uav_parameters.rotor_yaw_signs").as_double_array();
+        if (signs.size() == 3) {
+            for (int i = 0; i < 3; ++i) rotor_yaw_sign_[i] = signs[i] < 0.0 ? -1.0 : 1.0;
+        } else {
+            RCLCPP_ERROR(this->get_logger(),
+                "uav_parameters.rotor_yaw_signs must have 3 entries, got %zu; keeping the "
+                "simulator default (-1, +1, -1).", signs.size());
+        }
+    }
     tilt_min_deg_ = this->get_parameter("uav_parameters.tilt_min_deg").as_double();
     tilt_max_deg_ = this->get_parameter("uav_parameters.tilt_max_deg").as_double();
     tilt_1_servo_index_ = this->get_parameter("uav_parameters.tilt_1_servo_index").as_int();
@@ -246,9 +258,10 @@ void ControllerNode::loadParams() {
     // proves nothing if the BINARY predates the parameter. This line is the only
     // evidence that the value reached the code -- it cost a bench test to learn.
     RCLCPP_INFO(this->get_logger(),
-        "Tilt config: yaw_sign %+.0f, travel [%.1f, %.1f] deg, servo indices %d and %d.",
-        tilt_yaw_sign_, tilt_min_deg_, tilt_max_deg_,
-        tilt_1_servo_index_, tilt_2_servo_index_);
+        "Tilt config: yaw_sign %+.0f, rotor yaw signs (%+.0f %+.0f %+.0f), "
+        "travel [%.1f, %.1f] deg, servo indices %d and %d.",
+        tilt_yaw_sign_, rotor_yaw_sign_[0], rotor_yaw_sign_[1], rotor_yaw_sign_[2],
+        tilt_min_deg_, tilt_max_deg_, tilt_1_servo_index_, tilt_2_servo_index_);
     if (tilt_yaw_sign_ < 0.0) {
         RCLCPP_WARN(this->get_logger(),
             "tilt_yaw_sign is NEGATIVE: differential tilt is inverted relative to the "
@@ -544,8 +557,30 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         // Compute front-tilt from desired tau_z:
         // tau_z_0 = moment_constant * thrust_constant * (-omega1^2 + omega2^2 - omega3^2)
         // tilt = (tau_z_desired - tau_z_0) / (thrust_constant*(l1y*omega1^2 + l2y*omega2^2))
+        // Net rotor drag torque, in body FLU. The per-rotor SIGNS are the spin
+        // directions and they are a property of the aircraft, not of this code.
+        //
+        // They were hardcoded as (-, +, -), which is the SIMULATOR's aircraft. The
+        // real T2's tail rotor turns the other way: the gz airframe sets
+        // CA_ROTOR2_KM +0.05, the vehicle's own parameters say -0.05. (PX4's KM is
+        // in NED, so its sign is the opposite of the FLU sign used here; rotors 0
+        // and 1 agree once that flip is applied, the tail does not.)
+        //
+        // Getting the tail wrong inverts the WHOLE term, because at hover the three
+        // contributions are equal in magnitude: (-1+1-1) = -1 against (-1+1+1) = +1.
+        // And this term is not small -- at hover it is 0.390 N.m, which asks for
+        // 6.66 deg of differential tilt against a 6.5 deg clamp. So it SATURATES the
+        // tilt on its own, and with the wrong sign it saturates it the wrong way and
+        // holds it there: the yaw error never gets to influence the servo at all.
+        // That is what span the aircraft up on the first hardware flight, and it is
+        // why the damping gains and the yaw reference were never the problem.
+        //
+        // The corrected value asks for -6.66 deg, against the -6.12 deg PX4's own
+        // allocator was holding on the same airframe just before handover.
         const double tau_z_desired = wrench(2);
-        const double tau_z_0 = _moment_constant * _thrust_constant * (-omega_sq[0] + omega_sq[1] - omega_sq[2]);
+        const double tau_z_0 = _moment_constant * _thrust_constant *
+            (rotor_yaw_sign_[0] * omega_sq[0] + rotor_yaw_sign_[1] * omega_sq[1] +
+             rotor_yaw_sign_[2] * omega_sq[2]);
         const double denom = _thrust_constant * (kTricopterArm1Y * omega_sq[0] + kTricopterArm2Y * omega_sq[1]);
         // tilt_yaw_sign_ is +1 in the simulator and -1 on the real T2, and that is
         // MEASURED rather than assumed. The relationship it carries is whether a

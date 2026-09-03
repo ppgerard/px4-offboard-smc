@@ -126,7 +126,18 @@
       # within 3 s of offboard entry, both tilt servos pinned at their clamps,
       # while roll and pitch stayed bounded. Correlation between commanded
       # differential and yaw acceleration: -0.882.
-      tilt_yaw_sign: -1.0
+      # Back to +1. The -1 was aimed at the wrong term: it happened to correct the
+      # feedforward's sign by accident while inverting the damping response, which
+      # is why the bench test still looked wrong. The real fault is rotor_yaw_signs.
+      tilt_yaw_sign: 1.0
+      # Spin direction of each rotor's yaw torque, body FLU, in the order
+      # [front-right, front-left, tail]. MEASURED ON THE AIRCRAFT: front right is
+      # CCW, front left and tail are CW.
+      #
+      # The simulator's tail turns the OTHER WAY (gz airframe CA_ROTOR2_KM +0.05,
+      # this vehicle -0.05), which is why the hardcoded (-1, +1, -1) flew every
+      # SITL landing and then saturated the tilt the wrong way on the real T2.
+      rotor_yaw_signs: [-1.0, 1.0, 1.0]
       # FROM THE VEHICLE: CA_SV_TL0_MINA/MAXA are -5 and 90, against the SITL
       # airframe's -7 and 90.
       #
