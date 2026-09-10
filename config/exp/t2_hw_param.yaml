@@ -44,11 +44,25 @@
         ixy: 0.0
         ixz: -0.0025341
         iyz: 0.0
-      # These two agree with the vehicle's own allocation parameters, which is
-      # the one cross-check available without a thrust stand:
-      #   CA_ROTOR0_KM 0.05  -> moment_constant 0.05
-      #   CA_ROTOR*_CT 13.0  -> thrust at full scale; see thrust_constant below.
-      moment_constant: 0.05
+      # 0.05 -> 0.018 (10 Sep). The vehicle's CA_ROTOR0_KM is ALSO 0.05, but that
+      # is not an independent cross-check: both are PX4's generic `tiltrotor`
+      # default and neither was identified for this airframe. 0.018 is derived
+      # from the FX-3110-680KV datasheet -- hover power at 60%, 70-80% efficiency,
+      # km = Q/T -- i.e. from the motor actually fitted here. PX4's x500 is 0.016.
+      #
+      # THE ERROR IS ASYMMETRIC, which is what settles it while km is unmeasured.
+      # At hover (m 2.387, all three rotors at 7.805 N, denom = 3.356 N.m/rad):
+      #   km 0.018 -> -2.40 deg of differential tilt, 4.10 deg of margin
+      #   km 0.050 -> -6.66 deg, i.e. PAST the +-6.5 deg clamp at ZERO yaw error
+      # Under-estimating km leaves a residual the yaw integral reclaims;
+      # over-estimating it pins the servo and deletes the yaw axis. That is the
+      # log_20 spin.
+      #
+      # TO MEASURE IT, now that rotor_yaw_signs is correct: fly a PX4-STABILISED
+      # hover, let the heading settle, and read the steady differential tilt.
+      # km = denom*tilt / (ct*omega^2). A reading taken while the aircraft is
+      # yawing is NOT an equilibrium and must not be inverted.
+      moment_constant: 0.018
       # MEASURE ON A THRUST STAND. 1.6e-05 N.s^2/rad^2 is the Gazebo rotor.
       # The vehicle's CA_ROTOR*_CT is 13.0 N at full command, which for three
       # rotors is 39 N against a ~24.4 N hover -- consistent with a ~63% hover
