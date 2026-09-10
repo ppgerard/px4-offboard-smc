@@ -12,7 +12,7 @@
         # ixz: 0.0025341
         ixz: 0.0
         iyz: 0.0
-      moment_constant: 0.05     # m
+      moment_constant: 0.018    # m  (datasheet-derived; was 0.05, inherited from PX4 generic tiltrotor)
       thrust_constant: 1.6e-05   # N.s^2/rad^2
       gravity: 9.81                # m/s^2
       pitch_trim_deg: 0.0         # compensates the tiltrotor's natural mounting tilt
@@ -22,7 +22,7 @@
         x_0: 914.2
       PWM_MIN: 1075
       PWM_MAX: 1950
-      SIM_GZ_EC_MAX: 1500        # rad/s, corresponds to SIM_GZ_EC_MAX from PX4 parameters
+      SIM_GZ_EC_MAX: 1139        # rad/s, corresponds to SIM_GZ_EC_MAX from PX4 parameters
       SIM_GZ_EC_MIN: 0           # rad/s, corresponds to SIM_GZ_EC_MIN from PX4 parameters 10 AVANT
     landing_parameters:
       # ===== Reference generation (roadmap item 11) =====
@@ -70,9 +70,74 @@
       # The marker layout, which MUST match apriltag_ros_enhanced/cfg/tags_36h11.yaml:
       # two concentric tags at the platform centre. Corner positions are derived
       # from these, so a wrong size here is a scale error in the estimate.
+      # Horizontal authority of the guidance. The STSMC TRACKS this reference and
+      # its damping term brakes the aircraft above it, so in wind these are a
+      # hard ceiling on recovery. PX4's arm is not subject to them (it closes the
+      # position loop itself at MPC_XY_VEL_MAX), which is the asymmetry behind
+      # the 90/135 deg Monte-Carlo result. 0.5 / 1.0 / 0.8 are the historical values.
+      # Phase 2 XY reference bounding. The legacy integration is open-loop and
+      # driven by the VEHICLE's error, so a displaced vehicle drives the
+      # reference through the pad and out the far side, and the law then flies
+      # the vehicle after it -- measured as a 9.6 m limit cycle at 7.5 m/s/90 deg
+      # with the commanded force pointing away from the pad 67% of the time.
+      # 0.0 / false reproduce that legacy behaviour exactly.
+      # Phase 1 -> 2 handover gate [m]. 0.3 is the historical value.
+      phase2_max_velocity_z: 0.6
+      cone_slope: 0.30
+      # Terminal descent. Measured: commit at 0.097 m -> touchdown 0.725 m, i.e.
+      # 60+ cm lost in the 2 s open-loop commit. 0.4/false are the historical values.
+      commit_descent_rate: 0.6
+      # ADOPTED 9 Sep, after a REVERT THAT WAS BASED ON INVALID EVIDENCE.
+      # It was briefly reverted for an apparent 5 m/s / 90 deg regression
+      # (29.15/8.35 -> 38.10/FLEW). Reading the phase log showed neither of those
+      # runs EVER REACHED PHASE 3 -- both failed in Phase 2, pushed 0.30-0.36 m
+      # outside the descent cone at 0.7-0.8 m altitude -- and this parameter only
+      # exists inside updatePhase3Commit(). The change was not executing. The
+      # 5 m/s / 90 deg cell is simply marginal on its own.
+      #
+      # MEASUREMENT RULE: before attributing a failure to a change, confirm the
+      # change was on the code path the failure took. This is the second time in
+      # this investigation a null/regression was pinned on an inactive knob.
+      #
+      # Keeping XY steering through the commit descent, gated on a
+      # genuinely fresh tag (falls back to the frozen point otherwise). Measured
+      # at 7.5 m/s / 90 deg, n=4 each: median 142 -> 71 cm and the spread 57-174
+      # -> 69-86 cm. The VARIANCE collapse is the real result: the aircraft
+      # oscillates about the pad (0.2-0.4 m, 5.7 s period) and the frozen commit
+      # inherits that swing as run-to-run scatter, while steering keeps fighting.
+      # It works through the reference VELOCITY, not the target: freezing sets
+      # r_v_xy = 0 so the damping term only opposes absolute motion, whereas
+      # steering points r_v at the pad and enlarges e_v when drifting away.
+      commit_steer_xy: true
+      # SETTLED COMMIT GATE (0.0 = disabled = bit-exact the instantaneous gate).
+      # The alignment test fires AT an oscillation crossing -- peak lateral speed
+      # -- and the blind descent turns that speed into miss distance. 48.6% of
+      # the campaign's STSMC failures are that shape.
+      commit_max_speed_xy: 0.0
+      commit_settle_seconds: 0.0
+      # The timeout fallback used to commit at ANY error (observed 3.137 m,
+      # reported as "Landing complete"). 0.0 = no ceiling = previous behaviour.
+      commit_fallback_xy_max: 0.0
+      xy_error_threshold: 0.3
+      phase2_reference_leash: 0.0
+      phase2_reference_settles: false
+      max_velocity_xy: 1.0
+      phase2_max_velocity_xy: 0.5
+      phase2_max_acceleration_xy: 0.8
+      # Ramp rate for the terminal descent. At 0.3 m/s^2 a 0.8 m/s commit rate needs
+      # 1.67 s and the phase only lasts ~1.45 s, so commit_descent_rate is inert
+      # above ~0.45 m/s. This is what actually sets the blind-descent exposure.
+      phase2_max_acceleration_z: 0.3
+      # Sustained-alignment filter on the descent throttle. An oscillating aircraft
+      # crosses the cone axis every swing; instantaneously that unlocks the full
+      # descent rate at the worst moment. 0.0 = instantaneous = previous law.
+      descent_alignment_filter_hz: 0.0
+      # The frozen two-marker layout, at the REAL sizes. To re-run the third-marker
+      # A/B, add id 3 / "36h11" / 0.035 here and set TAG3_SIZE=0.035 in the
+      # environment; it was measured on 9 Sep as 3/18 against 3/18, i.e. no effect.
       tag_ids: [2, 1]
       tag_families: ["Custom48h12", "36h11"]
-      tag_sizes: [0.6, 0.16]
+      tag_sizes: [0.35, 0.091]
       tag_positions_x: [0.0, 0.0]
       tag_positions_y: [0.0, 0.0]
       tag_positions_z: [0.0, 0.0]

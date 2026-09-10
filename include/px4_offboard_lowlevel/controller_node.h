@@ -152,6 +152,8 @@ private:
     // Set by computeRotorVelocities() when the commanded wrench had to be
     // clamped to something the airframe can produce; feeds the control law's
     // anti-windup together with the throttle range check.
+    bool tilt_saturated_ = false;
+    bool antiwindup_split_ = false;
     bool allocation_saturated_ = false;
 
     // Logic switches

@@ -134,10 +134,78 @@ public:
     // (apriltag_ros_enhanced/cfg/tags_36h11.yaml). It is duplicated rather than
     // read from the detector because this package does not depend on it -- only
     // on the messages it publishes.
+    // ---- Horizontal authority of the GUIDANCE ------------------------------
+    // These cap how fast the reference may move toward the pad, and in wind that
+    // is a hard ceiling on recovery: the STSMC TRACKS this reference, and its
+    // damping term -m*Lambda*e_v BRAKES the aircraft whenever it exceeds the
+    // capped reference velocity. A lateral wind that pushes faster than
+    // phase2_max_velocity_xy therefore cannot be flown out of, at ANY gain --
+    // which is why raising K1/K2 4x through the barrier adaptation changed
+    // nothing at 7.5 m/s.
+    //
+    // The PX4 baseline arm is NOT subject to this: px4_offboard_landing_node
+    // publishes position AND velocity with position=true, so PX4 closes the
+    // position loop itself at MPC_XY_VEL_MAX (12 m/s by default) and treats this
+    // velocity as feedforward only. That asymmetry, not the control law, is what
+    // the Monte-Carlo measured at 90/135 deg (STSMC 0/12, PX4 11/12).
+    //
+    // Defaults reproduce the historical constants exactly.
+    // The Phase 1 -> 2 gate. Measured at 7.5 m/s / 90 deg: PX4 enters Phase 2 at
+    // 0.045 m of XY error and holds 0.05 m all the way to commit; the STSMC
+    // enters at 0.26 m -- six times worse -- and diverges from there. Both arms
+    // fly the SAME guidance, so the handover quality is the one thing the
+    // guidance can still tighten on the loop's behalf.
+    // Descent throttling. PX4 is not FASTER through Phase 2 (11.9 s), it is
+    // better ALIGNED, so coneDescentLimit() never throttles it. The STSMC is
+    // off-centre and therefore descends slowly while the wind works on it.
+    this->declare_parameter("landing_parameters.phase2_max_velocity_z", 0.3);
+    this->declare_parameter("landing_parameters.cone_slope", 0.30);
+    phase2_max_velocity_z_ = this->get_parameter("landing_parameters.phase2_max_velocity_z").as_double();
+    cone_slope_ = this->get_parameter("landing_parameters.cone_slope").as_double();
+    // ---- Terminal descent -----------------------------------------------------
+    // MEASURED 9 Sep at 7.5 m/s / 90 deg: the aircraft COMMITS at 0.097 m of XY
+    // error and touches down at 0.725 m -- it loses 60+ cm during the 2 s
+    // open-loop commit descent, not during the approach. That is the TERMINAL
+    // failure mode, 48.6% of all STSMC failures campaign-wide.
+    //
+    // commit_descent_rate: 0.30 m at 0.4 m/s is 2 s of exposure; 0.8 m/s halves it.
+    // commit_steer_xy: the XY freeze was chosen when the blind zone began at
+    //   0.229 m of body height. The corrected 0.091 m inner tag pushes that to
+    //   0.173 m, so there is now LIVE tag data through most of the commit
+    //   descent and the freeze is discarding it. false = the historical freeze.
+    this->declare_parameter("landing_parameters.commit_descent_rate", 0.4);
+    this->declare_parameter("landing_parameters.commit_steer_xy", false);
+    commit_descent_rate_ = this->get_parameter("landing_parameters.commit_descent_rate").as_double();
+    commit_steer_xy_ = this->get_parameter("landing_parameters.commit_steer_xy").as_bool();
+    this->declare_parameter("landing_parameters.commit_max_speed_xy", 0.0);
+    this->declare_parameter("landing_parameters.commit_settle_seconds", 0.0);
+    this->declare_parameter("landing_parameters.commit_fallback_xy_max", 0.0);
+    commit_max_speed_xy_ = this->get_parameter("landing_parameters.commit_max_speed_xy").as_double();
+    commit_settle_seconds_ = this->get_parameter("landing_parameters.commit_settle_seconds").as_double();
+    commit_fallback_xy_max_ = this->get_parameter("landing_parameters.commit_fallback_xy_max").as_double();
+    this->declare_parameter("landing_parameters.xy_error_threshold", 0.3);
+    xy_error_threshold_ = this->get_parameter("landing_parameters.xy_error_threshold").as_double();
+    this->declare_parameter("landing_parameters.phase2_reference_leash", 0.0);
+    this->declare_parameter("landing_parameters.phase2_reference_settles", false);
+    phase2_reference_leash_ = this->get_parameter("landing_parameters.phase2_reference_leash").as_double();
+    phase2_reference_settles_ = this->get_parameter("landing_parameters.phase2_reference_settles").as_bool();
+    this->declare_parameter("landing_parameters.max_velocity_xy", 1.0);
+    this->declare_parameter("landing_parameters.phase2_max_velocity_xy", 0.5);
+    this->declare_parameter("landing_parameters.phase2_max_acceleration_xy", 0.8);
+    max_velocity_xy_ = this->get_parameter("landing_parameters.max_velocity_xy").as_double();
+    phase2_max_velocity_xy_ = this->get_parameter("landing_parameters.phase2_max_velocity_xy").as_double();
+    phase2_max_acceleration_xy_ = this->get_parameter("landing_parameters.phase2_max_acceleration_xy").as_double();
+    this->declare_parameter("landing_parameters.phase2_max_acceleration_z", 0.3);
+    phase2_max_acceleration_z_ = this->get_parameter("landing_parameters.phase2_max_acceleration_z").as_double();
+    this->declare_parameter("landing_parameters.descent_alignment_filter_hz", 0.0);
+    descent_alignment_filter_hz_ = this->get_parameter("landing_parameters.descent_alignment_filter_hz").as_double();
+    RCLCPP_INFO(this->get_logger(),
+                "Guidance XY authority: phase1 %.2f m/s, phase2 %.2f m/s, phase2 accel %.2f m/s2",
+                max_velocity_xy_, phase2_max_velocity_xy_, phase2_max_acceleration_xy_);
     this->declare_parameter("landing_parameters.tag_ids", std::vector<int64_t>{2, 1});
     this->declare_parameter("landing_parameters.tag_families",
                             std::vector<std::string>{"Custom48h12", "36h11"});
-    this->declare_parameter("landing_parameters.tag_sizes", std::vector<double>{0.6, 0.16});
+    this->declare_parameter("landing_parameters.tag_sizes", std::vector<double>{0.35, 0.091});
     this->declare_parameter("landing_parameters.tag_positions_x", std::vector<double>{0.0, 0.0});
     this->declare_parameter("landing_parameters.tag_positions_y", std::vector<double>{0.0, 0.0});
     this->declare_parameter("landing_parameters.tag_positions_z", std::vector<double>{0.0, 0.0});
@@ -349,11 +417,11 @@ protected:
 
   // ---- Phase 1: approach ------------------------------------------------------
   const Eigen::Vector3d phase_1_target_{0.0, 0.0, 3.0};  // hold point above the tag [m]
-  const double max_velocity_xy_ = 1.0;      // [m/s]
+  double max_velocity_xy_ = 1.0;            // [m/s]  (parameter)
   const double max_velocity_z_ = 2.0;       // [m/s]
   const double max_acceleration_xy_ = 2.5;  // [m/s²]
   const double max_acceleration_z_ = 1.0;   // [m/s²]
-  const double xy_error_threshold_ = 0.3;   // XY error that counts as "over the tag" [m]
+  double xy_error_threshold_ = 0.3;         // XY error that counts as "over the tag" [m] (parameter)
   const double z_error_threshold_ = 0.3;    // ... altitude error that counts as "at the hold point" [m]
   const double settled_velocity_z_ = 0.2;   // ... and vertical speed that counts as settled [m/s]
   const double xy_error_min_time_ = 0.5;    // ... all held this long before descending [s]
@@ -369,15 +437,28 @@ protected:
   // origin, so it includes the vehicle's own ground clearance: a T2 at rest on
   // the pad reads ~0.105 m, not zero.
   const Eigen::Vector3d phase_2_target_{0.0, 0.0, 0.0};  // the tag itself
-  const double phase2_max_velocity_xy_ = 0.5;      // [m/s]
-  const double phase2_max_velocity_z_ = 0.3;       // [m/s]
-  const double phase2_max_acceleration_xy_ = 0.8;  // [m/s²]
-  const double phase2_max_acceleration_z_ = 0.3;   // [m/s²]
+  double phase2_max_velocity_xy_ = 0.5;            // [m/s]  (parameter)
+  double phase2_reference_leash_ = 0.0;            // [m] 0 = unbounded (legacy)
+  bool phase2_reference_settles_ = false;          // reference closes on itself
+  double phase2_max_velocity_z_ = 0.3;             // [m/s]  (parameter)
+  double phase2_max_acceleration_xy_ = 0.8;        // [m/s²] (parameter)
+  // THE binding constraint on the terminal descent, and it was a const.
+  // The commit phase ramps toward commit_descent_rate_ at this rate, and the
+  // phase only lasts ~1.45 s -- so at 0.3 m/s^2 a 0.8 m/s target needs 1.67 s
+  // and is NEVER reached. Measured 10 Sep: commit_descent_rate 0.4 / 0.8 / 1.2
+  // all achieved the same 0.26-0.31 m/s. Since the blind descent is where the
+  // lateral miss is made (|v_xy| grows 0.03 -> 0.55 m/s over that 1.45 s) and
+  // drift goes as t^2, the exposure time is the lever and THIS is what sets it.
+  double phase2_max_acceleration_z_ = 0.3;   // [m/s²] (parameter)
+  // Low-pass on the cone alignment that throttles the descent; 0 = instantaneous
+  // = bit-exact the previous law. See coneDescentLimit().
+  double descent_alignment_filter_hz_ = 0.0;   // [Hz] (parameter)
+  double descent_alignment_filtered_ = 0.0;
   // Descent cone: altitude is only given up while the aircraft is inside a cone
   // that narrows as it descends, which bounds the touchdown error by design
   // instead of measuring it afterwards. A gust that pushes the aircraft
   // off-centre pauses the descent rather than racing it to the ground.
-  const double cone_slope_ = 0.30;       // cone radius gained per metre of height [m/m]
+  double cone_slope_ = 0.30;             // cone radius gained per metre of height [m/m] (parameter)
   const double cone_radius_min_ = 0.05;  // cone radius at the pad [m]
   // A fresh tag to BEGIN the descent. Deliberately stricter than what the
   // tag-loss ladder below allows once the descent is under way: starting is a
@@ -397,7 +478,21 @@ protected:
   const double commit_xy_error_max_ = 0.10;  // XY alignment required to commit [m]
   const double commit_tag_max_age_ = 0.5;    // tag measurement must be fresher than this [s]
   const double commit_wait_timeout_ = 5.0;   // commit regardless after waiting this long [s]
-  const double commit_descent_rate_ = 0.4;   // fixed descent rate once committed [m/s]
+  double commit_descent_rate_ = 0.4;         // fixed descent rate once committed [m/s] (parameter)
+  bool commit_steer_xy_ = false;             // keep XY steering while the tag is fresh (parameter)
+  // SETTLED COMMIT GATE. The alignment test is INSTANTANEOUS, so on an aircraft
+  // oscillating about the pad it fires AT a crossing -- the moment of peak
+  // lateral speed -- and the blind descent then converts that speed into miss
+  // distance. Measured 9 Sep at 7.5 m/s / 90 deg: committed at 0.092 m and
+  // 0.035 m/s CLOSING, touched down 0.773 m downwind, with the speed growing
+  // linearly through the 2.02 s commit. 48.6% of this campaign's STSMC failures
+  // are that shape (committed aligned, lost in the last 30 cm).
+  // Both 0.0 = disabled = bit-exact the previous gate.
+  double commit_max_speed_xy_ = 0.0;         // lateral speed must be below this to commit [m/s]
+  double commit_settle_seconds_ = 0.0;       // ...and the gate must hold this long [s]
+  double commit_fallback_xy_max_ = 0.0;      // timeout fallback refuses beyond this [m]; 0 = no limit
+  rclcpp::Time commit_settle_start_;         // when the gate last became satisfiable
+  bool commit_settle_flag_ = false;
   const double commit_timeout_ = 8.0;        // no touchdown by then: disarm anyway [s]
 
   // ---- Phase 4: touchdown and disarm -----------------------------------------
@@ -1306,18 +1401,46 @@ protected:
     }
 
     const double xy_error = landingEstimate().head<2>().norm();
+    const double xy_speed = drone_velocity_W_.head<2>().norm();
     const bool aligned = xy_error < commit_xy_error_max_;
     const bool tag_fresh = tagIsFresh(commit_tag_max_age_);
+    // Settled: slow enough that the blind descent cannot convert the residual
+    // speed into miss distance, and held long enough that we are not sampling
+    // one crossing of an oscillation.
+    const bool slow_enough =
+        (commit_max_speed_xy_ <= 0.0) || (xy_speed < commit_max_speed_xy_);
+    bool settled = true;
+    if (commit_settle_seconds_ > 0.0) {
+      if (aligned && tag_fresh && slow_enough) {
+        if (!commit_settle_flag_) {
+          commit_settle_start_ = this->now();
+          commit_settle_flag_ = true;
+        }
+        settled = (this->now() - commit_settle_start_).seconds() >= commit_settle_seconds_;
+      } else {
+        commit_settle_flag_ = false;   // any lapse restarts the dwell
+        settled = false;
+      }
+    }
     const bool waited_long_enough =
         (this->now() - commit_wait_start_time_).seconds() >= commit_wait_timeout_;
 
-    if (!(aligned && tag_fresh)) {
+    if (!(aligned && tag_fresh && slow_enough && settled)) {
       if (!waited_long_enough) {
         return;  // hold at the commit altitude and keep trying to centre
       }
+      // The fallback used to commit at ANY error -- observed committing at
+      // 3.137 m and reporting "Landing complete". An explicit ceiling turns
+      // that into a continued hold, which the tag-loss ladder can then abort.
+      if (commit_fallback_xy_max_ > 0.0 && xy_error > commit_fallback_xy_max_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Commit fallback REFUSED: XY error=%.3f m exceeds %.2f m",
+                             xy_error, commit_fallback_xy_max_);
+        return;
+      }
       RCLCPP_WARN(this->get_logger(),
-                  "Committing after %.1f s wait: XY error=%.3f m, tag %s",
-                  commit_wait_timeout_, xy_error, tag_fresh ? "fresh" : "stale");
+                  "Committing after %.1f s wait: XY error=%.3f m, speed=%.3f m/s, tag %s",
+                  commit_wait_timeout_, xy_error, xy_speed, tag_fresh ? "fresh" : "stale");
     }
 
     enterCommitPhase(xy_error);
@@ -1633,7 +1756,30 @@ protected:
                            "Descent paused: %.2f m off centre, outside the %.2f m cone at "
                            "%.2f m altitude.", xy_error, cone_radius, height);
     }
-    return phase2_max_velocity_z_ * alignment;
+    // SUSTAINED alignment, not instantaneous. An aircraft oscillating about the
+    // pad passes through the cone axis on every swing, and an instantaneous
+    // `alignment` unlocks the full descent rate during that crossing -- so it
+    // drops fastest at the moment it is about to swing back out. Measured
+    // 10 Sep: raising the ceiling to 1.0 m/s is a 10x WIN at 5 m/s (the loop
+    // holds, alignment is genuinely sustained) and lands 4-6 m off the pad at
+    // 7.5 m/s (the loop does not hold, so every unlock is a crossing).
+    // Low-passing the alignment makes the throttle regime-independent by
+    // construction: sustained centring earns the fast descent, a crossing does
+    // not. 0.0 Hz disables it and is bit-exact the instantaneous law.
+    double effective_alignment = alignment;
+    if (descent_alignment_filter_hz_ > 0.0) {
+      const double a = 1.0 - std::exp(-2.0 * M_PI * descent_alignment_filter_hz_ * dt_);
+      // Rise slowly, fall immediately: losing alignment must throttle at once,
+      // while regaining it has to be earned. A symmetric filter would let a
+      // fast swing average out to "centred".
+      if (alignment < descent_alignment_filtered_) {
+        descent_alignment_filtered_ = alignment;
+      } else {
+        descent_alignment_filtered_ += a * (alignment - descent_alignment_filtered_);
+      }
+      effective_alignment = descent_alignment_filtered_;
+    }
+    return phase2_max_velocity_z_ * effective_alignment;
   }
 
   void updatePhase2() {
@@ -1715,7 +1861,49 @@ protected:
     }
 
     // Integrate setpoint from actual tag position to keep trajectory anchored to reality
-    r_position_W_ = r_position_W_ + r_velocity_W_ * dt_;
+    // ---- Phase 2 XY reference: bound the open-loop integration -------------
+    //
+    // MEASURED FAILURE. r_velocity_W_ is K_p*(target - VEHICLE), and this line
+    // integrates it into r_position_W_ open-loop. So while the vehicle is
+    // displaced the reference keeps sliding padward -- THROUGH the pad and out
+    // the far side -- and the control law then faithfully flies the vehicle to
+    // it. That is positive feedback: measured at 7.5 m/s / 90 deg as a limit
+    // cycle across the pad growing to 9.6 m, with the commanded force pointing
+    // AWAY from the pad on 67% of samples (align_p50 -0.999) while the attitude
+    // loop tracked its command to two decimals and the motors never saturated.
+    // No gain fixes a reference that is in the wrong place.
+    //
+    // Two bounded alternatives, both OFF by default (legacy is bit-exact):
+    //
+    //   leash  -- the reference may not lead the vehicle by more than this, so
+    //             e_p is bounded and the reference cannot run away. Simple, and
+    //             it caps the restoring force at Lambda*leash.
+    //   settle -- integrate the reference toward the target using the
+    //             REFERENCE's own error instead of the vehicle's. The reference
+    //             is then a stable first-order system converging on the pad and
+    //             cannot overshoot it at all, while e_p stays the true tracking
+    //             error so the restoring force is NOT capped.
+    if (phase2_reference_settles_) {
+      const Eigen::Vector2d ref_error = phase_2_target_.head<2>() - r_position_W_.head<2>();
+      Eigen::Vector3d ref_velocity = r_velocity_W_;
+      ref_velocity.head<2>() = K_p_ * ref_error;
+      const double speed = ref_velocity.head<2>().norm();
+      if (speed > phase2_max_velocity_xy_) {
+        ref_velocity.head<2>() *= phase2_max_velocity_xy_ / speed;
+      }
+      r_position_W_.head<2>() += ref_velocity.head<2>() * dt_;
+      r_position_W_(2) += r_velocity_W_(2) * dt_;
+    } else {
+      r_position_W_ = r_position_W_ + r_velocity_W_ * dt_;
+    }
+    if (phase2_reference_leash_ > 0.0) {
+      const Eigen::Vector2d lead = r_position_W_.head<2>() - drone_position_W_.head<2>();
+      const double distance = lead.norm();
+      if (distance > phase2_reference_leash_) {
+        r_position_W_.head<2>() =
+            drone_position_W_.head<2>() + lead * (phase2_reference_leash_ / distance);
+      }
+    }
   }
 
   // Only meaningful inside the commit phase: elsewhere commit_start_time_ is stale.
@@ -1738,12 +1926,29 @@ protected:
     const double velocity_step = std::clamp(target_velocity_z - r_velocity_W_(2),
                                             -max_velocity_step, max_velocity_step);
     r_velocity_W_(2) += velocity_step;
-    r_velocity_W_(0) = 0.0;
-    r_velocity_W_(1) = 0.0;
     r_acceleration_W_.setZero();
 
-    r_position_W_(0) = commit_position_xy_(0);
-    r_position_W_(1) = commit_position_xy_(1);
+    // XY: either the historical freeze, or keep steering at the pad for as long
+    // as the tag is genuinely fresh. Freshness is the ladder's own accepted-
+    // measurement age, so a stream of gated frames does NOT count as steering
+    // data -- the moment that fails we fall back to the frozen commit point,
+    // which is exactly the old behaviour.
+    if (commit_steer_xy_ && tagIsFresh(cone_tag_max_age_)) {
+      const Eigen::Vector2d error_xy = phase_2_target_.head<2>() - landingEstimate().head<2>();
+      Eigen::Vector2d velocity_xy = K_p_ * error_xy;
+      const double speed = velocity_xy.norm();
+      if (speed > phase2_max_velocity_xy_) {
+        velocity_xy *= phase2_max_velocity_xy_ / speed;
+      }
+      r_velocity_W_.head<2>() = velocity_xy;
+      r_position_W_.head<2>() += velocity_xy * dt_;
+      commit_position_xy_ = r_position_W_.head<2>();   // so the fallback is current
+    } else {
+      r_velocity_W_(0) = 0.0;
+      r_velocity_W_(1) = 0.0;
+      r_position_W_(0) = commit_position_xy_(0);
+      r_position_W_(1) = commit_position_xy_(1);
+    }
     r_position_W_(2) += r_velocity_W_(2) * dt_;
   }
 

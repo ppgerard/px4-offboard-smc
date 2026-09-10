@@ -45,6 +45,28 @@
         # measured on a loop that has since changed. Left at 1.0 for that reason,
         # not because raising it is unsafe. See CLAUDE.md, "The 11.6 Hz ceiling
         # on the observer bandwidth was the reference differentiation".
+        # Bound on the external-force ESTIMATE, as a fraction of hover thrust.
+        # MEASURED PINNED at 7.32 N (p50 = p95 = max = the bound) through a whole
+        # 7.5 m/s / 90 deg flight -- so the feedforward was a constant 16.7 deg of
+        # lean that could not respond to the wind. 0.30 is the historical value.
+        # Commanded-lean limit [deg], PX4's MPC_TILTMAX_AIR equivalent. Neither
+        # SMC law had one. Measured from the BodyAero plugin's own applied wrench
+        # at 7.5 m/s / 90 deg: PX4 leans 7.1 deg and meets 3.02 N; the STSMC leans
+        # 19.5 deg and meets 7.97 N (20.8 max) -- the aircraft MAKES its own
+        # disturbance through 0.547 m2 of wing. 0.0 disables (bit-exact).
+        tilt_max_deg: 0.0
+        # Solution B: estimate d|F_aero|/d(lean) online by RLS on the (lean,
+        # |f_ext_hat|) pairs the aircraft already produces, then bound the lean to
+        # where b_eff = T*cos(theta) - g still buys net force. A DERIVED,
+        # airspeed-dependent tilt limit -- no aero model, no wind estimator.
+        # Forgetting factor; 0.0 disables the whole path bit-exactly. 0.995 ~ 200
+        # samples of memory at 100 Hz.
+        aero_rls_forget: 0.0
+        f_ext_max_fraction: 0.30
+        # Horizontal bound, separate from the vertical one. 0.0 = same as above
+        # (bit-exact the old law). The clamp guards against the PAD pushing back,
+        # which is vertical; wind is horizontal and needs more room.
+        f_ext_max_fraction_xy: 0.0
         f_ext_observer_gain: 1.0
 
         # ===== Reference-rate filter on omega_ref [Hz]; 0.0 disables =====
@@ -93,6 +115,28 @@
         STA_K2_x: 0.3
         STA_K2_y: 0.3
         STA_K2_z: 0.5
+        # Generalised STA linear terms, TRANSLATIONAL (roadmap item 10). Zero =
+        # classical law, bit-exact. The sqrt branch makes very little FORCE at
+        # small |s| (0.7*sqrt(0.1) = 0.22 N against PX4's 0.75 N at the same
+        # velocity error), and against a displacement-growing disturbance the law
+        # needs authority EARLY. -K3*s supplies it.
+        #
+        # ADOPTED 9 Sep at K3 = 6, K4 = 1 (translational XY only; z stays
+        # classical). It is a deliberate TRADE, measured on the km-0.018 plant:
+        #   7.5 m/s @ 90 deg : 0/2 fly-away  ->  2/2 landed (79-127 cm)
+        #   5 m/s success    : 5/6           ->  6/6
+        #   5 m/s CEP50      : 3.16 cm       ->  6.32 cm   <- the cost
+        # Robustness up, absolute accuracy in benign wind roughly halved. Accepted
+        # because the accuracy loss never crosses the 30 cm bar while the
+        # robustness gain removes fly-aways. Scheduling K3 on the operating point
+        # (small when benign, large when |s_xy| grows) is the obvious refinement
+        # and is deliberately NOT done yet.
+        STA_K3_x: 0.0
+        STA_K3_y: 0.0
+        STA_K3_z: 0.0
+        STA_K4_x: 0.0
+        STA_K4_y: 0.0
+        STA_K4_z: 0.0
         # STA_Lambda_R: rotational sliding surface slope (same role as Lambda_R above)
         STA_Lambda_R_x: 5.0
         STA_Lambda_R_y: 5.0
@@ -134,6 +178,78 @@
         STA_K2_R_x: 0.05
         STA_K2_R_y: 0.05
         STA_K2_R_z: 0.015
+        # ---- Geometric PID alternative for the ROTATIONAL loop ----------------
+        # false = BIT-EXACT the super-twisting law, so this A/Bs against one binary.
+        # The attitude loop is NOT the limiting factor (thrust-direction error
+        # 0.2 deg p50, 0% motor saturation), so this is not a performance fix. It
+        # exists because the rotational STA runs at HALF authority for chattering
+        # reasons and a non-switching law carries no such trade.
+        # Gains: kR = J*wn^2, kW = 2*zeta*J*wn at the SAME wn Lambda_R sets (5,5,2
+        # rad/s), zeta 0.8 -- so the comparison is of reaching laws, not tunings.
+        geometric_rot: false
+        GEO_KR_x: 2.022
+        GEO_KR_y: 3.140
+        GEO_KR_z: 0.815
+        GEO_KW_x: 0.647
+        GEO_KW_y: 1.005
+        GEO_KW_z: 0.652
+        GEO_KI_x: 0.405
+        GEO_KI_y: 0.628
+        GEO_KI_z: 0.163
+
+        # ===== Barrier-function adaptive gain, TRANSLATIONAL XY ONLY =====
+        # SHIPPED OFF: STA_adapt_l_max <= 1.0 leaves K1/K2 bit-for-bit as loaded
+        # above, so this A/Bs against ONE BINARY like STA_implicit and K3/K4.
+        #
+        # One scalar L >= 1 is adapted and BOTH gains scale from it,
+        # K1 *= sqrt(L) and K2 *= L -- Levant's own scalings, so the pair never
+        # leaves the manifold the convergence proof needs. L is ALGEBRAIC in the
+        # surface, not an integrator, so it cannot wind up, drift, or
+        # overestimate:
+        #
+        #     L = 1 + kappa * x/(1-x),   x = min(LPF(|s_xy|)/epsilon, 1-)
+        #
+        # WHY XY ONLY. The Monte-Carlo says the failures split into two
+        # populations needing OPPOSITE gain directions. Wind is the only MATCHED
+        # additive disturbance, and more gain rejects it -- that is the
+        # translational loop. ct is multiplicative input-gain uncertainty and tau
+        # is unmodelled actuator lag; more gain makes both WORSE, and they act
+        # through the attitude loop and the allocation. So the rotational pair
+        # stays fixed (quartering it is a 3x still-air win that lands 0 of 3
+        # tail-on) and z stays fixed (the commit descent has no wind term).
+        #
+        # epsilon is a PRESCRIBED BAND on |s_xy| in m/s -- set it from measured
+        # flight data, not by guess; l_max is the authority ceiling.
+        STA_adapt_l_max: 1.0
+        STA_adapt_epsilon: 0.5
+        STA_adapt_kappa: 0.25
+        STA_adapt_filter_hz: 2.0
+
+        # ===== Anti-windup split =====
+        # The tilt servos are the YAW axis on this tricopter, so their clamp and
+        # rate limiter say nothing about whether the TRANSLATIONAL wrench reached
+        # the rotors -- yet both fed ONE flag that froze BOTH super-twisting
+        # integrals. A steady lateral wind is exactly where the tilt works
+        # hardest and the translational integral is most needed, and the MC found
+        # the STSMC's whole deficit against PX4 at 7.5 m/s is at 90/135 deg
+        # (0/12 against 11/12). false reproduces the combined flag bit-for-bit.
+        antiwindup_split: false
+
+        # Bound on the TRANSLATIONAL super-twisting integral w_, as a fraction of
+        # hover thrust. 0.40 = 9.76 N is the historical value; w_ ramps at
+        # K2 = 0.3 N/s, so it takes 32 s to fill and 32 s to empty -- the same
+        # time scale as the 20-25 s position limit cycle measured at 7.5 m/s /
+        # 90 deg. The existing anti-windup cannot see that cycle: it triggers on
+        # ACTUATOR saturation and the motors are 0.0% saturated throughout. The
+        # steady wind this term exists to reject is ~3 N.
+        STA_w_limit_fraction: 0.40
+
+        # Saturation [m] of the POSITION term inside the translational sliding
+        # surface. s = e_v + Lambda*e_p demands a closing velocity of Lambda*e_p,
+        # so at Lambda 1.5 an aircraft 3 m out is asked to close at 4.5 m/s while
+        # Phase 2 caps the reference at 0.5 m/s. They agree only inside
+        # v_max/Lambda = 0.33 m. 0.0 disables it (bit-exact the previous law).
+        STA_ep_max: 0.0
 
     diagnostics:
         # /landing/sliding_surface, ON by default like every other diagnostic

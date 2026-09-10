@@ -3,6 +3,8 @@
 // baseline/comparison testing against the SMC-controlled landing path.
 // Shared tag-fusion/phase logic lives in landing_trajectory_base.h.
 
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -59,9 +61,23 @@ private:
     setpoint.acceleration[1] = acceleration_NED(1);
     setpoint.acceleration[2] = acceleration_NED(2);
 
-    // No yaw setpoint
-    setpoint.yaw = std::numeric_limits<float>::quiet_NaN();
-    setpoint.yawspeed = std::numeric_limits<float>::quiet_NaN();
+    // Yaw. NaN by default -- PX4 then holds no heading at all and the airframe
+    // weathervanes passively: measured settling 26 deg off the wind at 7.5 m/s
+    // side-on, against the STSMC arm which is PINNED to the platform heading at
+    // 90 deg to the same wind. That is a 2.2x difference in aerodynamic force
+    // (effective Cd*A 0.0715 against 0.178) and it made the baseline unfair.
+    // PX4_YAW_SP_DEG (NED degrees) pins PX4 to the same heading the STSMC holds.
+    // Unset -> NaN -> bit-exact the previous behaviour.
+    {
+      static const char *yaw_env = std::getenv("PX4_YAW_SP_DEG");
+      if (yaw_env != nullptr && yaw_env[0] != '\0') {
+        setpoint.yaw = static_cast<float>(std::atof(yaw_env) * M_PI / 180.0);
+        setpoint.yawspeed = 0.0f;
+      } else {
+        setpoint.yaw = std::numeric_limits<float>::quiet_NaN();
+        setpoint.yawspeed = std::numeric_limits<float>::quiet_NaN();
+      }
+    }
 
     setpoint.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 

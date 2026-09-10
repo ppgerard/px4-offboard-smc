@@ -32,6 +32,7 @@
  *
  ****************************************************************************/
 
+#include <algorithm>
 #include "../include/px4_offboard_lowlevel/st_smc_controller.h"
 #include "../include/px4_offboard_lowlevel/sta_reaching_law.h"
 #include "rclcpp/rclcpp.hpp"
@@ -61,8 +62,29 @@ void StSmcController::calculateControllerOutput(
     const Eigen::Vector3d e_v =
                 velocity_W_ - r_velocity_W_;
 
+    // The surface s = e_v + Lambda*e_p DEMANDS a closing velocity of Lambda*e_p:
+    // reaching s = 0 means e_v = -Lambda*e_p. At Lambda 1.5 an aircraft 3 m off
+    // the pad is being asked to close at 4.5 m/s, while Phase 2 caps the
+    // reference velocity at 0.5 m/s -- an order of magnitude apart. The two are
+    // consistent only inside |e_p| < v_max/Lambda = 0.33 m, which is why this
+    // loop is well behaved near the pad and diverges once wind pushes it out.
+    //
+    // Saturating the POSITION term enforces that consistency without touching
+    // the restoring force: s keeps its sign and the reaching law keeps its
+    // authority, but the surface stops asking for a velocity the guidance will
+    // never command. Bounding the REFERENCE instead (the leash) was tried and is
+    // worse -- it shrinks e_p and removes the restoring force with it.
+    //
+    // 0.0 disables the saturation and is bit-exact the previous law.
+    Eigen::Vector3d e_p_surface = e_p;
+    if (sta_ep_max_ > 0.0) {
+        const double lateral = e_p_surface.head<2>().norm();
+        if (lateral > sta_ep_max_) {
+            e_p_surface.head<2>() *= sta_ep_max_ / lateral;
+        }
+    }
     const Eigen::Vector3d s =
-                e_v + Lambda.cwiseProduct(e_p);
+                e_v + Lambda.cwiseProduct(e_p_surface);
 
     // Composite control (§05): the observer cancels the slow, large part of the
     // disturbance so the super-twisting law is left with only the fast residual.
@@ -89,22 +111,59 @@ void StSmcController::calculateControllerOutput(
     px4_offboard::StaGains gains;
     gains.k1 = K1;
     gains.k2 = K2;
+    gains.k3 = K3;
+    gains.k4 = K4;
+
+    // Barrier-function adaptive gain, XY ONLY, and the restriction is the whole
+    // design. Wind is the one MATCHED disturbance here, so it is the one more
+    // gain rejects; ct (input-gain uncertainty) and tau (unmodelled actuator
+    // lag) are not matched and more gain makes them worse. Those two live in the
+    // rotational loop and the allocation, which is why the rotational pair is
+    // left fixed -- quartering it is a 3x still-air win that lands 0 of 3
+    // tail-on. z is left fixed too: the commit descent is a z-tracking task with
+    // no wind term to reject.
+    //
+    // k1 *= sqrt(L) and k2 *= L together, never separately: those are Levant's
+    // scalings, so the pair stays on the manifold the convergence proof needs.
+    const double l_hat = px4_offboard::barrierGainUpdate(
+        adaptive_, s.head<2>().norm(), dt_);
+    if (l_hat > 0.0) {
+        adaptive_multiplier_ = l_hat;
+        gains.k1.head<2>() *= std::sqrt(l_hat);
+        gains.k2.head<2>() *= l_hat;
+    }
+
+    // Bound on the translational super-twisting integral. 0.40 of hover thrust
+    // is 9.76 N here, and w_ ramps at K2 = 0.3 N/s -- so filling it takes 32 s
+    // and emptying it another 32 s. That is the same time scale as the ~20-25 s
+    // limit cycle measured at 7.5 m/s / 90 deg, and the existing anti-windup
+    // cannot see it because it triggers on ACTUATOR saturation and the motors
+    // are 0.0% saturated throughout. The wind this has to reject is ~3 N, so the
+    // bound has a lot of unnecessary room to wind into.
     const Eigen::Vector3d w_limit = Eigen::Vector3d::Constant(
-        px4_offboard::kStaThrustHoverFraction * _uav_mass * _gravity);
+        sta_w_limit_fraction_ * _uav_mass * _gravity);
     // Control effectiveness of the translational surface: s_dot = u/m + d.
     const Eigen::Vector3d b_translational =
         Eigen::Vector3d::Constant(1.0 / std::max(_uav_mass, 1e-6));
     const Eigen::Vector3d u_sta =
         px4_offboard::staReachingStep(s, w_, gains, b_translational, w_limit,
-                                      actuators_saturated_, dt_,
+                                      actuators_saturated_trans_, dt_,
                                       false);
 
-    const Eigen::Vector3d I_a_d =
+    Eigen::Vector3d I_a_d =
                 + _uav_mass * _gravity * Eigen::Vector3d::UnitZ()
                 + _uav_mass * r_acceleration_W_
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 + u_sta
                 - f_ext_hat_;
+
+    // Cap the commanded lean before it becomes an attitude (see limitTilt).
+
+    // Solution B: feed the CURRENT operating point to the effectiveness
+    // estimator before limiting, so the bound reflects the aero the aircraft is
+    // actually meeting at the lean it is actually holding.
+    updateInputGain(I_a_d, dt_);
+    I_a_d = limitTilt(I_a_d);
 
     thrust = projectedThrust(I_a_d);
     noteAppliedThrust(thrust);
@@ -199,11 +258,40 @@ void StSmcController::calculateControllerOutput(
                                       actuators_saturated_, dt_,
                                       false);
 
-    tau =
-        angular_velocity_B_.cross(_inertia_matrix * angular_velocity_B_)
-        - _inertia_matrix * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
-        - _inertia_matrix * Lambda_R.cwiseProduct(e_R_dot)
-        + u_sta_R;
+    if (geometric_rot_) {
+        // Geometric PID on SE(3). The feedforward terms below are the SAME ones
+        // the super-twisting branch uses -- only the reaching law differs, which
+        // is what makes this an honest A/B of reaching laws.
+        //
+        // The surface-derivative term (-J*Lambda_R*e_R_dot) is SMC-specific and
+        // drops out: e_R_dot = E*e_omega, so its damping role is carried by
+        // K_W_geo_ instead.
+        //
+        // Integral: same bound and anti-windup rule as the STA's w_R_, so the
+        // two arms get identical integral authority and a difference between
+        // them cannot be an artefact of one being freer than the other.
+        if (!actuators_saturated_) {
+            e_R_int_ += e_R * dt_;
+        }
+        const Eigen::Vector3d int_limit =
+            _inertia_matrix.diagonal() * px4_offboard::kStaMaxAngularAcceleration;
+        for (int i = 0; i < 3; ++i) {
+            const double lim = (K_I_geo_(i) > 1e-9) ? int_limit(i) / K_I_geo_(i) : 0.0;
+            e_R_int_(i) = std::clamp(e_R_int_(i), -lim, lim);
+        }
+        tau =
+            angular_velocity_B_.cross(_inertia_matrix * angular_velocity_B_)
+            - _inertia_matrix * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
+            - K_R_geo_.cwiseProduct(e_R)
+            - K_W_geo_.cwiseProduct(e_omega)
+            - K_I_geo_.cwiseProduct(e_R_int_);
+    } else {
+        tau =
+            angular_velocity_B_.cross(_inertia_matrix * angular_velocity_B_)
+            - _inertia_matrix * angular_velocity_B_.cross(R_B_W_.transpose() * R_d_w * omega_ref)
+            - _inertia_matrix * Lambda_R.cwiseProduct(e_R_dot)
+            + u_sta_R;
+    }
 
     // Output the wrench
     *controller_torque_thrust << tau, thrust;

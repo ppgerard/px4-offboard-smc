@@ -103,8 +103,137 @@ public:
     // Whether the previous commanded wrench reached the actuators intact. False
     // means the loop is open downstream of the law, which is precisely when
     // integrating winds up state the law can never work off again.
+    // ---- Solution B: online control-EFFECTIVENESS estimate --------------------
+    //
+    // The horizontal force actually delivered is  F_net(theta) = T*sin(theta) -
+    // F_aero(theta, V_air), and on this airframe the second term grows almost as
+    // fast as the first: measured net force is ~1 N at EVERY lean from 7 to 20
+    // deg (see the self-inflicted-disturbance section in CLAUDE.md). So the
+    // effective input gain
+    //
+    //     b_eff(theta) = d/dtheta [ T*sin(theta) - F_aero ] = T*cos(theta) - g
+    //
+    // collapses toward zero, which breaks the assumption every sliding-mode
+    // proof makes (b bounded away from zero) and is why no reaching gain,
+    // surface slope, integral bound or adaptation law moved this failure.
+    //
+    // g = d|F_aero|/dtheta is estimated ONLINE by recursive least squares on the
+    // pairs (lean, |f_ext_hat_xy|) the aircraft already produces -- no aero
+    // model, no wind estimator, no new sensor. The lean is then limited to where
+    // b_eff still exceeds a floor, which is a DERIVED, airspeed-dependent tilt
+    // limit rather than a guessed constant (and explains why a fixed 10 deg cap
+    // helped at 7.5 m/s and hurt at 5 m/s).
+    //
+    // aero_rls_forget <= 0 disables the whole path, bit-exactly.
+    // Estimate the EFFECTIVE INPUT GAIN online:
+    //
+    //     b_hat = d(m * a_achieved) / d(F_commanded)      [dimensionless, ideal 1]
+    //
+    // This is strictly better than regressing f_ext on lean, because one slope
+    // absorbs EVERY corruption of the input path at once:
+    //   * ct error   -- a multiplicative input-gain error IS this quantity
+    //   * the aero feedback, dd/du, which is why b_eff collapses here
+    //   * thrust-model error, battery sag, allocation shortfall
+    //
+    // Both signals already exist: the commanded horizontal force is I_a_d, and
+    // the achieved acceleration is the filtered derivative of velocity_W_. The
+    // achieved acceleration is PROJECTED on the commanded force direction, so
+    // the regression measures delivery along the axis actually being commanded.
+    //
+    // b_hat << 1 means "commanding more buys nothing" -- the condition every
+    // sliding-mode proof assumes away. The lean is then bounded to where the
+    // command still pays, which is a derived, airspeed-dependent limit.
+    void updateInputGain(const Eigen::Vector3d &force_cmd_W, double dt) {
+        if (aero_rls_forget_ <= 0.0 || dt <= 1e-6) {
+            return;
+        }
+        // filtered achieved acceleration
+        const Eigen::Vector3d accel = (velocity_W_ - velocity_prev_) / dt;
+        velocity_prev_ = velocity_W_;
+        accel_filt_ += 0.1 * (accel - accel_filt_);
+
+        const double f_mag = force_cmd_W.head<2>().norm();
+        if (f_mag < 0.5) {                 // no excitation, do not adapt
+            return;
+        }
+        const Eigen::Vector2d dir = force_cmd_W.head<2>() / f_mag;
+        const double y = _uav_mass * accel_filt_.head<2>().dot(dir);
+
+        // RLS with forgetting on  y = b*f_mag + c
+        const double x0 = f_mag, x1 = 1.0;
+        const double denom = aero_rls_forget_
+            + (x0 * (aero_P_[0] * x0 + aero_P_[1] * x1)
+             + x1 * (aero_P_[2] * x0 + aero_P_[3] * x1));
+        if (!(denom > 1e-9)) {
+            return;
+        }
+        const double k0 = (aero_P_[0] * x0 + aero_P_[1] * x1) / denom;
+        const double k1 = (aero_P_[2] * x0 + aero_P_[3] * x1) / denom;
+        const double err = y - (aero_g_ * f_mag + aero_a_);
+        aero_g_ += k0 * err;               // aero_g_ is now b_hat
+        aero_a_ += k1 * err;
+        const double p00 = aero_P_[0], p01 = aero_P_[1], p10 = aero_P_[2], p11 = aero_P_[3];
+        aero_P_[0] = (p00 - k0 * (x0 * p00 + x1 * p10)) / aero_rls_forget_;
+        aero_P_[1] = (p01 - k0 * (x0 * p01 + x1 * p11)) / aero_rls_forget_;
+        aero_P_[2] = (p10 - k1 * (x0 * p00 + x1 * p10)) / aero_rls_forget_;
+        aero_P_[3] = (p11 - k1 * (x0 * p01 + x1 * p11)) / aero_rls_forget_;
+        aero_g_ = std::clamp(aero_g_, 0.0, 2.0);
+
+        // Bound the lean by how much of the command is actually delivered. At
+        // b_hat = 1 the full envelope is available; as b_hat -> 0 commanding more
+        // lean only manufactures more disturbance, so pull the bound in.
+        const double target = 0.12 + 0.50 * aero_g_;        // [rad], 6.9 deg .. 35 deg
+        aero_tilt_max_rad_ += 0.01 * (target - aero_tilt_max_rad_);
+    }
+
+    double inputGainEstimate() const { return aero_g_; }
+    double aeroTiltMaxRad() const { return aero_tilt_max_rad_; }
+
+    void setAeroRlsForget(double f) { aero_rls_forget_ = (f > 0.0 && f <= 1.0) ? f : 0.0; }
+
+    // Commanded-lean limit [deg]; 0 disables. See limitTilt().
+    void setTiltMaxDeg(double deg) {
+        tilt_max_rad_ = (deg > 0.0) ? deg * M_PI / 180.0 : 0.0;
+    }
+
+    // Bound on the external-force estimate, as a fraction of hover thrust.
+    void setFextMaxFraction(double f) {
+        if (f > 0.0) { fext_max_fraction_ = f; }
+    }
+
+    // SEPARATE horizontal bound. The clamp exists to stop the observer running
+    // away when the PAD PUSHES BACK, and that reaction is VERTICAL -- but the
+    // bound was applied per-axis with one value, so covering the wind meant
+    // also letting the ground reaction in. Measured 9 Sep at 7.5 m/s / 90 deg:
+    // the true aero force is 8.28 N against a 7.32 N per-axis bound, so f_ext_y
+    // sits ON the clamp and the feedforward is 0.96 N short. That deficit is
+    // 0.386 m/s^2, which over the 2.02 s commit descent is 0.79 m -- against a
+    // MEASURED commit drift of 0.68 m. The landing is lost to a saturated
+    // estimator, not to a reaching gain.
+    // 0 (default) means "same as the vertical bound", i.e. bit-exact the old law.
+    void setFextMaxFractionXy(double f) {
+        if (f > 0.0) { fext_max_fraction_xy_ = f; }
+    }
+
     void setActuatorsSaturated(bool saturated) {
         actuators_saturated_ = saturated;
+        actuators_saturated_trans_ = saturated;
+    }
+
+    // Split form. The tilt servos are the YAW axis on this tricopter, so their
+    // clamp and rate limiter say nothing about whether the TRANSLATIONAL wrench
+    // reached the rotors -- yet both used to feed one flag that froze both
+    // super-twisting integrals. A steady lateral wind is exactly the case where
+    // the tilt works hardest AND the translational integral is most needed, so
+    // the coupling starves the loop precisely when it matters. Pass the
+    // translational flag without the tilt terms to break it.
+    void setActuatorsSaturated(bool rotational, bool translational) {
+        actuators_saturated_ = rotational;
+        actuators_saturated_trans_ = translational;
+    }
+
+    bool actuatorsSaturatedTranslational() const {
+        return actuators_saturated_trans_;
     }
 
     // Bandwidth of the external-force observer [rad/s]. Zero disables it, which
@@ -227,6 +356,42 @@ protected:
     // lags the desired force direction — 6% at 20 deg of lag, 13% at 30 deg —
     // and the lag is largest during a gust, so the error arrives as altitude
     // bumps correlated with lateral disturbance. Floored, see the constant.
+    // Limit the commanded LEAN, the way PX4's MPC_TILTMAX_AIR does. Neither SMC
+    // law had any such limit, and on this airframe that is a positive feedback
+    // loop rather than merely an aggressive one:
+    //
+    //   MEASURED 9 Sep, 7.5 m/s at 90 deg, from the BodyAero plugin's OWN
+    //   applied wrench (gz /t2/body_aero, no inference):
+    //     PX4    leans  7.1 deg -> plugin applies 3.02 N median -> lands 1.01 cm
+    //     STSMC  leans 19.5 deg -> plugin applies 7.97 N median (20.8 max) -> departs
+    //     SMC    leans 16-19 deg -> 5.8-8.4 N median -> departs
+    //
+    // The T2 carries 0.547 m2 of wing in that plugin, so lean changes the angle
+    // of attack and sideslip and the aircraft MAKES its own disturbance. More
+    // lean buys more force to fight, which is why no reaching gain, surface
+    // slope, integral bound or reference scheme changed anything: they all act
+    // by leaning harder. There are two equilibria and the limit is what keeps
+    // the aircraft in the benign one.
+    //
+    // 0 disables it and is bit-exact the previous law.
+    Eigen::Vector3d limitTilt(const Eigen::Vector3d &I_a_d) const {
+        const double bound = (aero_rls_forget_ > 0.0)
+            ? ((tilt_max_rad_ > 0.0) ? std::min(tilt_max_rad_, aero_tilt_max_rad_)
+                                     : aero_tilt_max_rad_)
+            : tilt_max_rad_;
+        if (bound <= 0.0) {
+            return I_a_d;
+        }
+        const double vertical = std::max(I_a_d.z(), 0.1 * _uav_mass * _gravity);
+        const double horizontal_max = vertical * std::tan(bound);
+        Eigen::Vector3d limited = I_a_d;
+        const double horizontal = limited.head<2>().norm();
+        if (horizontal > horizontal_max && horizontal > 1e-9) {
+            limited.head<2>() *= horizontal_max / horizontal;
+        }
+        return limited;
+    }
+
     double projectedThrust(const Eigen::Vector3d &I_a_d) const {
         return std::max(I_a_d.dot(R_B_W_.col(2)),
                         px4_offboard::kMinThrustHoverFraction * _uav_mass * _gravity);
@@ -275,8 +440,18 @@ protected:
         }
 
         f_ext_hat_ = f_ext_observer_gain_ * (momentum - momentum_reference_ - momentum_integral_);
-        const double limit = px4_offboard::kFextMaxHoverFraction * _uav_mass * _gravity;
+        // MEASURED PINNED IN FLIGHT (9 Sep). At 7.5 m/s / 90 deg the estimate sits
+        // at 7.317/7.378/7.401 N for p50/p95/max against a 7.32 N bound -- saturated
+        // for the whole flight, not 'only on the ground' as this file assumed. A
+        // saturated observer feeds forward a CONSTANT force (16.7 deg of lean) and
+        // stops responding to the wind at all, which is why the commanded lean was
+        // invariant at ~19 deg across every gain, Lambda, integral bound and
+        // reference scheme tried.
+        const double limit_z = fext_max_fraction_ * _uav_mass * _gravity;
+        const double limit_xy = (fext_max_fraction_xy_ > 0.0)
+            ? fext_max_fraction_xy_ * _uav_mass * _gravity : limit_z;
         for (int i = 0; i < 3; ++i) {
+            const double limit = (i < 2) ? limit_xy : limit_z;
             const double unclamped = f_ext_hat_(i);
             f_ext_hat_(i) = std::clamp(unclamped, -limit, limit);
             // Back-calculate the integral whenever the clamp bites, so the
@@ -320,7 +495,17 @@ protected:
 
     // Set by the node when the commanded wrench did not survive allocation:
     // a rotor clamped at zero, a throttle outside [0, 1], a tilt on its stop.
+    double fext_max_fraction_ = px4_offboard::kFextMaxHoverFraction;
+    double fext_max_fraction_xy_ = 0.0;   // 0 = use fext_max_fraction_
+    double tilt_max_rad_ = 0.0;   // commanded lean limit; 0 = unlimited
+    double aero_rls_forget_ = 0.0;          // 0 disables solution B
+    double aero_a_ = 0.0, aero_g_ = 0.0;    // f_aero ~ a + g*lean
+    double aero_P_[4] = {10.0, 0.0, 0.0, 10.0};
+    Eigen::Vector3d velocity_prev_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d accel_filt_ = Eigen::Vector3d::Zero();
+    double aero_tilt_max_rad_ = 0.35;       // derived authority bound [rad]
     bool actuators_saturated_ = false;
+    bool actuators_saturated_trans_ = false;
 
     // Previous desired attitude and first-call guard, used to differentiate the
     // desired attitude into a reference angular velocity. Per-instance so that
