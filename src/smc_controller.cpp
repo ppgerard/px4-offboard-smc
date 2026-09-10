@@ -91,12 +91,16 @@ void SmcController::calculateControllerOutput(
     //             -velocity_gain_.cwiseProduct(e_v)
     //             +_uav_mass * _gravity * Eigen::Vector3d::UnitZ() + _uav_mass * r_acceleration_W_;
 
-    const Eigen::Vector3d I_a_d = 
+    Eigen::Vector3d I_a_d = 
                 + _uav_mass * _gravity * Eigen::Vector3d::UnitZ() 
                 + _uav_mass * r_acceleration_W_
                 - _uav_mass * Lambda.cwiseProduct(e_v)
                 - K_s.cwiseProduct(sat_vec)
                 - f_ext_hat_;
+
+    // Cap the commanded lean before it becomes an attitude (see limitTilt).
+
+    I_a_d = limitTilt(I_a_d);
 
     thrust = projectedThrust(I_a_d);
     noteAppliedThrust(thrust);

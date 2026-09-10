@@ -173,6 +173,65 @@ inline Eigen::Vector3d staReachingStep(const Eigen::Vector3d &s,
     return u;
 }
 
+// ===== Barrier-function adaptive gain (option 3) =====
+//
+// ONE scalar is adapted -- a dimensionless disturbance-scale multiplier L >= 1 --
+// and BOTH gains are derived from it as k1 *= sqrt(L), k2 *= L. That pairing is
+// not cosmetic: Levant's conditions are k1 ~ sqrt(L) and k2 ~ L, so scaling the
+// two together is the only way to move the gains and stay on the manifold the
+// convergence proof needs. Adapting k1 alone silently breaks it, which is the
+// commonest way an "adaptive STA" stops being one.
+//
+// L is an ALGEBRAIC function of the surface, not an integrator:
+//
+//     L(sigma) = 1 + kappa * x/(1-x),    x = min(sigma/epsilon, 1-)
+//
+// so it cannot wind up, cannot drift, and cannot overestimate -- the three
+// failure modes of the integrating |s|-driven adaptive laws. It rises only while
+// the surface is actually large and returns to 1 the instant it is not, which is
+// exactly the split this airframe needs: wind is a MATCHED disturbance that more
+// gain rejects, and it drives sigma up; the ct/tau draws are input-gain
+// uncertainty and unmodelled actuator lag, which more gain makes WORSE, and they
+// sit near sigma = 0 where the hand-tuned gains are kept. A fixed gain cannot
+// serve both -- measured, see CLAUDE.md.
+//
+// epsilon is a PRESCRIBED BAND: L grows without bound as sigma -> epsilon, so
+// the law spends whatever authority it has to keep the surface inside it.
+// l_max is the hard ceiling that makes that finite, and it belongs to the
+// airframe's real authority -- demanding force the allocation cannot deliver
+// buys nothing and only tilts the commanded attitude further.
+//
+// sigma is a LOW-PASSED |s|. Unfiltered, measurement noise on the surface
+// becomes gain modulation at the same ~11 Hz mode the omega_ref filter exists to
+// remove, so the default cut matches it.
+//
+// l_max <= 1.0 DISABLES it, and the caller then leaves the gains untouched, so
+// the adaptive and fixed-gain laws A/B against ONE BINARY -- the same discipline
+// as STA_implicit and the k3/k4 terms above.
+struct BarrierGain {
+    double l_max = 1.0;       // ceiling on the multiplier; <= 1.0 disables
+    double epsilon = 0.5;     // prescribed band on |s|, in the surface's units
+    double kappa = 0.25;      // barrier strength
+    double filter_hz = 2.0;   // low-pass on |s|; 0.0 passes it through
+    double sigma = 0.0;       // filtered |s| -- the only state this carries
+};
+
+// Advance the filter and return the gain multiplier L in [1, l_max], or -1.0
+// when disabled (so the caller can tell "disabled" from "L = 1" and leave the
+// gain vectors bit-for-bit untouched).
+inline double barrierGainUpdate(BarrierGain &g, double s_norm, double dt) {
+    if (!(g.l_max > 1.0) || !(g.epsilon > 0.0)) {
+        return -1.0;
+    }
+    constexpr double kTwoPi = 6.283185307179586;
+    const double alpha = (g.filter_hz > 0.0)
+                             ? 1.0 - std::exp(-kTwoPi * g.filter_hz * dt)
+                             : 1.0;
+    g.sigma += alpha * (std::abs(s_norm) - g.sigma);
+    const double x = std::min(g.sigma / g.epsilon, 0.999);
+    return std::clamp(1.0 + g.kappa * x / (1.0 - x), 1.0, g.l_max);
+}
+
 }  // namespace px4_offboard
 
 #endif  // PX4_OFFBOARD_STA_REACHING_LAW_H

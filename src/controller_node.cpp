@@ -320,13 +320,70 @@ void ControllerNode::loadParams() {
     // Shared by both control laws, so it is read here rather than inside either
     // branch below -- the stsmc path returns early. Zero disables the observer,
     // which is what makes it A/B-able against one binary.
+    this->declare_parameter("control_gains.tilt_max_deg", 0.0);
+    this->declare_parameter("control_gains.aero_rls_forget", 0.0);
+    this->declare_parameter("control_gains.f_ext_max_fraction", 0.30);
+    this->declare_parameter("control_gains.f_ext_max_fraction_xy", 0.0);
     this->declare_parameter("control_gains.f_ext_observer_gain", 0.0);
     const double f_ext_gain = this->get_parameter("control_gains.f_ext_observer_gain").as_double();
     controller_->setExternalForceGain(f_ext_gain);
+    const double tilt_max = this->get_parameter("control_gains.tilt_max_deg").as_double();
+    controller_->setTiltMaxDeg(tilt_max);
+    const double aero_rls = this->get_parameter("control_gains.aero_rls_forget").as_double();
+    controller_->setAeroRlsForget(aero_rls);
+    RCLCPP_INFO(this->get_logger(), "Solution B (online control effectiveness): %s",
+                aero_rls > 0.0 ? "ON" : "OFF");
+    RCLCPP_INFO(this->get_logger(), "Commanded-lean limit: %s",
+                tilt_max > 0.0 ? std::to_string(tilt_max).c_str() : "OFF");
+    controller_->setFextMaxFraction(
+        this->get_parameter("control_gains.f_ext_max_fraction").as_double());
+    const double fext_xy =
+        this->get_parameter("control_gains.f_ext_max_fraction_xy").as_double();
+    controller_->setFextMaxFractionXy(fext_xy);
+
+    // Geometric PID alternative for the ROTATIONAL loop. false = bit-exact the
+    // super-twisting law. Gains default to J*wn^2 / 2*zeta*J*wn at the SAME
+    // bandwidth Lambda_R sets, so the two arms differ only in reaching law.
+    this->declare_parameter("control_gains.geometric_rot", false);
+    this->declare_parameter("control_gains.GEO_KR_x", 2.022);
+    this->declare_parameter("control_gains.GEO_KR_y", 3.140);
+    this->declare_parameter("control_gains.GEO_KR_z", 0.815);
+    this->declare_parameter("control_gains.GEO_KW_x", 0.647);
+    this->declare_parameter("control_gains.GEO_KW_y", 1.005);
+    this->declare_parameter("control_gains.GEO_KW_z", 0.652);
+    this->declare_parameter("control_gains.GEO_KI_x", 0.405);
+    this->declare_parameter("control_gains.GEO_KI_y", 0.628);
+    this->declare_parameter("control_gains.GEO_KI_z", 0.163);
+    {
+      auto *st = dynamic_cast<StSmcController *>(controller_.get());
+      if (st != nullptr) {
+        const bool geo = this->get_parameter("control_gains.geometric_rot").as_bool();
+        st->setGeometricRot(geo);
+        st->setGeometricGains(
+            Eigen::Vector3d(this->get_parameter("control_gains.GEO_KR_x").as_double(),
+                            this->get_parameter("control_gains.GEO_KR_y").as_double(),
+                            this->get_parameter("control_gains.GEO_KR_z").as_double()),
+            Eigen::Vector3d(this->get_parameter("control_gains.GEO_KW_x").as_double(),
+                            this->get_parameter("control_gains.GEO_KW_y").as_double(),
+                            this->get_parameter("control_gains.GEO_KW_z").as_double()),
+            Eigen::Vector3d(this->get_parameter("control_gains.GEO_KI_x").as_double(),
+                            this->get_parameter("control_gains.GEO_KI_y").as_double(),
+                            this->get_parameter("control_gains.GEO_KI_z").as_double()));
+        RCLCPP_INFO(this->get_logger(), "Rotational law: %s",
+                    geo ? "GEOMETRIC PID" : "super-twisting");
+      }
+    }
+    RCLCPP_INFO(this->get_logger(), "f_ext bound: vertical %.2f, horizontal %s",
+                this->get_parameter("control_gains.f_ext_max_fraction").as_double(),
+                fext_xy > 0.0 ? std::to_string(fext_xy).c_str() : "(same)");
     RCLCPP_INFO(this->get_logger(), "External-force observer (item 8): %s, gain %.2f rad/s",
                 f_ext_gain > 0.0 ? "ON" : "OFF", f_ext_gain);
 
     // Also shared by both laws: the low-pass on omega_ref. Zero disables it.
+    this->declare_parameter("control_gains.antiwindup_split", false);
+    antiwindup_split_ = this->get_parameter("control_gains.antiwindup_split").as_bool();
+    RCLCPP_INFO(this->get_logger(), "Anti-windup split (tilt does not freeze the translational integral): %s",
+                antiwindup_split_ ? "ON" : "OFF");
     this->declare_parameter("control_gains.omega_ref_filter_hz", 0.0);
     const double omega_ref_hz = this->get_parameter("control_gains.omega_ref_filter_hz").as_double();
     controller_->setReferenceRateFilterHz(omega_ref_hz);
@@ -344,6 +401,12 @@ void ControllerNode::loadParams() {
         this->declare_parameter("control_gains.STA_K2_x", 0.0);
         this->declare_parameter("control_gains.STA_K2_y", 0.0);
         this->declare_parameter("control_gains.STA_K2_z", 0.0);
+        this->declare_parameter("control_gains.STA_K3_x", 0.0);
+        this->declare_parameter("control_gains.STA_K3_y", 0.0);
+        this->declare_parameter("control_gains.STA_K3_z", 0.0);
+        this->declare_parameter("control_gains.STA_K4_x", 0.0);
+        this->declare_parameter("control_gains.STA_K4_y", 0.0);
+        this->declare_parameter("control_gains.STA_K4_z", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_x", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_y", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_z", 0.0);
@@ -353,6 +416,15 @@ void ControllerNode::loadParams() {
         this->declare_parameter("control_gains.STA_K2_R_x", 0.0);
         this->declare_parameter("control_gains.STA_K2_R_y", 0.0);
         this->declare_parameter("control_gains.STA_K2_R_z", 0.0);
+        // Barrier-function adaptive gain. l_max <= 1.0 DISABLES it and the
+        // law is then bit-exact the fixed-gain one, which is how it A/Bs
+        // against one binary. See sta_reaching_law.h.
+        this->declare_parameter("control_gains.STA_w_limit_fraction", 0.40);
+        this->declare_parameter("control_gains.STA_ep_max", 0.0);
+        this->declare_parameter("control_gains.STA_adapt_l_max", 1.0);
+        this->declare_parameter("control_gains.STA_adapt_epsilon", 0.5);
+        this->declare_parameter("control_gains.STA_adapt_kappa", 0.25);
+        this->declare_parameter("control_gains.STA_adapt_filter_hz", 2.0);
 
         Eigen::Vector3d lambda, k1, k2, lambda_r, k1_r, k2_r;
 
@@ -387,6 +459,18 @@ void ControllerNode::loadParams() {
         RCLCPP_INFO(this->get_logger(), "Lambda_R: [%.2f, %.2f, %.2f]", lambda_r(0), lambda_r(1), lambda_r(2));
         RCLCPP_INFO(this->get_logger(), "K1_R:     [%.2f, %.2f, %.2f]", k1_r(0), k1_r(1), k1_r(2));
         RCLCPP_INFO(this->get_logger(), "K2_R:     [%.2f, %.2f, %.2f]", k2_r(0), k2_r(1), k2_r(2));
+        px4_offboard::BarrierGain adapt;
+        adapt.l_max     = this->get_parameter("control_gains.STA_adapt_l_max").as_double();
+        adapt.epsilon   = this->get_parameter("control_gains.STA_adapt_epsilon").as_double();
+        adapt.kappa     = this->get_parameter("control_gains.STA_adapt_kappa").as_double();
+        adapt.filter_hz = this->get_parameter("control_gains.STA_adapt_filter_hz").as_double();
+        if (adapt.l_max > 1.0) {
+            RCLCPP_INFO(this->get_logger(),
+                        "Adaptive: ON  L<=%.2f eps=%.2f kappa=%.2f lpf=%.1f Hz (XY only)",
+                        adapt.l_max, adapt.epsilon, adapt.kappa, adapt.filter_hz);
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Adaptive: OFF (fixed gains)");
+        }
         RCLCPP_INFO(this->get_logger(), "==================================");
 
         auto* stsmc_controller = static_cast<StSmcController*>(controller_.get());
@@ -394,8 +478,24 @@ void ControllerNode::loadParams() {
         stsmc_controller->setLambdaR(lambda_r);
         stsmc_controller->setK1(k1);
         stsmc_controller->setK2(k2);
+        Eigen::Vector3d k3, k4;
+        k3 << this->get_parameter("control_gains.STA_K3_x").as_double(),
+              this->get_parameter("control_gains.STA_K3_y").as_double(),
+              this->get_parameter("control_gains.STA_K3_z").as_double();
+        k4 << this->get_parameter("control_gains.STA_K4_x").as_double(),
+              this->get_parameter("control_gains.STA_K4_y").as_double(),
+              this->get_parameter("control_gains.STA_K4_z").as_double();
+        stsmc_controller->setK3(k3);
+        stsmc_controller->setK4(k4);
+        RCLCPP_INFO(this->get_logger(), "K3:       [%.2f, %.2f, %.2f]  K4: [%.2f, %.2f, %.2f]",
+                    k3(0), k3(1), k3(2), k4(0), k4(1), k4(2));
         stsmc_controller->setK1R(k1_r);
         stsmc_controller->setK2R(k2_r);
+        stsmc_controller->setStaEpMax(
+            this->get_parameter("control_gains.STA_ep_max").as_double());
+        stsmc_controller->setStaWLimitFraction(
+            this->get_parameter("control_gains.STA_w_limit_fraction").as_double());
+        stsmc_controller->setAdaptiveGain(adapt);
         return;
     }
 
@@ -540,6 +640,7 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
     // the delivered wrench is no longer the commanded one. Recorded so the
     // control law can hold its integral state while that is true.
     allocation_saturated_ = false;
+    tilt_saturated_ = false;
 
     if (_num_of_arms == 3) {
         Eigen::Vector3d reduced_wrench;
@@ -611,11 +712,13 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
 
         // Keep physical angles in radians internally; convert to normalized only when publishing.
         const double tilt_1_desired = std::clamp(computed_tilt_rad, tilt_min_deg_ * kDegToRad, -tilt_min_deg_ * kDegToRad);
+        tilt_saturated_ = tilt_saturated_ || tilt_1_desired != computed_tilt_rad;
         allocation_saturated_ = allocation_saturated_ || tilt_1_desired != computed_tilt_rad;
 
         // Rate limiting
         const double delta_desired = tilt_1_desired - tilt_1_prev_;
         const double delta = std::clamp(delta_desired, -kTiltRateLimitRadPerStep, kTiltRateLimitRadPerStep);
+        tilt_saturated_ = tilt_saturated_ || delta != delta_desired;
         allocation_saturated_ = allocation_saturated_ || delta != delta_desired;
         tilt_1_rad_ = tilt_1_prev_ + delta;
         tilt_1_prev_ = tilt_1_rad_;
@@ -956,7 +1059,14 @@ void ControllerNode::updateControllerOutput() {
     // super-twisting state up. Takes effect on the next cycle, 10 ms later.
     const bool throttle_saturated = !throttles.allFinite() ||
         (throttles.array() < 0.0).any() || (throttles.array() > 1.0).any();
-    controller_->setActuatorsSaturated(allocation_saturated_ || throttle_saturated);
+    // The tilt terms are the YAW axis; excluding them from the TRANSLATIONAL
+    // flag is roadmap "anti-windup split". Default false reproduces the single
+    // combined flag bit-for-bit, so it A/Bs against one binary.
+    const bool rotational_saturated = allocation_saturated_ || throttle_saturated;
+    const bool translational_saturated = antiwindup_split_
+        ? ((allocation_saturated_ && !tilt_saturated_) || throttle_saturated)
+        : rotational_saturated;
+    controller_->setActuatorsSaturated(rotational_saturated, translational_saturated);
 
     // Publish the controller output
     if (current_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {
