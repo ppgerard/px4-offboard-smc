@@ -101,6 +101,15 @@ void SmcController::calculateControllerOutput(
     // Cap the commanded lean before it becomes an attitude (see limitTilt).
 
     I_a_d = limitTilt(I_a_d);
+    // Record the FULL demand for the allocator BEFORE removing the tilt's share.
+    // Reading it after would ask the tilt to serve the same force twice; see
+    // desiredForceBody().
+    i_a_d_full_ = I_a_d;
+    // Hand the attitude only what the TILT did not already deliver. Zero unless
+    // the QP allocator is on, so this is bit-exact the previous law by default.
+    if (served_body_x_ != 0.0) {
+        I_a_d -= R_B_W_ * Eigen::Vector3d(served_body_x_, 0.0, 0.0);
+    }
 
     thrust = projectedThrust(I_a_d);
     noteAppliedThrust(thrust);

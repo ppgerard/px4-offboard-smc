@@ -47,6 +47,24 @@ struct StaGains {
     Eigen::Vector3d k2 = Eigen::Vector3d::Zero();   // integral branch
     Eigen::Vector3d k3 = Eigen::Vector3d::Zero();   // linear proportional
     Eigen::Vector3d k4 = Eigen::Vector3d::Zero();   // linear integral
+    // UNIFORM / FIXED-TIME STA (Cruz-Zavala, Moreno & Fridman 2010). beta adds a
+    // |s|^{3/2} term to the proportional branch and the matching quadratic to the
+    // integral branch. ZERO reproduces the classical law exactly.
+    //
+    // WHY THIS SHAPE. The classical sqrt branch makes very little FORCE at
+    // moderate displacement, so its restoring stiffness FALLS as the error grows
+    // -- measured 3.83 N/m at 5 cm down to 1.11 at 60 cm, against PX4's constant
+    // 7.09. That is backwards for station keeping and is why K1, Lambda, the
+    // adaptive gain and the reference schemes all failed: every one of them
+    // SCALES a curve whose SHAPE is wrong.
+    //
+    // The |s|^{3/2} term fixes the shape where it is wrong and, crucially, leaves
+    // the crossover alone: its incremental gain VANISHES as s -> 0 (d/ds = 1.5*
+    // beta*sqrt|s|) and dominates far out. At |s| = 1e-3 it adds 0.7% of the sqrt
+    // branch's gain; at |s| = 0.9 it adds 600%. That is the opposite of k3, whose
+    // FLAT gain added 2.0 at the 10.7 Hz crossover and cost the phase margin that
+    // made K3 = 6 lose 7 of 12 paired draws once the MC sampled tau.
+    Eigen::Vector3d beta = Eigen::Vector3d::Zero();
 };
 
 // Super-twisting integral update w += increment, with the two bounds the plain
@@ -150,8 +168,21 @@ inline Eigen::Vector3d staReachingStep(const Eigen::Vector3d &s,
     }
 
     // Integral branch: the switching term plus the generalised linear one.
+    // Integral branch: the switching term plus the generalised linear one, and
+    // the uniform STA's matching quadratic. The pairing is not optional --
+    // phi2 = phi1' * phi1 is what keeps the Lyapunov argument intact, exactly as
+    // k1 ~ sqrt(L), k2 ~ L does for the adaptive gain. With beta = 0 the bracket
+    // is 1 and this is bit-exact the classical increment.
+    Eigen::Vector3d xi_uniform = xi;
+    for (int i = 0; i < 3; ++i) {
+        if (gains.beta(i) != 0.0) {
+            const double a = std::abs(s(i)), b2 = gains.beta(i);
+            // phi1'*phi1 / (1/2) , normalised so beta = 0 leaves xi untouched
+            xi_uniform(i) = xi(i) * (1.0 + 4.0 * b2 * a + 3.0 * b2 * b2 * a * a);
+        }
+    }
     const Eigen::Vector3d increment =
-        -(gains.k2.cwiseProduct(xi) + gains.k4.cwiseProduct(s)) * dt;
+        -(gains.k2.cwiseProduct(xi_uniform) + gains.k4.cwiseProduct(s)) * dt;
 
     if (implicit) {
         integrateStaState(w, increment, w_limit, saturated);
@@ -164,7 +195,9 @@ inline Eigen::Vector3d staReachingStep(const Eigen::Vector3d &s,
     for (int i = 0; i < 3; ++i) {
         const double magnitude = std::sqrt(std::abs(sigma(i)));
         const double sign = (sigma(i) > 0.0) - (sigma(i) < 0.0);
-        u(i) = -gains.k1(i) * magnitude * sign - gains.k3(i) * s(i) + w(i);
+        // phi1(s) = |s|^1/2 sign(s) + beta |s|^3/2 sign(s)
+        const double phi1 = magnitude + gains.beta(i) * magnitude * std::abs(sigma(i));
+        u(i) = -gains.k1(i) * phi1 * sign - gains.k3(i) * s(i) + w(i);
     }
 
     if (!implicit) {

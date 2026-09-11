@@ -160,6 +160,18 @@ public:
     // off-centre and therefore descends slowly while the wind works on it.
     this->declare_parameter("landing_parameters.phase2_max_velocity_z", 0.3);
     this->declare_parameter("landing_parameters.cone_slope", 0.30);
+    // Ground radius the camera sees per metre of height. The default is the
+    // SIMULATOR's camera (mono_cam/model.sdf, horizontal_fov 1.74 rad = 99.7 deg,
+    // so tan(49.85 deg) = 1.19) and it does not transfer: the real T2 carries a
+    // Camera Module 3 measured at 58.9 x 38.9 deg, whose GUARANTEED (inscribed)
+    // radius is 0.344*h -- 3.5x smaller. Left at the SITL value here so the
+    // simulator is bit-exact, and overridden in config/exp/t2_hw_param.yaml.
+    //
+    // Note this is the radius the tag is guaranteed to be inside, not the corner
+    // distance: the ladder uses it to decide whether a climb could bring the tag
+    // back into frame, and under-estimating only makes it climb sooner, which is
+    // the designed response. Over-estimating is what stops it climbing at all.
+    this->declare_parameter("landing_parameters.camera_footprint_slope", 1.19);
     phase2_max_velocity_z_ = this->get_parameter("landing_parameters.phase2_max_velocity_z").as_double();
     cone_slope_ = this->get_parameter("landing_parameters.cone_slope").as_double();
     // ---- Terminal descent -----------------------------------------------------
@@ -276,6 +288,8 @@ public:
     tag_loss_thresholds_.cone_slope = cone_slope_;
     tag_loss_thresholds_.cone_radius_min = cone_radius_min_;
     tag_loss_thresholds_.no_escalation_below = commit_altitude_;
+    tag_loss_thresholds_.footprint_slope =
+        this->get_parameter("landing_parameters.camera_footprint_slope").as_double();
 
     // TF2 buffer and listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
@@ -752,9 +766,21 @@ protected:
   // An "age" beyond this is not a late measurement, it is a different clock.
   static constexpr double kImplausibleMeasurementAge = 3600.0;  // [s]
 
-  // Groundtruth state for diagnostics
-  Eigen::Vector3d groundtruth_position_W_;
-  Eigen::Vector3d groundtruth_velocity_W_;
+  // Groundtruth state for diagnostics. ZERO-INITIALISED on purpose: Eigen does
+  // not zero a default-constructed vector, and on hardware nothing ever writes
+  // these (see groundtruth_received_ below), so the five diagnostics derived
+  // from them published uninitialised memory for entire flights.
+  Eigen::Vector3d groundtruth_position_W_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d groundtruth_velocity_W_ = Eigen::Vector3d::Zero();
+  // Whether a groundtruth message has EVER arrived. False on hardware for the
+  // whole flight: groundtruthCallback() is fed by
+  // /fmu/out/vehicle_local_position_groundtruth_v1, which only the simulator
+  // publishes. Measured on the real T2 (10 Sep): /landing/estimated_position,
+  // /landing/position_raw, /landing/filter_position, /landing/odometry and
+  // /landing/groundtruth each carried a CONSTANT 9.78e199 for a whole flight --
+  // five of the six topics the estimator is debugged with, all finite, all
+  // plausible-looking in a plot, all meaningless. See truthError().
+  bool groundtruth_received_ = false;
 
   // Raw tag position (unfiltered)
   Eigen::Vector3d position_W_raw_;
@@ -2290,23 +2316,43 @@ protected:
     platform_position_pub_->publish(pos_msg);
   }
 
+  // These diagnostics score an estimate AGAINST GROUNDTRUTH, which exists only in
+  // the simulator. On hardware the subtraction is meaningless, so publish the
+  // absolute quantity instead: "where does this estimator think the vehicle is"
+  // is the useful question when there is nothing to score it against, and it is
+  // the question the real aircraft actually needs answered.
+  //
+  // So the SEMANTICS of these topics differ by rig, deliberately:
+  //   SITL     -> error, groundtruth - estimate, and 0 is perfect
+  //   hardware -> the estimate itself, in the world/ENU frame
+  // Both are finite and both are worth plotting; only the interpretation moves.
+  Eigen::Vector3d truthError(const Eigen::Vector3d& estimate) const {
+    return groundtruth_received_ ? (groundtruth_position_W_ - estimate) : estimate;
+  }
+
   void publishDiagnostics() {
     // Publish odometry with orientation and angular velocity from odometry callback
-    diagnostics_->publishOdometry(groundtruth_position_W_ - drone_position_W_, drone_velocity_W_,
+    diagnostics_->publishOdometry(truthError(drone_position_W_), drone_velocity_W_,
                                  drone_orientation_W_, drone_angular_velocity_W_,
                                  last_odometry_timestamp_);
 
-    // Publish groundtruth with odometry timestamp for synchronization
-    diagnostics_->publishGroundtruth(groundtruth_position_W_, groundtruth_velocity_W_, last_odometry_timestamp_);
+    // Groundtruth itself has no hardware fallback -- there is no second source to
+    // stand in for it -- so the topic stays SILENT rather than publishing zeros.
+    // A topic with no publisher is unambiguous; one stuck at the origin looks
+    // like a vehicle parked at the origin.
+    if (groundtruth_received_) {
+      diagnostics_->publishGroundtruth(groundtruth_position_W_, groundtruth_velocity_W_,
+                                       last_odometry_timestamp_);
+    }
 
     // Publish current phase
     diagnostics_->publishPhase(static_cast<int>(phase_), last_odometry_timestamp_);
 
     // Publish estimated position (fused estimate)
-    diagnostics_->publishEstimatedPosition(groundtruth_position_W_ - estimated_position_W_, last_odometry_timestamp_);
+    diagnostics_->publishEstimatedPosition(truthError(estimated_position_W_), last_odometry_timestamp_);
 
     // Publish raw tag position
-    diagnostics_->publishPositionRaw(groundtruth_position_W_ - position_W_filtered_, last_odometry_timestamp_);
+    diagnostics_->publishPositionRaw(truthError(position_W_filtered_), last_odometry_timestamp_);
 
     // Publish the in-plane platform yaw: the complementary filter's pair, plus
     // the EKF's psi_pf -- which is a state with a covariance rather than a signal
@@ -2327,7 +2373,7 @@ protected:
     // dead reckoning alone has an estimate, but scoring it would measure the
     // odometry rather than the estimator.
     if (filter_measurement_received_) {
-      diagnostics_->publishFilterPosition(groundtruth_position_W_ - filter_position_W_,
+      diagnostics_->publishFilterPosition(truthError(filter_position_W_),
                                           last_odometry_timestamp_);
       diagnostics_->publishFilterSigma(filter_sigma_, filter_platform_yaw_sigma_,
                                        last_odometry_timestamp_);
@@ -2607,6 +2653,7 @@ protected:
 
     groundtruth_position_W_ = px4_frames::rotateVectorFromToENU_NED(gt_position);
     groundtruth_velocity_W_ = px4_frames::rotateVectorFromToENU_NED(gt_velocity);
+    groundtruth_received_ = true;
   }
 };
 

@@ -113,6 +113,7 @@ void StSmcController::calculateControllerOutput(
     gains.k2 = K2;
     gains.k3 = K3;
     gains.k4 = K4;
+    gains.beta = Beta;
 
     // Barrier-function adaptive gain, XY ONLY, and the restriction is the whole
     // design. Wind is the one MATCHED disturbance here, so it is the one more
@@ -164,6 +165,15 @@ void StSmcController::calculateControllerOutput(
     // actually meeting at the lean it is actually holding.
     updateInputGain(I_a_d, dt_);
     I_a_d = limitTilt(I_a_d);
+    // Record the FULL demand for the allocator BEFORE removing the tilt's share.
+    // Reading it after would ask the tilt to serve the same force twice; see
+    // desiredForceBody().
+    i_a_d_full_ = I_a_d;
+    // Hand the attitude only what the TILT did not already deliver. Zero unless
+    // the QP allocator is on, so this is bit-exact the previous law by default.
+    if (served_body_x_ != 0.0) {
+        I_a_d -= R_B_W_ * Eigen::Vector3d(served_body_x_, 0.0, 0.0);
+    }
 
     thrust = projectedThrust(I_a_d);
     noteAppliedThrust(thrust);

@@ -35,6 +35,7 @@
 #include "px4_offboard_lowlevel/controller_node.h"
 
 #include <algorithm>
+#include "px4_offboard_lowlevel/qp_allocator.h"
 
 namespace {
 constexpr double kDegToRad = M_PI / 180.0;
@@ -66,6 +67,11 @@ constexpr double kTricopterArm1Y = 0.215;
 constexpr double kTricopterArm2X = 0.20;
 constexpr double kTricopterArm2Y = 0.215;
 constexpr double kTricopterArm3X = 0.40;
+// Distance from the TILT AXIS down to the rotor plane. model.sdf puts motor_N
+// (the tilting nacelle, and the joint) at z = 0.045 and rotor_N (where thrust is
+// applied) at z = 0.0, both relative to base_link -- so the rotor hangs 45 mm
+// below the axis it swings about, and the thrust point moves when it tilts.
+constexpr double kTiltAxisToRotorZ = 0.045;
 constexpr double kTricopterArm1Z = 0.0;
 constexpr double kTricopterArm2Z = 0.0;
 
@@ -238,6 +244,24 @@ void ControllerNode::loadParams() {
     }
     tilt_min_deg_ = this->get_parameter("uav_parameters.tilt_min_deg").as_double();
     tilt_max_deg_ = this->get_parameter("uav_parameters.tilt_max_deg").as_double();
+    this->declare_parameter("uav_parameters.qp_allocation", false);
+    this->declare_parameter("uav_parameters.qp_yaw_weight", 0.25);
+    this->declare_parameter("uav_parameters.qp_tilt_rate_dps", 90.0);
+    this->declare_parameter("uav_parameters.qp_rotor_spin_rate", 0.0);
+    this->declare_parameter("uav_parameters.qp_tilt_limit_deg", 6.5);
+    this->declare_parameter("uav_parameters.qp_fx_weight", 1.0);
+    this->declare_parameter("uav_parameters.qp_fz_weight", 5.0);
+    qp_allocation_ = this->get_parameter("uav_parameters.qp_allocation").as_bool();
+    qp_yaw_weight_ = this->get_parameter("uav_parameters.qp_yaw_weight").as_double();
+    qp_tilt_rate_dps_ = this->get_parameter("uav_parameters.qp_tilt_rate_dps").as_double();
+    qp_rotor_spin_rate_ = this->get_parameter("uav_parameters.qp_rotor_spin_rate").as_double();
+    qp_tilt_limit_deg_ = this->get_parameter("uav_parameters.qp_tilt_limit_deg").as_double();
+    qp_fx_weight_ = this->get_parameter("uav_parameters.qp_fx_weight").as_double();
+    qp_fz_weight_ = this->get_parameter("uav_parameters.qp_fz_weight").as_double();
+    RCLCPP_INFO(this->get_logger(), "Allocation: %s (yaw weight %.2f, tilt +-%.1f deg, rate %.0f deg/s, gyro %s)",
+                qp_allocation_ ? "CONSTRAINED QP" : "3x3 pseudo-inverse",
+                qp_yaw_weight_, qp_tilt_limit_deg_, qp_tilt_rate_dps_,
+                qp_rotor_spin_rate_ > 0.0 ? "ON" : "off");
     tilt_1_servo_index_ = this->get_parameter("uav_parameters.tilt_1_servo_index").as_int();
     tilt_2_servo_index_ = this->get_parameter("uav_parameters.tilt_2_servo_index").as_int();
     // ActuatorServos carries 8 channels; an out-of-range index would read or
@@ -407,6 +431,9 @@ void ControllerNode::loadParams() {
         this->declare_parameter("control_gains.STA_K4_x", 0.0);
         this->declare_parameter("control_gains.STA_K4_y", 0.0);
         this->declare_parameter("control_gains.STA_K4_z", 0.0);
+        this->declare_parameter("control_gains.STA_beta_x", 0.0);
+        this->declare_parameter("control_gains.STA_beta_y", 0.0);
+        this->declare_parameter("control_gains.STA_beta_z", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_x", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_y", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_z", 0.0);
@@ -487,6 +514,14 @@ void ControllerNode::loadParams() {
               this->get_parameter("control_gains.STA_K4_z").as_double();
         stsmc_controller->setK3(k3);
         stsmc_controller->setK4(k4);
+        Eigen::Vector3d beta;
+        beta << this->get_parameter("control_gains.STA_beta_x").as_double(),
+                this->get_parameter("control_gains.STA_beta_y").as_double(),
+                this->get_parameter("control_gains.STA_beta_z").as_double();
+        stsmc_controller->setBeta(beta);
+        RCLCPP_INFO(this->get_logger(), "Uniform STA |s|^3/2 beta: [%.2f %.2f %.2f]%s",
+                    beta(0), beta(1), beta(2),
+                    beta.norm() > 0.0 ? "" : "   (classical law)");
         RCLCPP_INFO(this->get_logger(), "K3:       [%.2f, %.2f, %.2f]  K4: [%.2f, %.2f, %.2f]",
                     k3(0), k3(1), k3(2), k4(0), k4(1), k4(2));
         stsmc_controller->setK1R(k1_r);
@@ -575,18 +610,27 @@ void ControllerNode::compute_ControlAllocation_and_ActuatorEffect_matrices(doubl
         // Tau_z is intentionally handled by a separate loop.
         rotor_velocities_to_torques_and_thrust.resize(3, 3);
 
-        const double l_1_x = kTricopterArm1X;
-        const double l_1_y = kTricopterArm1Y;
-        const double l_2_x = kTricopterArm2X;
-        const double l_2_y = kTricopterArm2Y;
-        const double l_3_x = kTricopterArm3X;
-        const double l_1_z = kTricopterArm1Z;
-        const double l_2_z = kTricopterArm2Z;
-
         const double c_1 = std::cos(tilt_1_rad);
         const double c_2 = std::cos(tilt_2_rad);
         const double s_1 = std::sin(tilt_1_rad);
         const double s_2 = std::sin(tilt_2_rad);
+
+        const double l_1_y = kTricopterArm1Y;
+        const double l_2_y = kTricopterArm2Y;
+        const double l_3_x = kTricopterArm3X;
+        // TILT-DEPENDENT LEVER ARMS. The rotor hangs kTiltAxisToRotorZ BELOW the
+        // tilt axis (model.sdf: motor_N at z = 0.045, rotor_N at z = 0.0), so
+        // tilting MOVES the point the thrust is applied at:
+        //     l_x(t) = l_x0 - d*sin(t)      l_z(t) = d*(1 - cos(t))
+        // At the old +-6.5 deg clamp that is a 2.5% error on l_x and it never
+        // mattered. At the 10-20 deg common-mode tilt needs it is ~8%, worth
+        // ~0.24 N.m of UNCOMMANDED pitch across the pair -- about eight times the
+        // hover trim torque. Fixed arms are only valid near zero tilt, which is
+        // the only regime this airframe has ever flown.
+        const double l_1_x = kTricopterArm1X - kTiltAxisToRotorZ * s_1;
+        const double l_2_x = kTricopterArm2X - kTiltAxisToRotorZ * s_2;
+        const double l_1_z = kTricopterArm1Z + kTiltAxisToRotorZ * (1.0 - c_1);
+        const double l_2_z = kTricopterArm2Z + kTiltAxisToRotorZ * (1.0 - c_2);
 
         rotor_velocities_to_torques_and_thrust <<
             -c_1 * _thrust_constant * l_1_y - _moment_constant * _thrust_constant * s_1,  c_2 * _thrust_constant * l_2_y + _moment_constant * _thrust_constant * s_2, 0.0,
@@ -641,6 +685,77 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
     // control law can hold its integral state while that is true.
     allocation_saturated_ = false;
     tilt_saturated_ = false;
+
+    if (_num_of_arms == 3 && qp_allocation_) {
+        // ---- CONSTRAINED ALLOCATION (qp_allocator.h) ---------------------
+        // Five actuators (3 rotor speeds + 2 tilts) for five demands
+        // (tau_xyz, F_x, F_z). The 3x3 path below has NO F_x row, so body-x
+        // force is a side effect there; here it is commanded, limits are
+        // constraints rather than post-hoc clamps, and saturation is reported
+        // per actuator instead of through one shared flag.
+        px4_offboard::TricopterGeometry g;
+        g.ct = _thrust_constant;  g.km = _moment_constant;
+        g.r0 = Eigen::Vector3d( kTricopterArm1X, -kTricopterArm1Y, 0.0);
+        g.r1 = Eigen::Vector3d( kTricopterArm2X,  kTricopterArm2Y, 0.0);
+        g.r2 = Eigen::Vector3d(-kTricopterArm3X,  0.0,             0.0);
+        g.tilt_axis_to_rotor_z = kTiltAxisToRotorZ;
+        g.spin = Eigen::Vector3d(rotor_yaw_sign_[0], rotor_yaw_sign_[1], rotor_yaw_sign_[2]);
+        g.rotor_spin_rate = qp_rotor_spin_rate_;   // 0 disables the gyroscopic term
+
+        px4_offboard::AllocLimits lim;
+        // Rotor ceiling from the airframe's own EC_MAX -- the same number the
+        // SITL mapping divides by, so the constraint matches what can be sent.
+        const double w_ceiling = static_cast<double>(_SIM_GZ_EC_MAX);
+        lim.w_max   = w_ceiling * w_ceiling;
+        // SYMMETRIC control bound, NOT the servo's mechanical range. tilt_max_deg_
+        // is 90 deg -- the travel used for OUTPUT MAPPING -- while the 3x3 path
+        // has always clamped to +-tilt_min_deg_ (6.5 deg). Handing the allocator
+        // the mechanical range gave it 14x more positive tilt than the loop has
+        // ever used: measured 11 Sep, lean p95 reached 77.8 deg and the run never
+        // landed, because a large tilt collapses F_z (cos 90 = 0) and altitude
+        // control goes with it.
+        //
+        // Widening this IS the point of common-mode tilt, but it has to be a
+        // deliberate sweep from the authority the aircraft already flies, not a
+        // side effect of picking the wrong constant.
+        const double tilt_lim = qp_tilt_limit_deg_ * kDegToRad;
+        lim.tilt_min = -tilt_lim;
+        lim.tilt_max =  tilt_lim;
+        lim.dtilt_max = qp_tilt_rate_dps_ * kDegToRad * px4_offboard::kControlPeriodSeconds;
+
+        px4_offboard::AllocWeights wt;
+        // The three weights that set the trade. w_out(3) (F_x) is also the GAIN of
+        // the split feedback loop -- the allocator is fed the REMAINDER, so
+        // S_{n+1} = alpha*(F - S_n) with alpha rising in this weight: 1.0 is
+        // marginal and oscillates, lower converges but under-serves.
+        wt.w_out(2) = qp_yaw_weight_;   // yaw is what to give up first
+        wt.w_out(3) = qp_fx_weight_;
+        wt.w_out(4) = qp_fz_weight_;
+
+        // Desired wrench. F_x / F_z come from the control law's own force
+        // command resolved into body axes.
+        const Eigen::Vector3d F_b = controller_ ? controller_->desiredForceBody()
+                                                : Eigen::Vector3d::Zero();
+        Eigen::Matrix<double,5,1> want;
+        want << wrench(0), wrench(1), wrench(2), F_b.x(), wrench(3);
+
+        const auto res = px4_offboard::allocate(g, lim, wt, qp_state_, want, 3,
+                                                px4_offboard::kControlPeriodSeconds);
+        qp_state_ = res.x;
+        tilt_1_rad_ = res.x.t0;  tilt_1_prev_ = res.x.t0;
+        tilt_2_rad_ = res.x.t1;
+        // Tell the law what body-x actually arrived, so next cycle's attitude
+        // asks only for the remainder. ACHIEVED, not demanded.
+        if (controller_) { controller_->setServedBodyX(res.achieved(3)); }
+        // Per-actuator saturation: a saturated TILT is the yaw axis and says
+        // nothing about the translational wrench, which one shared flag could
+        // not express.
+        tilt_saturated_ = res.at_limit[3] || res.at_limit[4];
+        allocation_saturated_ = res.at_limit[0] || res.at_limit[1] || res.at_limit[2];
+        Eigen::Vector3d w = res.x.w.cwiseMax(0.0);
+        *omega = w.cwiseSqrt();
+        return true;
+    }
 
     if (_num_of_arms == 3) {
         Eigen::Vector3d reduced_wrench;

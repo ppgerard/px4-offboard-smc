@@ -24,6 +24,44 @@
       PWM_MAX: 1950
       SIM_GZ_EC_MAX: 1139        # rad/s, corresponds to SIM_GZ_EC_MAX from PX4 parameters
       SIM_GZ_EC_MIN: 0           # rad/s, corresponds to SIM_GZ_EC_MIN from PX4 parameters 10 AVANT
+      # ===== CONSTRAINED ALLOCATION (qp_allocator.h) =====
+      # false = the 3x3 pseudo-inverse, BIT-EXACT the previous behaviour.
+      #
+      # The 3x3 form has no F_x row, so the body-x force a tilted nacelle makes
+      # is a side effect nothing commands -- and `tilt_2 = -tilt_1` made common
+      # mode identically zero, so the one DOF that can hold a head/tail wind
+      # WITHOUT leaning was unusable. Measured 11 Sep over 78 fair draws: the
+      # STSMC is 1/6 against PX4's 6/6 at 7.5 m/s nose-on, where the disturbance
+      # is only ~2.4 N = 8.4 deg of common tilt.
+      qp_allocation: false
+      # Weight on tau_z in the allocation objective. Yaw is what to give up
+      # first here: it is served by DIFFERENTIAL tilt, the same actuator that
+      # makes body-x force, so under saturation the two compete directly. A
+      # landing needs the heading roughly right and the position to centimetres.
+      qp_yaw_weight: 0.25
+      # Tilt servo rate limit [deg/s], as a CONSTRAINT rather than a post-hoc
+      # clamp. The shipped 90 deg/s is a bare constant with no derivation; the
+      # datasheet says 0.10 s/60 deg = 600 deg/s NO-LOAD at 6.0 V, so the usable
+      # figure is likely 200-300 once load and gyroscopic reaction are allowed
+      # for. This is the number to sweep.
+      qp_tilt_rate_dps: 90.0
+      # Rotor spin rate [rad/s] for the GYROSCOPIC term; 0 disables it. Tilting
+      # a spinning rotor precesses: measured in the offline test, a DIFFERENTIAL
+      # tilt at 90 deg/s makes 0.37 N.m of roll (12x the hover trim torque) while
+      # a COMMON-MODE tilt cancels to 0.0000 -- the fronts spin opposite ways.
+      qp_rotor_spin_rate: 0.0
+      # SYMMETRIC tilt bound for the allocator [deg]. 6.5 reproduces the authority
+      # the 3x3 path has always had. tilt_max_deg (90) is the SERVO's mechanical
+      # travel for output mapping and must not be used here -- doing so let the
+      # allocator command lean p95 of 77.8 deg and lose the aircraft.
+      # Widening this is the experiment; it is not a default.
+      qp_tilt_limit_deg: 6.5
+      # Allocation objective weights. F_x is ALSO the gain of the split feedback
+      # loop (the allocator is fed the remainder), so it trades authority against
+      # stability: 1.0 served nearly the whole demand and oscillated, 0.5
+      # converged but under-served and the aircraft drifted.
+      qp_fx_weight: 1.0
+      qp_fz_weight: 5.0
     landing_parameters:
       # ===== Reference generation (roadmap item 11) =====
       # Bandwidth [rad/s] of the third-order reference model. 0.0 keeps the old

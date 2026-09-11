@@ -165,6 +165,32 @@
       tilt_max_deg: 90.0
 
     landing_parameters:
+      # Ground radius the camera can see per metre of height. The node's default
+      # is 1.19, which is the SIMULATOR's camera (mono_cam/model.sdf,
+      # horizontal_fov 1.74 rad = 99.7 deg). The real T2 carries a Raspberry Pi
+      # Camera Module 3 (standard, 66 deg HFOV on a 16:9 sensor) requested at
+      # 1920x1200, i.e. 16:10, so libcamera crops ~11% of the width to make the
+      # aspect. Measured from the flight calibration (fx = fy = 1698.8, 1920x1200,
+      # cx 1129.1 / cy 615.6):
+      #
+      #   HFOV 58.9 deg, VFOV 38.9 deg
+      #   half-angle slopes  left 0.665  right 0.466  up 0.362  down 0.344
+      #   INSCRIBED (guaranteed) radius  0.344 * h      <- this value
+      #   corner (best case)             0.757 * h
+      #
+      # The VERTICAL field is what binds, and it is already almost the full sensor
+      # height -- which is why running the camera at full resolution buys only
+      # ~6% here (0.344 -> 0.365) and costs 5x the detector CPU. The lever, if
+      # more footprint is ever wanted, is the WIDE module: 0.695 * h, i.e. 2x.
+      #
+      # REPLACE WITH THE BENCH MEASUREMENT when it exists: camera at a known
+      # height pointing down, slide the tag along the image's SHORT axis until
+      # detection stops, slope = offset / height. That includes distortion and the
+      # detector's own edge behaviour, and trusts no calibration -- which matters
+      # here, because cx sits 169 px off centre on a 1920-wide image and that is
+      # either an off-centre crop or an under-constrained calibration.
+      camera_footprint_slope: 0.344
+
       # Shared with tag_ev_bridge_node so the estimator's input and the guidance
       # that consumes its output cannot disagree about the camera.
       #

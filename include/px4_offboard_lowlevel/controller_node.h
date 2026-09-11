@@ -37,6 +37,8 @@
 
 #include "rclcpp/rclcpp.hpp"
 
+#include "px4_offboard_lowlevel/qp_allocator.h"
+
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
@@ -132,6 +134,16 @@ private:
     double tilt_min_deg_ = -7.0;
     double tilt_max_deg_ = 90.0;
     int tilt_1_servo_index_ = 4;
+    // Constrained allocation (qp_allocator.h). Defaults OFF -> the 3x3
+    // pseudo-inverse path runs bit-exact as before.
+    bool qp_allocation_ = false;
+    double qp_yaw_weight_ = 0.25;
+    double qp_tilt_rate_dps_ = 90.0;
+    double qp_rotor_spin_rate_ = 0.0;
+    double qp_tilt_limit_deg_ = 6.5;
+    double qp_fx_weight_ = 1.0;
+    double qp_fz_weight_ = 5.0;   // SYMMETRIC control bound, not the servo range
+    px4_offboard::AllocState qp_state_;
     int tilt_2_servo_index_ = 5;
     // Sign of the differential-tilt -> yaw-torque relationship. +1 is the
     // simulator's geometry; the real T2 measured -1 in flight. See the note at

@@ -170,6 +170,20 @@ install(DIRECTORY
 
 if(BUILD_TESTING)
 
+  # ROS-free offline checks. Each is a standalone executable returning non-zero
+  # on failure, so they run in ~1 s with no simulator -- which is the only reason
+  # defects like the badly-conditioned allocator solve or the wrong common-mode
+  # force expectation were found before a flight rather than after one.
+  foreach(_t sta_reaching_law_test reference_model_test reference_rate_filter_test
+             external_force_observer_test relative_state_filter_test qp_allocator_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_t}.cpp")
+      add_executable(${_t} test/${_t}.cpp)
+      target_include_directories(${_t} PRIVATE ${EIGEN3_INCLUDE_DIRS})
+      target_link_libraries(${_t} Eigen3::Eigen)
+      add_test(NAME ${_t} COMMAND ${_t})
+    endif()
+  endforeach()
+
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

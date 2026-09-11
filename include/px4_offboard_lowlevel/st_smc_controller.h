@@ -104,6 +104,8 @@ public:
         K4 = k4;
     }
 
+    // Uniform / fixed-time STA: the |s|^{3/2} coefficient. Zero = classical.
+    void setBeta(const Eigen::Vector3d &b) { Beta = b; }
     // Super-twisting gains, rotational
     void setK1R(const Eigen::Vector3d &k1_r) {
         K1_R = k1_r;
@@ -146,6 +148,7 @@ private:
     Eigen::Vector3d K2;
     Eigen::Vector3d K3 = Eigen::Vector3d::Zero();
     Eigen::Vector3d K4 = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Beta = Eigen::Vector3d::Zero();
     Eigen::Vector3d K1_R;
     Eigen::Vector3d K2_R;
 

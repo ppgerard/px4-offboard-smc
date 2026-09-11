@@ -196,6 +196,41 @@ public:
         tilt_max_rad_ = (deg > 0.0) ? deg * M_PI / 180.0 : 0.0;
     }
 
+    // The force the ALLOCATOR actually delivered along body x last cycle. The
+    // attitude must be chosen BEFORE the allocation runs, so the two cannot be
+    // solved together without iterating the whole loop; feeding the achieved
+    // value back one cycle later closes it instead. At 100 Hz that is 10 ms
+    // against a translational loop at ~1.5 rad/s -- about 0.9 deg of phase.
+    //
+    // ACHIEVED, not demanded, is the point: if the tilt saturated or the servo
+    // rate-limited, the attitude picks up exactly the remainder, and the two
+    // actuators cannot both claim the same newton. Zero unless the QP allocator
+    // is on, so the laws are bit-exact by default.
+    void setServedBodyX(double f) { served_body_x_ = f; }
+    double servedBodyX() const { return served_body_x_; }
+    // Desired force in BODY axes, for the allocator's F_x / F_z rows.
+    // Body-frame force demand handed to the allocator: the REMAINDER after the
+    // tilt's last contribution, not the full demand.
+    //
+    // This makes the split a stable feedback loop rather than a static division.
+    // With alpha the fraction the allocator actually serves,
+    //
+    //     S_{n+1} = alpha * (F - S_n)      fixed point S* = alpha*F/(1+alpha)
+    //                                      eigenvalue -alpha
+    //
+    // so it CONVERGES for alpha < 1 and is marginal at alpha ~ 1. The F_x weight
+    // in AllocWeights is exactly that gain: at w_Fx = 1.0 the allocator served
+    // nearly everything asked, alpha ~ 1, and the result was the marginal
+    // oscillation measured 11 Sep (bimodal -- 5.5/6.5/6.7 cm when it did not
+    // trip, 147-165 cm when it did). At w_Fx = 0.5 the loop self-limits.
+    //
+    // Feeding the FULL demand instead was tried and is worse: algebraically the
+    // total force is the same either way, but it puts the MAXIMUM on the tilt
+    // rather than letting the split settle, and it landed 0/3 at the same tilt
+    // authority the 3x3 path flies.
+    Eigen::Vector3d desiredForceBody() const { return R_B_W_.transpose() * i_a_d_last_; }
+
+
     // Bound on the external-force estimate, as a fraction of hover thrust.
     void setFextMaxFraction(double f) {
         if (f > 0.0) { fext_max_fraction_ = f; }
@@ -497,7 +532,9 @@ protected:
     // a rotor clamped at zero, a throttle outside [0, 1], a tilt on its stop.
     double fext_max_fraction_ = px4_offboard::kFextMaxHoverFraction;
     double fext_max_fraction_xy_ = 0.0;   // 0 = use fext_max_fraction_
-    double tilt_max_rad_ = 0.0;   // commanded lean limit; 0 = unlimited
+    double tilt_max_rad_ = 0.0;           // commanded lean limit; 0 = unlimited
+    double served_body_x_ = 0.0;          // body-x force the allocator delivered
+    Eigen::Vector3d i_a_d_full_ = Eigen::Vector3d::Zero();  // demand BEFORE the tilt subtraction
     double aero_rls_forget_ = 0.0;          // 0 disables solution B
     double aero_a_ = 0.0, aero_g_ = 0.0;    // f_aero ~ a + g*lean
     double aero_P_[4] = {10.0, 0.0, 0.0, 10.0};
