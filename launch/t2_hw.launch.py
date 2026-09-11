@@ -60,6 +60,8 @@ def generate_launch_description():
     hw_uav = os.path.join(share, 'config', 'exp', 't2_hw_param.yaml')
     hw_topics = os.path.join(share, 'config', 'exp', 'exp_params.yaml')
     gains = os.path.join(share, 'config', 'controller', 'initial_gains_t2.yaml')
+    # Hardware-only overlay, loaded AFTER `gains` so it wins. See the file.
+    hw_gains = os.path.join(share, 'config', 'exp', 't2_hw_gains.yaml')
 
     camera_launch = os.path.join(
         get_package_share_directory('apriltag_ros'), 'launch', 'camera_36h11.launch.yml')
@@ -135,7 +137,7 @@ def generate_launch_description():
             package='px4_offboard_lowlevel',
             executable='offboard_controller_node',
             name='offboard_controller',
-            parameters=[hw_uav, hw_topics, gains, {'controller_type': ctrl}],
+            parameters=[hw_uav, hw_topics, gains, hw_gains, {'controller_type': ctrl}],
             condition=run_smc,
             output='screen',
         ),

@@ -174,18 +174,11 @@
         # must be flown tail-on before it is believed.
         STA_K1_R_x: 0.25
         STA_K1_R_y: 0.25
-        # YAW HALVED FOR HARDWARE BRING-UP (0.075/0.015 are the SITL values).
-        # Not general caution: on this tricopter yaw is DIFFERENTIAL TILT, and
-        # Gazebo models the tilt servo as a P-controlled joint with no dynamics
-        # at all -- no lag, no backlash, no current limit. Roll and pitch act
-        # through the rotors, whose lag IS modelled and has been validated at
-        # PLANT=centre (36 ms, inside the real 25-56 ms), so they are unchanged.
-        # The yaw path is the one thing SITL cannot speak to, on an axis with
-        # ~4 deg of authority, on the aircraft that span up on log_20.
-        STA_K1_R_z: 0.0375
+        # HARDWARE halves these two; see config/exp/t2_hw_gains.yaml.
+        STA_K1_R_z: 0.075
         STA_K2_R_x: 0.05
         STA_K2_R_y: 0.05
-        STA_K2_R_z: 0.0075
+        STA_K2_R_z: 0.015
         # ---- Geometric PID alternative for the ROTATIONAL loop ----------------
         # false = BIT-EXACT the super-twisting law, so this A/Bs against one binary.
         # The attitude loop is NOT the limiting factor (thrust-direction error
