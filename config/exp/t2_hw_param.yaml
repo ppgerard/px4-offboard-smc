@@ -183,12 +183,36 @@
       # ~6% here (0.344 -> 0.365) and costs 5x the detector CPU. The lever, if
       # more footprint is ever wanted, is the WIDE module: 0.695 * h, i.e. 2x.
       #
-      # REPLACE WITH THE BENCH MEASUREMENT when it exists: camera at a known
-      # height pointing down, slide the tag along the image's SHORT axis until
-      # detection stops, slope = offset / height. That includes distortion and the
-      # detector's own edge behaviour, and trusts no calibration -- which matters
-      # here, because cx sits 169 px off centre on a 1920-wide image and that is
-      # either an off-centre crop or an under-constrained calibration.
+      # A BENCH MEASUREMENT WAS TAKEN (11 Sep) AND IS NOT USED. Height 29.5 units,
+      # detection lost at 13.5 off-axis on the short axis and 16.5 on the long one,
+      # i.e. slopes 0.458 and 0.559. Rejected because it is internally impossible
+      # and externally contradicted:
+      #
+      #  - INTERNALLY: the two axes give a ratio of 1.22. A 1920x1200 frame forces
+      #    1.60, and no tag-size correction can reconcile them -- solving for the
+      #    tag half-extent that would make both fit returns a NEGATIVE number. One
+      #    camera cannot have two focal lengths (1311 px from the short axis,
+      #    1716 px from the long one, against 1698.8 calibrated).
+      #  - EXTERNALLY, twice, from the 10 Sep flight bags:
+      #      * tag-derived depth (size*fx/edge_px) against the RANGEFINDER, which
+      #        knows nothing about the camera: 95 paired samples over 2.5-4.8 m
+      #        give a median ratio of 1.032, i.e. fx = 1646 against 1699 -- 3%.
+      #      * the outermost successfully-detected tag CORNER over those flights
+      #        reached 0.326 on the short axis and never once crossed the 0.344
+      #        the calibration predicts. The bench number puts the edge 33% past a
+      #        boundary that real detections respected.
+      #
+      # The likely bench error is camera tilt (a tilted camera makes the footprint
+      # a trapezoid and the floor distance is no longer the perpendicular one) or
+      # measuring at 0.75 m, where the tag's own 0.467 m black extent dominates the
+      # geometry. If it is ever repeated: do it at FLIGHT height, level the
+      # airframe, plumb-line the nadir, measure to the TAG CENTRE, and use
+      # slope = (offset + 0.2335) / height -- 0.2335 m being half the BLACK extent,
+      # not half the 0.35 m "size", which is only the inner white square.
+      #
+      # 0.344 also errs in the SAFE direction: too small makes the ladder climb
+      # sooner, which is the designed response and genuinely gains footprint. Too
+      # large is what stopped it climbing at all and cost the 10 Sep landings.
       camera_footprint_slope: 0.344
 
       # Shared with tag_ev_bridge_node so the estimator's input and the guidance
