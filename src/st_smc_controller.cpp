@@ -169,9 +169,13 @@ void StSmcController::calculateControllerOutput(
     // Reading it after would ask the tilt to serve the same force twice; see
     // desiredForceBody().
     i_a_d_full_ = I_a_d;
-    // Hand the attitude only what the TILT did not already deliver. Zero unless
-    // the QP allocator is on, so this is bit-exact the previous law by default.
-    if (served_body_x_ != 0.0) {
+    // Hand the attitude only what the TILT is serving. Two forms, both inert by
+    // default: the closed-form split decides the share here and hands it to the
+    // allocator, while the older feedback form takes back what the allocator
+    // achieved last cycle. Never both.
+    if (tilt_split_max_rad_ > 0.0) {
+        I_a_d = splitTiltShare(I_a_d, r_yaw);
+    } else if (served_body_x_ != 0.0) {
         I_a_d -= R_B_W_ * Eigen::Vector3d(served_body_x_, 0.0, 0.0);
     }
 

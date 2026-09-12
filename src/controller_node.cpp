@@ -251,6 +251,8 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.qp_tilt_limit_deg", 6.5);
     this->declare_parameter("uav_parameters.qp_fx_weight", 1.0);
     this->declare_parameter("uav_parameters.qp_fz_weight", 5.0);
+    this->declare_parameter("uav_parameters.qp_tilt_split_deg", 0.0);
+    this->declare_parameter("uav_parameters.qp_tilt_yaw_reserve_deg", 2.0);
     qp_allocation_ = this->get_parameter("uav_parameters.qp_allocation").as_bool();
     qp_yaw_weight_ = this->get_parameter("uav_parameters.qp_yaw_weight").as_double();
     qp_tilt_rate_dps_ = this->get_parameter("uav_parameters.qp_tilt_rate_dps").as_double();
@@ -258,10 +260,15 @@ void ControllerNode::loadParams() {
     qp_tilt_limit_deg_ = this->get_parameter("uav_parameters.qp_tilt_limit_deg").as_double();
     qp_fx_weight_ = this->get_parameter("uav_parameters.qp_fx_weight").as_double();
     qp_fz_weight_ = this->get_parameter("uav_parameters.qp_fz_weight").as_double();
+    qp_tilt_split_deg_ = this->get_parameter("uav_parameters.qp_tilt_split_deg").as_double();
+    qp_tilt_yaw_reserve_deg_ = this->get_parameter("uav_parameters.qp_tilt_yaw_reserve_deg").as_double();
     RCLCPP_INFO(this->get_logger(), "Allocation: %s (yaw weight %.2f, tilt +-%.1f deg, rate %.0f deg/s, gyro %s)",
                 qp_allocation_ ? "CONSTRAINED QP" : "3x3 pseudo-inverse",
                 qp_yaw_weight_, qp_tilt_limit_deg_, qp_tilt_rate_dps_,
                 qp_rotor_spin_rate_ > 0.0 ? "ON" : "off");
+    RCLCPP_INFO(this->get_logger(), "  lean/tilt split: %s (+%.1f/%.1f deg, %.1f reserved for yaw)",
+                qp_tilt_split_deg_ > 0.0 ? "CLOSED FORM" : "one-cycle feedback",
+                qp_tilt_split_deg_, tilt_min_deg_, qp_tilt_yaw_reserve_deg_);
     tilt_1_servo_index_ = this->get_parameter("uav_parameters.tilt_1_servo_index").as_int();
     tilt_2_servo_index_ = this->get_parameter("uav_parameters.tilt_2_servo_index").as_int();
     // ActuatorServos carries 8 channels; an out-of-range index would read or
@@ -353,6 +360,15 @@ void ControllerNode::loadParams() {
     controller_->setExternalForceGain(f_ext_gain);
     const double tilt_max = this->get_parameter("control_gains.tilt_max_deg").as_double();
     controller_->setTiltMaxDeg(tilt_max);
+    // The closed-form lean/tilt split. Only meaningful with the QP allocator --
+    // the 3x3 path has no body-x row to serve the share with, so enabling it
+    // there would remove force from the attitude and give it to nothing.
+    controller_->setTiltSplitMaxDeg(qp_allocation_ ? qp_tilt_split_deg_ : 0.0);
+    // Backward authority is the SERVO's, not the sweep's: the nacelles run
+    // [-7, +90] deg, so a tailwind has an order of magnitude less tilt to work
+    // with than a headwind. tilt_min_deg is that number in every config.
+    controller_->setTiltSplitMinDeg(tilt_min_deg_);
+    controller_->setTiltSplitYawReserveDeg(qp_tilt_yaw_reserve_deg_);
     const double aero_rls = this->get_parameter("control_gains.aero_rls_forget").as_double();
     controller_->setAeroRlsForget(aero_rls);
     RCLCPP_INFO(this->get_logger(), "Solution B (online control effectiveness): %s",
@@ -719,8 +735,15 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
         // deliberate sweep from the authority the aircraft already flies, not a
         // side effect of picking the wrong constant.
         const double tilt_lim = qp_tilt_limit_deg_ * kDegToRad;
-        lim.tilt_min = -tilt_lim;
         lim.tilt_max =  tilt_lim;
+        // Under the closed-form split the backward bound is the SERVO's own
+        // (-7 deg), not a mirror of the forward sweep. Common-mode tilt is what
+        // makes body-x force and the travel is genuinely asymmetric, so a
+        // symmetric box would both forbid reachable forward tilt and promise
+        // unreachable backward tilt. The older feedback path keeps the symmetric
+        // box it was measured with.
+        lim.tilt_min = (qp_tilt_split_deg_ > 0.0) ? tilt_min_deg_ * kDegToRad
+                                                  : -tilt_lim;
         lim.dtilt_max = qp_tilt_rate_dps_ * kDegToRad * px4_offboard::kControlPeriodSeconds;
 
         px4_offboard::AllocWeights wt;
@@ -734,19 +757,36 @@ bool ControllerNode::computeRotorVelocities(const Eigen::VectorXd &wrench, Eigen
 
         // Desired wrench. F_x / F_z come from the control law's own force
         // command resolved into body axes.
-        const Eigen::Vector3d F_b = controller_ ? controller_->desiredForceBody()
-                                                : Eigen::Vector3d::Zero();
+        // Body-x demand. Two sources, and which one is live is decided by
+        // qp_tilt_split_deg:
+        //
+        //   CLOSED FORM  -- the control law already divided the demand and told
+        //     the attitude to serve only the remainder, IN THIS CYCLE. The
+        //     allocator is handed the law's own share, so both actuators work
+        //     from one decision and neither can claim the same newton.
+        //   FEEDBACK     -- the older form: the allocator is handed the
+        //     remainder left by what it achieved LAST cycle. Convergent only
+        //     for an F_x weight below 1, and measured bimodal at 1.0.
+        const double want_fx =
+            (qp_tilt_split_deg_ > 0.0 && controller_)
+                ? controller_->commandedBodyX()
+                : (controller_ ? controller_->desiredForceBody().x() : 0.0);
         Eigen::Matrix<double,5,1> want;
-        want << wrench(0), wrench(1), wrench(2), F_b.x(), wrench(3);
+        want << wrench(0), wrench(1), wrench(2), want_fx, wrench(3);
 
         const auto res = px4_offboard::allocate(g, lim, wt, qp_state_, want, 3,
                                                 px4_offboard::kControlPeriodSeconds);
         qp_state_ = res.x;
         tilt_1_rad_ = res.x.t0;  tilt_1_prev_ = res.x.t0;
         tilt_2_rad_ = res.x.t1;
-        // Tell the law what body-x actually arrived, so next cycle's attitude
-        // asks only for the remainder. ACHIEVED, not demanded.
-        if (controller_) { controller_->setServedBodyX(res.achieved(3)); }
+        // Close the older feedback form: tell the law what body-x actually
+        // arrived, so next cycle's attitude asks only for the remainder.
+        // ACHIEVED, not demanded. Under the closed-form split there is nothing
+        // to feed back -- the share was decided from the demand -- and writing
+        // this would re-open exactly the loop the split removes.
+        if (controller_ && qp_tilt_split_deg_ <= 0.0) {
+            controller_->setServedBodyX(res.achieved(3));
+        }
         // Per-actuator saturation: a saturated TILT is the yaw axis and says
         // nothing about the translational wrench, which one shared flag could
         // not express.

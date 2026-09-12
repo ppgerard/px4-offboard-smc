@@ -208,6 +208,87 @@ public:
     // is on, so the laws are bit-exact by default.
     void setServedBodyX(double f) { served_body_x_ = f; }
     double servedBodyX() const { return served_body_x_; }
+
+    // ---- The CLOSED-FORM lean/tilt split (supersedes the feedback form above) ----
+    //
+    // Enable with a positive tilt authority in degrees; 0.0 leaves both laws
+    // bit-exact. When on, setServedBodyX is not used at all.
+    void setTiltSplitMaxDeg(double deg) { tilt_split_max_rad_ = deg * M_PI / 180.0; }
+    // The BACKWARD bound, which is a different number from the forward one. The
+    // nacelles tilt from hover toward forward flight, so the servo range is
+    // [-7, +90] deg: a headwind is served on the generous side and a tailwind on
+    // the 7 deg side. Promising the allocator a share it cannot reach would put
+    // the deficit back on the attitude a cycle late, which is the loop this
+    // whole construction exists to avoid. Defaults to symmetric.
+    void setTiltSplitMinDeg(double deg) { tilt_split_min_rad_ = deg * M_PI / 180.0; }
+    // Angle RESERVED for yaw, and it is not optional. Yaw on this airframe IS
+    // differential tilt, so the two nacelles are never at the same angle: when
+    // one is on its stop the other is short by the full differential, and the
+    // COMMON-MODE angle -- the only part that makes body-x force -- is the mean
+    // of the two, not the stop.
+    //
+    // Measured offline against the allocator at a 15 deg stop: the rotor-drag
+    // term alone holds 2.37 / -2.39 deg at hover (km 0.018), so the pair sits at
+    // 15.00 / 12.50 and the mean is 13.75. A split sized on 15 deg promised
+    // 4.21 N and the allocator delivered 4.09 -- and the 0.12 N difference goes
+    // nowhere, because the attitude was already told to serve the remainder.
+    // Sizing the share on what the PAIR can hold is what keeps the split honest.
+    void setTiltSplitYawReserveDeg(double deg) {
+        tilt_split_yaw_reserve_rad_ = std::fabs(deg) * M_PI / 180.0;
+    }
+    // The body-x force the split ASSIGNED to the tilt this cycle. The allocator
+    // is handed this as its F_x demand, so both actuators are working from one
+    // decision made in one cycle.
+    double commandedBodyX() const { return commanded_body_x_; }
+
+    // Divide the horizontal force demand between LEAN and TILT, in closed form.
+    //
+    // In the heading-aligned frame the demand is (fx, fy, fz), and only ONE of
+    // those three is contestable. Both nacelles rotate about body y, so the tilt
+    // makes body-x force and nothing else: fy has to come from roll and fz from
+    // thrust whatever happens. fx is therefore the entire free choice, and the
+    // split is one scalar.
+    //
+    //     X     = clamp(fx, +-X_max),   X_max = (2/3) fz sin(t_max)
+    //     attitude gets  (fx - X, fy, fz)
+    //
+    // Serving fx with tilt FIRST is the minimum-lean solution: the same force at
+    // less angle of attack. X_max carries the 2/3 because only the two front
+    // rotors tilt, which is the same factor test/qp_allocator_test.cpp asserts
+    // against the allocator's own wrench.
+    //
+    // Nothing here reads back what the allocator did. The earlier form fed the
+    // achieved value forward one cycle (see desiredForceBody), which made the
+    // split a discrete loop with eigenvalue -alpha in the F_x weight: marginal
+    // at alpha ~ 1, and the measured result was bimodal -- 5.5/6.5/6.7 cm when
+    // it did not trip, 147-165 cm when it did. A rule computed from the demand
+    // has no eigenvalue to place.
+    //
+    // The small-angle step is self-consistent where it matters: body x equals
+    // heading x exactly when the tilt covers all of fx, because the residual
+    // pitch is then zero. The approximation is tightest in the regime it is for.
+    Eigen::Vector3d splitTiltShare(const Eigen::Vector3d& I_a_d, double yaw) {
+        commanded_body_x_ = 0.0;
+        if (tilt_split_max_rad_ <= 0.0) { return I_a_d; }
+        const double c = std::cos(yaw), sn = std::sin(yaw);
+        const double fx =  c * I_a_d.x() + sn * I_a_d.y();
+        const double fy = -sn * I_a_d.x() + c * I_a_d.y();
+        const double fz =  I_a_d.z();
+        // A non-positive vertical demand is a descent the tilt cannot help with,
+        // and it would invert the sign of X_max. Leave the demand alone.
+        if (fz <= 0.0) { return I_a_d; }
+        // Both bounds shrink toward zero by the yaw reserve, never past it.
+        const double t_fwd = std::max(0.0, tilt_split_max_rad_ - tilt_split_yaw_reserve_rad_);
+        const double t_bwd = (tilt_split_min_rad_ < 0.0)
+                                 ? std::min(0.0, tilt_split_min_rad_ + tilt_split_yaw_reserve_rad_)
+                                 : -t_fwd;
+        const double x_max = (2.0 / 3.0) * fz * std::sin(t_fwd);
+        const double x_min = (2.0 / 3.0) * fz * std::sin(t_bwd);
+        const double X = std::max(x_min, std::min(fx, x_max));
+        commanded_body_x_ = X;
+        const double rx = fx - X;
+        return Eigen::Vector3d(c * rx - sn * fy, sn * rx + c * fy, fz);
+    }
     // Desired force in BODY axes, for the allocator's F_x / F_z rows.
     // Body-frame force demand handed to the allocator: the REMAINDER after the
     // tilt's last contribution, not the full demand.
@@ -534,6 +615,10 @@ protected:
     double fext_max_fraction_xy_ = 0.0;   // 0 = use fext_max_fraction_
     double tilt_max_rad_ = 0.0;           // commanded lean limit; 0 = unlimited
     double served_body_x_ = 0.0;          // body-x force the allocator delivered
+    double tilt_split_max_rad_ = 0.0;     // >0 enables the closed-form lean/tilt split
+    double tilt_split_min_rad_ = 0.0;     // backward bound; 0 = symmetric
+    double tilt_split_yaw_reserve_rad_ = 0.0;  // angle kept for differential (yaw)
+    double commanded_body_x_ = 0.0;       // body-x the split ASSIGNED to the tilt
     Eigen::Vector3d i_a_d_full_ = Eigen::Vector3d::Zero();  // demand BEFORE the tilt subtraction
     double aero_rls_forget_ = 0.0;          // 0 disables solution B
     double aero_a_ = 0.0, aero_g_ = 0.0;    // f_aero ~ a + g*lean

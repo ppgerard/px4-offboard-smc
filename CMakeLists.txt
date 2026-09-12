@@ -175,7 +175,8 @@ if(BUILD_TESTING)
   # defects like the badly-conditioned allocator solve or the wrong common-mode
   # force expectation were found before a flight rather than after one.
   foreach(_t sta_reaching_law_test reference_model_test reference_rate_filter_test
-             external_force_observer_test relative_state_filter_test qp_allocator_test)
+             external_force_observer_test relative_state_filter_test qp_allocator_test
+             tilt_split_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/${_t}.cpp")
       add_executable(${_t} test/${_t}.cpp)
       target_include_directories(${_t} PRIVATE ${EIGEN3_INCLUDE_DIRS})

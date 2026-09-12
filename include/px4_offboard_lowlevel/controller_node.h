@@ -143,6 +143,8 @@ private:
     double qp_tilt_limit_deg_ = 6.5;
     double qp_fx_weight_ = 1.0;
     double qp_fz_weight_ = 5.0;   // SYMMETRIC control bound, not the servo range
+    double qp_tilt_split_deg_ = 0.0;  // >0: closed-form lean/tilt split, no feedback
+    double qp_tilt_yaw_reserve_deg_ = 2.0;  // tilt kept back for differential (yaw)
     px4_offboard::AllocState qp_state_;
     int tilt_2_servo_index_ = 5;
     // Sign of the differential-tilt -> yaw-torque relationship. +1 is the
