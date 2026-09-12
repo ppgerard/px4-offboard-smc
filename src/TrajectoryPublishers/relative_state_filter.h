@@ -301,8 +301,25 @@ inline TagLossTier tagLossTier(const TagLossInputs &in, const TagLossThresholds 
     }
   }
 
-  if (tier == TagLossTier::kReacquire &&
-      (in.age >= t.abort_seconds || in.attempts_used > t.max_attempts)) {
+  // Out of climbs is not out of options. This used to read
+  //   kReacquire && (age >= abort_seconds || attempts_used > max_attempts)
+  // which made the ABORT reachable from GEOMETRY alone: an aircraft whose reach
+  // exceeded the footprint escalated Hold -> Reacquire, and an exhausted attempt
+  // budget then turned that into an abort in the same cycle, with the tag as
+  // little as 0.3 s stale. All four hardware landings of 12 Sep ended exactly
+  // that way -- ages 0.3 / 1.0 / 0.3 / 0.3 s against a 5.0 s threshold, so the
+  // clock never came into it -- and one of them was 0.43 m up and 0.07 m off
+  // centre at the time, i.e. thirteen centimetres from committing.
+  //
+  // ABORT is now a decision about TIME only: the tag has genuinely been gone for
+  // abort_seconds. Geometry and the attempt budget still do their jobs -- they
+  // stop the descent and they stop the climbing -- but neither hands the aircraft
+  // to a failsafe on its own. An exhausted budget parks the ladder at Hold, which
+  // keeps this node flying while the tag is still arriving.
+  if (tier == TagLossTier::kReacquire && in.attempts_used > t.max_attempts) {
+    tier = TagLossTier::kHold;
+  }
+  if (tier >= TagLossTier::kHold && in.age >= t.abort_seconds) {
     tier = TagLossTier::kAbort;
   }
 

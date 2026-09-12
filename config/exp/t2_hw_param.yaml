@@ -215,6 +215,55 @@
       # large is what stopped it climbing at all and cost the 10 Sep landings.
       camera_footprint_slope: 0.344
 
+      # ---- Commit altitude -------------------------------------------------
+      # 0.30 m is SITL's, where the lidar reports min_distance 0.1 m and goes
+      # blind at ~0.245 m of body height. The T2's rangefinder DECLARES
+      # min_distance 0.40 m (read straight off /fmu/out/distance_sensor), so at
+      # 0.30 m the commit decision was being taken inside the blind zone on a
+      # dead-reckoned altitude -- exactly what the constant exists to prevent.
+      #
+      # 0.55 m clears the declared minimum with margin. It is also the tag-loss
+      # ladder's no-escalation floor, so it is what keeps the failsafe off a
+      # nearly-landed aircraft: on 12 Sep the ladder aborted at 0.43 m with
+      # 0.07 m of XY error, which the 0.30 m floor was 13 cm too low to stop.
+      #
+      # Note the beam keeps reporting sensible values well below its declared
+      # minimum (0.30, 0.22, 0.14, 0.03 m were all logged on the way down, with
+      # signal_quality flipping -1 -> 0 at 0.40 m). If that is real rather than
+      # an artefact, lowering min_distance in the driver would buy back the
+      # terminal descent -- measure it against a tape before believing it.
+      commit_altitude: 0.55
+
+      filter:
+        # ---- Why R is wider here than in SITL ------------------------------
+        # These three terms are per-FRAME errors -- one attitude error, one
+        # mounting error, one unknown delay -- turned into pixels by the focal
+        # length. Hardware's fx is 1699 against SITL's 539, so the SAME physical
+        # error costs 3.2x the pixels here, and on top of that the camera on
+        # this airframe has never been calibrated: camera_offset_body is (0,0,0)
+        # and camera_rotation_{z,x}_deg are the ideal 90/180.
+        #
+        # Measured over the four flights of 12 Sep, off /landing/filter_residual:
+        #   reprojection residual  43-78 px p50   against R's predicted 29-46 px
+        # i.e. R was about 2x overconfident, and the chi-squared gate therefore
+        # threw away 72-83% of perfectly good detections. That starved the EKF,
+        # which then held a stale position and JUMPED up to 0.44 m when a
+        # measurement finally squeaked through, and the jumps drove the tag-loss
+        # ladder through its whole budget in ~12 s of flight.
+        #
+        # Widening R by 3x in sigma takes the modelled reject fraction from
+        # 72-83% to 4-13% (computed from the recorded NIS of all four flights).
+        # That is what these values do: attitude 0.57 deg -> 2.0 deg, extrinsic
+        # 2 cm -> 10 cm, latency 30 ms -> 50 ms.
+        #
+        # HOW TO RETUNE: watch /landing/filter_residual. x is the measured RMS,
+        # y is what R predicts. Aim for x/y near 1 and a reject fraction
+        # (/landing/filter_nis z) under ~0.2. Wider is the safe direction while
+        # the camera is uncalibrated; narrower only once it is.
+        attitude_sigma: 0.035     # [rad] ~2 deg: EKF2 attitude PLUS the uncalibrated mounting
+        extrinsic_sigma: 0.10     # [m]   camera_offset_body is (0,0,0) and unmeasured
+        latency_sigma: 0.05       # [s]   measured stamp->arrival 0.22-0.25 s, spread ~40 ms
+
       # Shared with tag_ev_bridge_node so the estimator's input and the guidance
       # that consumes its output cannot disagree about the camera.
       #

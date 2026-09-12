@@ -241,7 +241,22 @@ public:
     // note in relative_state_filter.h for the flight result that decided that.
     this->declare_parameter("landing_parameters.filter.velocity_bias_noise_density", 0.0);
     this->declare_parameter("landing_parameters.filter.platform_yaw_noise_density", 0.01);
+    this->declare_parameter("landing_parameters.commit_altitude", commit_altitude_);
     this->declare_parameter("landing_parameters.filter.gate_probability", 0.999);
+    // The three CORRELATED terms in R, exposed because they are the ones that do
+    // not transfer between rigs. R's pixel term is per-corner and honest at 1 px
+    // on both cameras; these three are per-FRAME errors converted to pixels by
+    // the focal length, and hardware's fx is 1699 against SITL's 539 -- so the
+    // same physical mounting or attitude error costs 3.2x the pixels here.
+    //
+    // Measured on the 12 Sep flights: reprojection residual 43-78 px p50 against
+    // the 29-46 px R predicted, i.e. R is ~2x overconfident, and the chi-squared
+    // gate therefore rejected 72-83% of perfectly usable detections. Widening R
+    // by 3x in sigma takes that to 4-13%. The defaults below are SITL's and are
+    // unchanged; the hardware values live in config/exp/t2_hw_param.yaml.
+    this->declare_parameter("landing_parameters.filter.attitude_sigma", 0.010);
+    this->declare_parameter("landing_parameters.filter.extrinsic_sigma", 0.02);
+    this->declare_parameter("landing_parameters.filter.latency_sigma", 0.03);
     // The camera mounting error, estimated per axis. Only the boresight (z) is
     // observable on a landing -- the rangefinder pins altitude, so a boresight
     // error shows up as the marker being the wrong SIZE for the measured height,
@@ -294,6 +309,7 @@ public:
     // altitude rather than to a number that happens to match it today.
     tag_loss_thresholds_.cone_slope = cone_slope_;
     tag_loss_thresholds_.cone_radius_min = cone_radius_min_;
+    commit_altitude_ = this->get_parameter("landing_parameters.commit_altitude").as_double();
     tag_loss_thresholds_.no_escalation_below = commit_altitude_;
     tag_loss_thresholds_.footprint_slope =
         this->get_parameter("landing_parameters.camera_footprint_slope").as_double();
@@ -517,7 +533,19 @@ protected:
   // old 0.20 m the commit decision was taken on a coasted altitude; at 0.30 m it
   // is taken on a live measurement. The terminal descent below it is unchanged
   // and needs no altitude: frozen XY, fixed rate, contact-based exit.
-  const double commit_altitude_ = 0.30;      // commit below this altitude (~0.20 m clearance) [m]
+  //
+  // A PARAMETER since 12 Sep, because the blind zone is a property of the sensor
+  // fitted and the two rigs do not share one. SITL's lidar reports a 0.1 m
+  // minimum and sits 0.145 m under base_link, so it goes blind at ~0.245 m and
+  // 0.30 m clears it. The T2's rangefinder DECLARES min_distance 0.40 m -- above
+  // the commit altitude -- so on hardware the 0.30 m default had the commit
+  // decision taken inside the blind zone, on a dead-reckoned altitude, which is
+  // precisely what this constant exists to prevent. Set it per rig, above the
+  // sensor's own minimum plus its lever arm.
+  //
+  // It is also the tag-loss ladder's no-escalation floor (see the constructor),
+  // so raising it protects the terminal phase from the failsafe as well.
+  double commit_altitude_ = 0.30;            // commit below this altitude [m] (parameter)
   const double commit_xy_error_max_ = 0.10;  // XY alignment required to commit [m]
   const double commit_tag_max_age_ = 0.5;    // tag measurement must be fresher than this [s]
   const double commit_wait_timeout_ = 5.0;   // commit regardless after waiting this long [s]
@@ -580,6 +608,11 @@ protected:
   TagHealth tag_health_ = TagHealth::kCoast;
   TagHealth tag_health_reported_ = TagHealth::kCoast;
   int reacquire_attempts_ = 0;
+  // Wall-clock instant the tier last settled at Coast with a fresh accepted
+  // measurement; negative means "not currently settled". See updateTagHealth().
+  double coast_since_ = -1.0;
+  const double attempt_reset_seconds_ = 5.0;  // healthy tag for this long returns the budget [s]
+  bool offboard_was_active_ = false;          // edge detector for the budget reset
   bool aborted_ = false;
   double health_sigma_xy_ = 0.0;   // [m] what the ladder is reading
   double health_age_ = 0.0;        // [s] ... and the freshness beside it
@@ -915,6 +948,12 @@ protected:
         this->get_parameter("landing_parameters.filter.platform_yaw_noise_density").as_double();
     config.gate_probability =
         this->get_parameter("landing_parameters.filter.gate_probability").as_double();
+    config.attitude_sigma =
+        this->get_parameter("landing_parameters.filter.attitude_sigma").as_double();
+    config.extrinsic_sigma =
+        this->get_parameter("landing_parameters.filter.extrinsic_sigma").as_double();
+    config.latency_sigma =
+        this->get_parameter("landing_parameters.filter.latency_sigma").as_double();
     const double camera_bias_xy =
         this->get_parameter("landing_parameters.filter.camera_bias_sigma_xy").as_double();
     const double camera_bias_z =
@@ -1858,14 +1897,58 @@ protected:
     if (health != tag_health_) {
       // An attempt is a climb STARTED, counted on the way in, so a landing that
       // loses the tag repeatedly runs out of attempts rather than climbing for
-      // ever. It is deliberately not reset on reacquisition: §07 caps the
-      // attempts per landing, not per outage.
-      if (health == TagHealth::kReacquire) {
+      // ever. §07 caps the attempts per LANDING -- and ONLY WHILE THIS NODE IS
+      // FLYING is there a landing to cap.
+      //
+      // Measured on hardware, 12 Sep, all four flights: every one of the four
+      // attempts was spent in POSCTL, before offboard was ever engaged, while
+      // the pilot flew the aircraft 2-7 m from the pad. The tag really was
+      // outside the camera footprint there -- the ladder's geometry was right --
+      // but a climb it cannot command, on an approach that has not started, is
+      // not an attempt at anything. The pilot then handed over a landing whose
+      // budget was already at 4 of 3, so the first geometry excursion in Phase 2
+      // aborted it. Bag 2 was 0.43 m up and 0.07 m off centre when that fired.
+      //
+      // Counting only while offboard is what makes "per landing" mean the
+      // landing; the reset on offboard entry below is the other half.
+      if (health == TagHealth::kReacquire && offboard_active_) {
         ++reacquire_attempts_;
       }
       tag_health_ = health;
     }
+
+    // A landing attempt begins when the pilot hands over. Anything the ladder
+    // counted while PX4 was flying belonged to PX4's flight, not to this one.
+    if (offboard_active_ && !offboard_was_active_ && reacquire_attempts_ > 0) {
+      RCLCPP_INFO(this->get_logger(),
+                  "Offboard engaged: resetting the reacquire budget (%d of %d were spent while "
+                  "PX4 was flying).", reacquire_attempts_, tag_loss_thresholds_.max_attempts);
+      reacquire_attempts_ = 0;
+    }
+    offboard_was_active_ = offboard_active_;
+
+    // Sustained health returns the budget. "Sustained" is deliberately much
+    // longer than the ladder's own thresholds so that thrashing cannot earn a
+    // reset: the tier has to sit at Coast, with measurements actually being
+    // accepted, for attempt_reset_seconds continuously.
+    if (tag_health_ == TagHealth::kCoast && health_age_ < tag_loss_thresholds_.coast_min_seconds) {
+      if (coast_since_ < 0.0) {
+        coast_since_ = nodeTimeSeconds();
+      } else if (reacquire_attempts_ > 0 &&
+                 nodeTimeSeconds() - coast_since_ >= attempt_reset_seconds_) {
+        RCLCPP_INFO(this->get_logger(),
+                    "Tag healthy for %.0f s; returning the reacquire budget (was %d of %d used).",
+                    attempt_reset_seconds_, reacquire_attempts_,
+                    tag_loss_thresholds_.max_attempts);
+        reacquire_attempts_ = 0;
+        coast_since_ = nodeTimeSeconds();
+      }
+    } else {
+      coast_since_ = -1.0;
+    }
   }
+
+  double nodeTimeSeconds() { return this->get_clock()->now().seconds(); }
 
   // Descent rate the alignment currently earns: full rate on the axis of the
   // cone, nothing at its edge, nothing at all on a stale estimate. The cone
