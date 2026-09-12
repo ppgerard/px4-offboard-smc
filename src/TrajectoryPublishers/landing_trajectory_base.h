@@ -612,7 +612,6 @@ protected:
   // measurement; negative means "not currently settled". See updateTagHealth().
   double coast_since_ = -1.0;
   const double attempt_reset_seconds_ = 5.0;  // healthy tag for this long returns the budget [s]
-  bool offboard_was_active_ = false;          // edge detector for the budget reset
   bool aborted_ = false;
   double health_sigma_xy_ = 0.0;   // [m] what the ladder is reading
   double health_age_ = 0.0;        // [s] ... and the freshness beside it
@@ -1295,7 +1294,16 @@ protected:
     // ABORT: hand the aircraft back to PX4. Only ever reached from Phase 2, which
     // is the only phase that descends on the tag -- see abortIfTagLost() for why
     // the other three are deliberately out of scope.
-    if (aborted_ || (phase_ == Phase::PHASE_2 && abortIfTagLost())) {
+    // The abort means "hand the aircraft to PX4", which is meaningless when PX4
+    // already has it. Phase 2 is no longer left behind on a mode switch -- the
+    // phase persists until the pilot engages offboard again and restartLanding()
+    // resets it -- so without this guard a pilot who dropped to Position mid
+    // descent and flew away would trip a 5 s tag loss and latch an ABORT during
+    // their own manual flight. It would self-heal on the next engagement, but it
+    // would put an abort in the log of a flight the node was not flying, which is
+    // the same false signal the latch itself exists to prevent.
+    if (aborted_ ||
+        (phase_ == Phase::PHASE_2 && offboard_active_ && abortIfTagLost())) {
       // Diagnostics keep flowing; setpoints do not. PX4 drops out of offboard
       // ~500 ms after the stream stops (COM_OF_LOSS_T) and runs its own failsafe,
       // and controller_node.cpp's nav_state gate stops actuating for the same
@@ -1917,15 +1925,6 @@ protected:
       tag_health_ = health;
     }
 
-    // A landing attempt begins when the pilot hands over. Anything the ladder
-    // counted while PX4 was flying belonged to PX4's flight, not to this one.
-    if (offboard_active_ && !offboard_was_active_ && reacquire_attempts_ > 0) {
-      RCLCPP_INFO(this->get_logger(),
-                  "Offboard engaged: resetting the reacquire budget (%d of %d were spent while "
-                  "PX4 was flying).", reacquire_attempts_, tag_loss_thresholds_.max_attempts);
-      reacquire_attempts_ = 0;
-    }
-    offboard_was_active_ = offboard_active_;
 
     // Sustained health returns the budget. "Sustained" is deliberately much
     // longer than the ladder's own thresholds so that thrashing cannot earn a
@@ -1949,6 +1948,55 @@ protected:
   }
 
   double nodeTimeSeconds() { return this->get_clock()->now().seconds(); }
+
+  // Every offboard engagement starts a fresh landing attempt. This is what makes
+  // the obvious hardware workflow work -- take off in Position, fly over the pad,
+  // switch to Offboard, and if the approach goes badly switch back to Position,
+  // reposition, and switch in again -- which the node did NOT support before.
+  //
+  // Three things stopped it, all seen in the 12 Sep flights:
+  //
+  //   1. aborted_ latched for the life of the node. Bag 1 aborted at 156 s and
+  //      the pilot then engaged offboard four more times (194 / 231 / 255 /
+  //      274 s) with no effect at all: /command/trajectory stopped dead at the
+  //      abort and never resumed. The controller went on holding the LAST
+  //      setpoint it had received, frozen at z = 1.95 m, so the aircraft did fly
+  //      back to a stale hover point each time -- which looks like a restart and
+  //      is not one.
+  //   2. phase_ never returned to Phase 1. /landing/phase reads P1 then P2 and
+  //      nothing else for the rest of both flights that reached it, across every
+  //      mode switch.
+  //   3. Phase 2 integrates its reference OPEN LOOP and does so unconditionally,
+  //      so while PX4 flew the aircraft the reference kept walking. Item 2b
+  //      guarded ENTRY into Phase 2 against exactly this and left the exit open;
+  //      the -7.6 m runaway it was written for is reachable through the door it
+  //      did not close. These flights never hit it only because the abort always
+  //      fired first.
+  //
+  // Phase 1 is the safe place to land back in: it re-anchors its reference to the
+  // vehicle every cycle, and its gate (settled, tag fresh, airborne, offboard)
+  // has to be satisfied again before anything descends.
+  void restartLanding() {
+    const bool had_run = aborted_ || phase_ != Phase::PHASE_1 || reacquire_attempts_ > 0;
+    if (!had_run) {
+      return;
+    }
+    RCLCPP_WARN(this->get_logger(),
+                "Offboard engaged: restarting the landing from Phase 1 (was phase %d%s, %d "
+                "reacquire attempt(s) spent). The descent gate must be satisfied again.",
+                static_cast<int>(phase_) + 1, aborted_ ? ", ABORTED" : "", reacquire_attempts_);
+    aborted_ = false;
+    phase_ = Phase::PHASE_1;
+    phase2_transition_flag_ = false;
+    commit_wait_flag_ = false;
+    reacquire_attempts_ = 0;
+    coast_since_ = -1.0;
+    // Phase 1 re-anchors r_position_W_ every cycle, but do not leave a stale one
+    // visible for even a cycle: the touchdown check reads the reference gap.
+    r_position_W_ = drone_position_W_;
+    r_velocity_W_.setZero();
+    r_acceleration_W_.setZero();
+  }
 
   // Descent rate the alignment currently earns: full rate on the axis of the
   // cone, nothing at its edge, nothing at all on a stale estimate. The cone
@@ -2629,7 +2677,15 @@ protected:
   void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
     vehicle_status_received_ = true;
     vehicle_armed_ = (msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
+    const bool was_offboard = offboard_active_;
     offboard_active_ = (msg->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+    // On the rising edge, HERE rather than in the timer: a Phase 2 reference that
+    // has been integrating open-loop while PX4 flew is stale by however long the
+    // pilot was away, and the control loop must not be handed even one cycle of
+    // it. Same executor as the timer, so this cannot race with it.
+    if (offboard_active_ && !was_offboard) {
+      restartLanding();
+    }
   }
 
   void odometryCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr odom_msg) {

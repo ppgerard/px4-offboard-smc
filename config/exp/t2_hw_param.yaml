@@ -253,15 +253,22 @@
         #
         # Widening R by 3x in sigma takes the modelled reject fraction from
         # 72-83% to 4-13% (computed from the recorded NIS of all four flights).
-        # That is what these values do: attitude 0.57 deg -> 2.0 deg, extrinsic
-        # 2 cm -> 10 cm, latency 30 ms -> 50 ms.
+        #
+        # The 3x is MEASURED, not assumed: R's predicted residual is a matrix sum
+        # in which the 1 px corner term survives untouched, so the inflation is
+        # not the ratio of any single sigma. Driving the real filter offline at
+        # the T2's own intrinsics gives 3.01x at 3 m on the 0.35 m tag and 3.00x
+        # at 0.60 m on the 0.091 m one -- flat across the descent, which is what
+        # says the attitude and extrinsic terms have been raised in the right
+        # proportion to each other. An earlier pair (0.035 / 0.10) measured 2.48x
+        # and left 12-22% still being rejected.
         #
         # HOW TO RETUNE: watch /landing/filter_residual. x is the measured RMS,
         # y is what R predicts. Aim for x/y near 1 and a reject fraction
         # (/landing/filter_nis z) under ~0.2. Wider is the safe direction while
         # the camera is uncalibrated; narrower only once it is.
-        attitude_sigma: 0.035     # [rad] ~2 deg: EKF2 attitude PLUS the uncalibrated mounting
-        extrinsic_sigma: 0.10     # [m]   camera_offset_body is (0,0,0) and unmeasured
+        attitude_sigma: 0.045     # [rad] ~2.6 deg: EKF2 attitude PLUS the uncalibrated mounting
+        extrinsic_sigma: 0.13     # [m]   camera_offset_body is (0,0,0) and unmeasured
         latency_sigma: 0.05       # [s]   measured stamp->arrival 0.22-0.25 s, spread ~40 ms
 
       # Shared with tag_ev_bridge_node so the estimator's input and the guidance
