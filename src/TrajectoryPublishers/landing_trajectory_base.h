@@ -50,6 +50,7 @@
 #include <eigen3/Eigen/Eigen>
 #include <tf2/LinearMath/Quaternion.h>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_land_detected.hpp>
@@ -209,6 +210,12 @@ public:
     phase2_max_acceleration_xy_ = this->get_parameter("landing_parameters.phase2_max_acceleration_xy").as_double();
     this->declare_parameter("landing_parameters.phase2_max_acceleration_z", 0.3);
     phase2_max_acceleration_z_ = this->get_parameter("landing_parameters.phase2_max_acceleration_z").as_double();
+    this->declare_parameter("landing_parameters.commit_max_acceleration_z", 0.0);
+    this->declare_parameter("landing_parameters.commit_lookahead_max", 0.0);
+    this->declare_parameter("landing_parameters.commit_lookahead_floor", 0.0);
+    commit_max_acceleration_z_ = this->get_parameter("landing_parameters.commit_max_acceleration_z").as_double();
+    commit_lookahead_max_ = this->get_parameter("landing_parameters.commit_lookahead_max").as_double();
+    commit_lookahead_floor_ = this->get_parameter("landing_parameters.commit_lookahead_floor").as_double();
     this->declare_parameter("landing_parameters.descent_alignment_filter_hz", 0.0);
     descent_alignment_filter_hz_ = this->get_parameter("landing_parameters.descent_alignment_filter_hz").as_double();
     RCLCPP_INFO(this->get_logger(),
@@ -305,6 +312,18 @@ public:
     // Subscriber to groundtruth for diagnostics
     groundtruth_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>
         ("/fmu/out/vehicle_local_position_groundtruth_v1", qos, std::bind(&LandingTrajectoryNodeBase::groundtruthCallback, this, std::placeholders::_1));
+    // The controller's own external-force estimate, so the descent can predict
+    // how far the wind will carry it while it cannot see. Best-effort: if the
+    // topic never arrives, f_ext_xy_ stays 0 and the lookahead gate is inert,
+    // which is the same as not enabling it.
+    f_ext_sub_ = this->create_subscription<geometry_msgs::msg::WrenchStamped>(
+        "/landing/f_ext", 10,
+        [this](const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
+          f_ext_vec_.x() = msg->wrench.force.x;
+          f_ext_vec_.y() = msg->wrench.force.y;
+          f_ext_xy_ = f_ext_vec_.norm();
+          f_ext_received_ = true;
+        });
     // Touchdown detection and disarm confirmation for the terminal descent
     land_detected_sub_ = this->create_subscription<px4_msgs::msg::VehicleLandDetected>
         ("/fmu/out/vehicle_land_detected", qos, std::bind(&LandingTrajectoryNodeBase::landDetectedCallback, this, std::placeholders::_1));
@@ -463,6 +482,16 @@ protected:
   // all achieved the same 0.26-0.31 m/s. Since the blind descent is where the
   // lateral miss is made (|v_xy| grows 0.03 -> 0.55 m/s over that 1.45 s) and
   // drift goes as t^2, the exposure time is the lever and THIS is what sets it.
+  double commit_max_acceleration_z_ = 0.0;   // [m/s2] 0 = use the Phase 2 cap
+  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr f_ext_sub_;
+  Eigen::Vector2d f_ext_vec_ = Eigen::Vector2d::Zero();  // world horizontal wind force [N]
+  double f_ext_xy_ = 0.0;                    // |horizontal wind force| [N]
+  bool f_ext_received_ = false;
+  static constexpr double kLandedBodyHeight = 0.105;  // body origin at rest [m]
+  double commit_lookahead_max_ = 0.0;        // [m] 0 = gate disabled
+  double commit_lookahead_floor_ = 0.0;      // [m] altitude below which to stop waiting
+  bool lookahead_holding_ = false;           // the gate is refusing to commit
+  double uav_mass_for_lookahead_ = 2.4864;   // [kg]
   double phase2_max_acceleration_z_ = 0.3;   // [m/s²] (parameter)
   // Low-pass on the cone alignment that throttles the descent; 0 = instantaneous
   // = bit-exact the previous law. See coneDescentLimit().
@@ -1418,6 +1447,7 @@ protected:
     // dead-reckoning. Phase 2 holds at the commit altitude until they are met.
     if (landingEstimate()(2) >= commit_altitude_) {
       commit_wait_flag_ = false;
+      lookahead_holding_ = false;
       return;
     }
 
@@ -1448,10 +1478,93 @@ protected:
         settled = false;
       }
     }
+    // ---- LOOKAHEAD: will this descent actually arrive? ---------------------
+    //
+    // Every other guard here asks whether the aircraft is well placed NOW. This
+    // one asks what the wind will do to it while it cannot correct, and refuses
+    // to start a descent whose predicted outcome is already a failure:
+    //
+    //     t_blind   = (altitude - landed_height) / commit_descent_rate
+    //     drift     = 0.5 * (|f_ext_xy| / m) * t_blind^2
+    //     miss_pred = xy_error + drift
+    //
+    // Measured over the 7.5 m/s block on 11 Sep, this is the thing that
+    // separates the outcomes: runs that kept the tag below 0.18 m of altitude
+    // succeeded 19 of 30, runs that lost it above 0.18 m succeeded 2 of 15. The
+    // difference is not authority, it is arriving blind and far out.
+    //
+    // TWO behaviours fall out of the one rule, and neither is coded for:
+    //
+    //  * it WAITS OUT A GUST. |f_ext_xy| is the wind the observer is measuring
+    //    right now, so a gust raises the predicted drift and the aircraft holds
+    //    instead of committing into it. The commit then lands in the lull.
+    //  * it commits LOWER when the air is rough, because t_blind shrinks with
+    //    altitude -- and lower is exactly where the tag is still usable, the
+    //    0.091 m marker being decodable to 0.173 m of body height.
+    //
+    // The floor stops it waiting for an improvement that cannot come: below it
+    // the remaining descent is too short for the prediction to matter, and
+    // holding there only spends tag life. 0 disables the whole gate.
+    bool lookahead_ok = true;
+    double miss_pred = 0.0;
+    lookahead_holding_ = false;
+    if (commit_lookahead_max_ > 0.0 && f_ext_received_) {
+      const double alt = landingEstimate()(2);
+      if (alt > commit_lookahead_floor_) {
+        // t_blind must come from the descent the aircraft will ACTUALLY fly,
+        // not from the rate it is commanded. commit_descent_rate is INERT under
+        // the acceleration cap -- from 0.279 m at 0.3 m/s2 the descent peaks at
+        // 0.41 m/s and never reaches the 0.6 it is asked for -- so using the
+        // commanded rate makes this prediction 4x optimistic and lets through
+        // exactly the commits that then fail.
+        //
+        // Measured 11 Sep at 135 deg: both STSMC arms commit well aligned
+        // (0.01-0.09 m, against PX4's 0.02-0.08) and still miss by 0.6-1.7 m,
+        // because the real descent takes ~1.36 s rather than 0.33 s. The
+        // ramp-limited profile below is the same arithmetic the descent itself
+        // runs, so the gate and the descent can no longer disagree.
+        const double dh = std::max(0.0, alt - kLandedBodyHeight);
+        const double a_cap = std::max(0.05, (commit_max_acceleration_z_ > 0.0)
+                                                ? commit_max_acceleration_z_
+                                                : phase2_max_acceleration_z_);
+        const double v_pk = std::min(std::max(0.05, commit_descent_rate_),
+                                     std::sqrt(2.0 * a_cap * dh));
+        const double t_ramp = v_pk / a_cap;
+        const double d_ramp = 0.5 * a_cap * t_ramp * t_ramp;
+        const double t_blind = t_ramp + std::max(0.0, dh - d_ramp) / std::max(0.05, v_pk);
+        // The drift is a VECTOR along the wind, and so is the position error, so
+        // the prediction is a vector sum -- NOT |e| + |drift|, which is the
+        // worst case and is wrong wherever the two are not parallel.
+        //
+        // This is what makes the gate reward being UPWIND. An aircraft 0.15 m
+        // upwind of the pad in a 9.5 N wind has a predicted miss of 0.05 m,
+        // because the drift carries it ONTO the tag; the scalar form scores the
+        // same aircraft at 0.35 m and refuses a commit that would have worked.
+        //
+        // The same expression names the optimal aim point, which is not the pad
+        // centre: it is one drift vector UPWIND of it.
+        const Eigen::Vector2d drift_vec =
+            0.5 * (f_ext_vec_ / std::max(0.1, uav_mass_for_lookahead_)) * t_blind * t_blind;
+        // landingEstimate() is the vehicle relative to the pad, so the predicted
+        // landing point is that plus the drift, and its norm is the miss.
+        const Eigen::Vector2d e_xy = landingEstimate().head<2>();
+        miss_pred = (e_xy + drift_vec).norm();
+        const double drift = drift_vec.norm();
+        lookahead_ok = miss_pred < commit_lookahead_max_;
+        lookahead_holding_ = !lookahead_ok;
+        if (!lookahead_ok) {
+          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+              "Commit held: predicted miss %.3f m (XY %.3f + drift %.3f from %.1f N "
+              "over %.2f s) exceeds %.2f m",
+              miss_pred, xy_error, drift, f_ext_xy_, t_blind, commit_lookahead_max_);
+        }
+      }
+    }
+
     const bool waited_long_enough =
         (this->now() - commit_wait_start_time_).seconds() >= commit_wait_timeout_;
 
-    if (!(aligned && tag_fresh && slow_enough && settled)) {
+    if (!(aligned && tag_fresh && slow_enough && settled && lookahead_ok)) {
       if (!waited_long_enough) {
         return;  // hold at the commit altitude and keep trying to centre
       }
@@ -1828,8 +1941,26 @@ protected:
 
     // Stop descending at the commit altitude: below it the terminal descent
     // takes over, and it only starts once the aircraft is centred.
-    if (landingEstimate()(2) < commit_altitude_) {
+    //
+    // EXCEPT while the LOOKAHEAD gate is holding. That gate refuses to commit
+    // because the predicted blind drift is too large, and the dominant term in
+    // that prediction is t_blind = (altitude - 0.105)/rate -- so descending is
+    // itself the cure. Parking at the commit altitude instead makes the
+    // prediction permanently bad and spends the tag's remaining life for
+    // nothing.
+    //
+    // This descent is still fully sighted: the 0.091 m marker reads down to
+    // 0.173 m of body height, measured at a 0.180 m median tonight, so the
+    // floor keeps the aircraft inside the range where it can still correct.
+    // It is capped at half the cone rate because the point is to buy prediction
+    // margin slowly while continuing to centre, not to race the wind down.
+    const double alt_now = landingEstimate()(2);
+    const bool creeping = commit_lookahead_max_ > 0.0 && lookahead_holding_ &&
+                          alt_now > std::max(commit_lookahead_floor_, 0.12);
+    if (alt_now < commit_altitude_ && !creeping) {
       desired_velocity(2) = std::max(desired_velocity(2), 0.0);
+    } else if (alt_now < commit_altitude_) {
+      desired_velocity(2) = std::max(desired_velocity(2), -0.5 * coneDescentLimit());
     }
 
     // Reacquire: climb to widen the footprint. coneDescentLimit() has already
@@ -1948,7 +2079,25 @@ protected:
     // The commit timeout deliberately does NOT brake this: see
     // checkPhase3To4Transition(), where it ends the phase instead.
     const double target_velocity_z = -commit_descent_rate_;
-    const double max_velocity_step = phase2_max_acceleration_z_ * dt_;
+    // COMMIT-SPECIFIC ramp cap, falling back to the Phase 2 one when unset so
+    // this is bit-exact by default.
+    //
+    // These two wants are OPPOSITE and sharing one parameter conflated them.
+    // In Phase 2 a faster descent also means less time to CORRECT, which is why
+    // phase2_max_velocity_z 1.0 landed metres out at 7.5 m/s while 0.6 shipped.
+    // Phase 3 is 0.28 m of frozen-reference descent that corrects almost
+    // nothing, so there less exposure is unambiguously better -- and at the
+    // shipped 0.3 m/s2 the commit descent never reaches the 0.6 m/s it is
+    // commanded (it peaks at 0.41), which makes commit_descent_rate inert.
+    //
+    // Measured 11 Sep: raising the SHARED parameter cut terminal drift from a
+    // 50.6 cm median to 15.0 cm, and separately made the QP arm worse -- because
+    // it was also making Phase 2 more aggressive. Splitting them is what lets
+    // the two changes compose.
+    const double commit_accel_z = (commit_max_acceleration_z_ > 0.0)
+                                      ? commit_max_acceleration_z_
+                                      : phase2_max_acceleration_z_;
+    const double max_velocity_step = commit_accel_z * dt_;
     const double velocity_step = std::clamp(target_velocity_z - r_velocity_W_(2),
                                             -max_velocity_step, max_velocity_step);
     r_velocity_W_(2) += velocity_step;

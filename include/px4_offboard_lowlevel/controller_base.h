@@ -98,6 +98,11 @@ public:
         omega_ref_filtered_.setZero();
         omega_ref_last_.setZero();
         i_a_d_last_.setZero();
+        i_a_d_full_.setZero();
+        served_body_x_ = 0.0;
+        commanded_body_x_ = 0.0;
+        commanded_body_x_prev_ = 0.0;
+        last_tau_z_ = 0.0;
     }
 
     // Whether the previous commanded wrench reached the actuators intact. False
@@ -274,21 +279,87 @@ public:
         const double fx =  c * I_a_d.x() + sn * I_a_d.y();
         const double fy = -sn * I_a_d.x() + c * I_a_d.y();
         const double fz =  I_a_d.z();
-        // A non-positive vertical demand is a descent the tilt cannot help with,
-        // and it would invert the sign of X_max. Leave the demand alone.
         if (fz <= 0.0) { return I_a_d; }
-        // Both bounds shrink toward zero by the yaw reserve, never past it.
-        const double t_fwd = std::max(0.0, tilt_split_max_rad_ - tilt_split_yaw_reserve_rad_);
+
+        // ---- The share is the SOLUTION of a 1-D constrained problem ----------
+        //
+        //     min (fx - X)^2   s.t.  X in [x_min, x_max]  and  |X - X_prev| <= dX
+        //
+        // which is exactly a clamp, so it costs nothing to evaluate -- but the
+        // constraint set is now the aircraft's ACTUAL feasible set rather than a
+        // fixed angle, and that is the whole difference from the earlier rule.
+        //
+        // The earlier version maxed the tilt against a CONSTANT 2 deg yaw
+        // reserve. Measured: at the full share (3.66 N, 13.01 deg common) only
+        // 1.99 deg of differential remained before the 15 deg stop, against the
+        // 2.4 deg that yaw needs at hover -- so the allocator had to give yaw up,
+        // and its yaw weight says to give yaw up first. That is the mechanism
+        // this project has already watched spin an aircraft on hardware.
+
+        // 1. YAW FIRST, and by how much it ACTUALLY needs. Yaw on this airframe
+        //    IS differential tilt, so every degree of common-mode tilt spent on
+        //    force is a degree the yaw axis cannot have. The demand is the
+        //    torque the law itself asked for last cycle, converted through the
+        //    differential's effectiveness -- an INPUT to allocation, never an
+        //    output, so nothing feeds back through the plant.
+        const double yaw_half =
+            (yaw_tilt_effectiveness_ > 1e-9)
+                ? std::min(std::fabs(last_tau_z_) / yaw_tilt_effectiveness_,
+                           tilt_split_max_rad_)
+                : tilt_split_yaw_reserve_rad_;
+        // The fixed reserve becomes a FLOOR, not the whole story: it covers the
+        // first cycle and any gust the last torque did not yet reflect.
+        const double reserve = std::max(yaw_half, tilt_split_yaw_reserve_rad_);
+
+        // 2. What common-mode angle is then left, each way.
+        const double t_fwd = std::max(0.0, tilt_split_max_rad_ - reserve);
         const double t_bwd = (tilt_split_min_rad_ < 0.0)
-                                 ? std::min(0.0, tilt_split_min_rad_ + tilt_split_yaw_reserve_rad_)
+                                 ? std::min(0.0, tilt_split_min_rad_ + reserve)
                                  : -t_fwd;
-        const double x_max = (2.0 / 3.0) * fz * std::sin(t_fwd);
-        const double x_min = (2.0 / 3.0) * fz * std::sin(t_bwd);
+        double x_max = (2.0 / 3.0) * fz * std::sin(t_fwd);
+        double x_min = (2.0 / 3.0) * fz * std::sin(t_bwd);
+
+        // 3. RATE feasibility. The servo slews at a finite rate, so a share the
+        //    tilt cannot reach this cycle is a share the attitude should have
+        //    taken. Bounding it here makes the split a FREQUENCY split as well
+        //    as a magnitude one: the rate-limited tilt takes the slow part of
+        //    fx and the attitude picks up the fast remainder, which is the right
+        //    way round for their bandwidths. This is a slew limit on the law's
+        //    own output, NOT feedback from the allocator -- it cannot oscillate
+        //    the way the achieved-value form did.
+        if (tilt_split_rate_rad_per_s_ > 0.0 && dt_ > 0.0) {
+            const double dtilt = tilt_split_rate_rad_per_s_ * dt_;
+            const double t_prev = std::asin(std::max(-1.0, std::min(1.0,
+                                      1.5 * commanded_body_x_prev_ / fz)));
+            const double hi = (2.0 / 3.0) * fz * std::sin(std::min(t_fwd, t_prev + dtilt));
+            const double lo = (2.0 / 3.0) * fz * std::sin(std::max(t_bwd, t_prev - dtilt));
+            x_max = std::min(x_max, hi);
+            x_min = std::max(x_min, lo);
+        }
+        if (x_min > x_max) { x_min = x_max = 0.0; }
+
         const double X = std::max(x_min, std::min(fx, x_max));
         commanded_body_x_ = X;
+        commanded_body_x_prev_ = X;
         const double rx = fx - X;
         return Eigen::Vector3d(c * rx - sn * fy, sn * rx + c * fy, fz);
     }
+
+    // Torque per radian of DIFFERENTIAL tilt, so the split can price yaw in the
+    // same units as everything else. ~3.36 N.m/rad at hover on this airframe.
+    void setYawTiltEffectiveness(double n_per_rad) { yaw_tilt_effectiveness_ = n_per_rad; }
+    // Slew rate the tilt can actually deliver; 0 disables the rate constraint.
+    void setTiltSplitRateDps(double dps) { tilt_split_rate_rad_per_s_ = dps * M_PI / 180.0; }
+
+    // Fast-terminal sliding SURFACE, XY only. gamma or gain at 0 leaves the
+    // surface exactly linear, so this A/Bs against one binary like everything
+    // else here. gamma must stay in (0,1): at 1 it is just more Lambda, and at
+    // >=1 the finite-time property is gone.
+    void setStaTerminal(double gamma, double gain) {
+        sta_term_gamma_ = (gamma > 0.0 && gamma < 1.0) ? gamma : 0.0;
+        sta_term_gain_ = std::max(0.0, gain);
+    }
+
     // Desired force in BODY axes, for the allocator's F_x / F_z rows.
     // Body-frame force demand handed to the allocator: the REMAINDER after the
     // tilt's last contribution, not the full demand.
@@ -618,6 +689,12 @@ protected:
     double tilt_split_max_rad_ = 0.0;     // >0 enables the closed-form lean/tilt split
     double tilt_split_min_rad_ = 0.0;     // backward bound; 0 = symmetric
     double tilt_split_yaw_reserve_rad_ = 0.0;  // angle kept for differential (yaw)
+    double sta_term_gamma_ = 0.0;   // fast-terminal surface exponent; 0 = classical
+    double sta_term_gain_  = 0.0;   // fast-terminal surface gain
+    double yaw_tilt_effectiveness_ = 0.0;      // N.m per rad of differential tilt
+    double tilt_split_rate_rad_per_s_ = 0.0;   // servo slew available to the split
+    double commanded_body_x_prev_ = 0.0;       // for the rate constraint
+    double last_tau_z_ = 0.0;                  // the law's own yaw demand, last cycle
     double commanded_body_x_ = 0.0;       // body-x the split ASSIGNED to the tilt
     Eigen::Vector3d i_a_d_full_ = Eigen::Vector3d::Zero();  // demand BEFORE the tilt subtraction
     double aero_rls_forget_ = 0.0;          // 0 disables solution B

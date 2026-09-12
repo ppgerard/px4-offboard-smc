@@ -217,5 +217,9 @@ void SmcController::calculateControllerOutput(
 
 
     // Output the wrench
+    // The split prices yaw in torque, so it needs the demand the law just made.
+    // This is an INPUT to allocation, never an output, so reading it back next
+    // cycle closes no loop through the plant.
+    last_tau_z_ = tau(2);
     *controller_torque_thrust << tau, thrust;
 }

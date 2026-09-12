@@ -253,6 +253,8 @@ void ControllerNode::loadParams() {
     this->declare_parameter("uav_parameters.qp_fz_weight", 5.0);
     this->declare_parameter("uav_parameters.qp_tilt_split_deg", 0.0);
     this->declare_parameter("uav_parameters.qp_tilt_yaw_reserve_deg", 2.0);
+    this->declare_parameter("uav_parameters.qp_yaw_tilt_effectiveness", 3.36);
+    this->declare_parameter("uav_parameters.qp_tilt_split_rate_dps", 90.0);
     qp_allocation_ = this->get_parameter("uav_parameters.qp_allocation").as_bool();
     qp_yaw_weight_ = this->get_parameter("uav_parameters.qp_yaw_weight").as_double();
     qp_tilt_rate_dps_ = this->get_parameter("uav_parameters.qp_tilt_rate_dps").as_double();
@@ -262,6 +264,8 @@ void ControllerNode::loadParams() {
     qp_fz_weight_ = this->get_parameter("uav_parameters.qp_fz_weight").as_double();
     qp_tilt_split_deg_ = this->get_parameter("uav_parameters.qp_tilt_split_deg").as_double();
     qp_tilt_yaw_reserve_deg_ = this->get_parameter("uav_parameters.qp_tilt_yaw_reserve_deg").as_double();
+    qp_yaw_tilt_effectiveness_ = this->get_parameter("uav_parameters.qp_yaw_tilt_effectiveness").as_double();
+    qp_tilt_split_rate_dps_ = this->get_parameter("uav_parameters.qp_tilt_split_rate_dps").as_double();
     RCLCPP_INFO(this->get_logger(), "Allocation: %s (yaw weight %.2f, tilt +-%.1f deg, rate %.0f deg/s, gyro %s)",
                 qp_allocation_ ? "CONSTRAINED QP" : "3x3 pseudo-inverse",
                 qp_yaw_weight_, qp_tilt_limit_deg_, qp_tilt_rate_dps_,
@@ -369,6 +373,8 @@ void ControllerNode::loadParams() {
     // with than a headwind. tilt_min_deg is that number in every config.
     controller_->setTiltSplitMinDeg(tilt_min_deg_);
     controller_->setTiltSplitYawReserveDeg(qp_tilt_yaw_reserve_deg_);
+    controller_->setYawTiltEffectiveness(qp_allocation_ ? qp_yaw_tilt_effectiveness_ : 0.0);
+    controller_->setTiltSplitRateDps(qp_allocation_ ? qp_tilt_split_rate_dps_ : 0.0);
     const double aero_rls = this->get_parameter("control_gains.aero_rls_forget").as_double();
     controller_->setAeroRlsForget(aero_rls);
     RCLCPP_INFO(this->get_logger(), "Solution B (online control effectiveness): %s",
@@ -448,6 +454,8 @@ void ControllerNode::loadParams() {
         this->declare_parameter("control_gains.STA_K4_y", 0.0);
         this->declare_parameter("control_gains.STA_K4_z", 0.0);
         this->declare_parameter("control_gains.STA_beta_x", 0.0);
+        this->declare_parameter("control_gains.STA_term_gamma", 0.0);
+        this->declare_parameter("control_gains.STA_term_gain", 0.0);
         this->declare_parameter("control_gains.STA_beta_y", 0.0);
         this->declare_parameter("control_gains.STA_beta_z", 0.0);
         this->declare_parameter("control_gains.STA_Lambda_R_x", 0.0);
@@ -535,6 +543,18 @@ void ControllerNode::loadParams() {
                 this->get_parameter("control_gains.STA_beta_y").as_double(),
                 this->get_parameter("control_gains.STA_beta_z").as_double();
         stsmc_controller->setBeta(beta);
+        const double term_gamma = this->get_parameter("control_gains.STA_term_gamma").as_double();
+        const double term_gain  = this->get_parameter("control_gains.STA_term_gain").as_double();
+        stsmc_controller->setStaTerminal(term_gamma, term_gain);
+        RCLCPP_INFO(this->get_logger(), "Sliding SURFACE: %s",
+                    (term_gamma > 0.0 && term_gain > 0.0)
+                        ? "FAST TERMINAL (finite-time e_p)" : "linear (classical)");
+        if (term_gamma > 0.0 && term_gain > 0.0) {
+            RCLCPP_INFO(this->get_logger(),
+                        "  s = e_v + Lambda*e_p + %.4f*|e_p|^%.2f   (terms equal at e_p = %.3f m)",
+                        term_gain, term_gamma,
+                        std::pow(term_gain / 1.5, 1.0 / (1.0 - term_gamma)));
+        }
         RCLCPP_INFO(this->get_logger(), "Uniform STA |s|^3/2 beta: [%.2f %.2f %.2f]%s",
                     beta(0), beta(1), beta(2),
                     beta.norm() > 0.0 ? "" : "   (classical law)");

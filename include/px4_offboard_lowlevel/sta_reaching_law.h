@@ -265,6 +265,47 @@ inline double barrierGainUpdate(BarrierGain &g, double s_norm, double dt) {
     return std::clamp(1.0 + g.kappa * x / (1.0 - x), 1.0, g.l_max);
 }
 
+// ---- The sliding SURFACE ---------------------------------------------------
+//
+// Everything above acts on the REACHING law: how s is driven to zero. This acts
+// on what s = 0 DEMANDS, which nothing in this project had changed -- the
+// surface has been s = e_v + Lambda*e_p since the beginning.
+//
+//     s = e_v + Lambda*e_p + gain*|e_p|^gamma*sign(e_p),     0 < gamma < 1
+//
+// Fast terminal (Yu & Man). On the surface the closing velocity is
+// Lambda*e_p + gain*|e_p|^gamma, whose second term has unbounded slope at the
+// origin, so e_p reaches EXACTLY zero in finite time
+//
+//     T = ln[(Lambda*e_p0^(1-gamma) + gain)/gain] / (Lambda*(1-gamma))
+//
+// rather than decaying exponentially and never arriving. A blind descent of
+// fixed duration is precisely the case that wants this.
+//
+// The boost GROWS as the error shrinks -- the exact opposite of the classical
+// sqrt reaching law, whose restoring stiffness FALLS with displacement. So this
+// is the complement of the |s|^{3/2} beta term, which repairs the far field.
+//
+// gamma or gain at 0 returns s UNCHANGED, bit-for-bit.
+//
+// kStaTerminalFloor bounds the term's incremental gain at gain*floor^(gamma-1).
+// Classical terminal SMC is singular because the surface DERIVATIVE carries
+// |e_p|^(gamma-1); this law never differentiates the surface, so that cannot
+// reach the control, and the floor makes the expression well-behaved anyway.
+inline constexpr double kStaTerminalFloor = 1e-3;
+
+inline void addTerminalSurface(Eigen::Vector3d &s, const Eigen::Vector3d &e_p,
+                               double gamma, double gain, int axes = 2) {
+    if (!(gamma > 0.0) || !(gamma < 1.0) || !(gain > 0.0)) {
+        return;
+    }
+    for (int i = 0; i < axes && i < 3; ++i) {
+        const double e = e_p(i);
+        const double a = std::max(std::abs(e), kStaTerminalFloor);
+        s(i) += gain * std::pow(a, gamma) * (e < 0.0 ? -1.0 : 1.0);
+    }
+}
+
 }  // namespace px4_offboard
 
 #endif  // PX4_OFFBOARD_STA_REACHING_LAW_H

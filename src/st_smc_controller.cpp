@@ -83,8 +83,43 @@ void StSmcController::calculateControllerOutput(
             e_p_surface.head<2>() *= sta_ep_max_ / lateral;
         }
     }
-    const Eigen::Vector3d s =
-                e_v + Lambda.cwiseProduct(e_p_surface);
+    // ---- FAST TERMINAL sliding surface (Yu & Man), XY only -----------------
+    //
+    //     s = e_v + Lambda*e_p + Gamma*|e_p|^gamma*sign(e_p),   0 < gamma < 1
+    //
+    // This is a change to the SURFACE, which nothing in this project had ever
+    // touched -- every previous candidate (K1, Lambda, K3, K4, the adaptive
+    // gain, beta) acts on the REACHING law, i.e. on how s is driven to zero,
+    // not on what s = 0 asks for.
+    //
+    // The surface sets the closing velocity the law demands. Linear, that is
+    // Lambda*e_p, so e_p decays exponentially and NEVER reaches zero. The
+    // fractional term has unbounded slope at the origin, so on the surface e_p
+    // reaches EXACTLY zero in finite time:
+    //
+    //     T = ln[(Lambda*e_p0^(1-g) + Gamma)/Gamma] / (Lambda*(1-g))
+    //
+    // 1.40 s from 10 cm at the shipped values -- inside the 0.67-1.36 s the
+    // commit descent lasts, which is the whole point. A fixed-duration blind
+    // descent wants finite-time convergence, not an exponential tail.
+    //
+    // It is the COMPLEMENT of beta, not a competitor: beta repairs the reaching
+    // law's FAR field (stiffness falling with displacement, 3.83 -> 1.11 N/m),
+    // while this raises the demand as the error SHRINKS -- 1.5x at the 0.30 m
+    // gate, 2.0x at commit, 2.9x at touchdown.
+    //
+    // SINGULARITY: classical terminal SMC is singular because the surface
+    // derivative carries |e_p|^(gamma-1). This law never differentiates the
+    // surface -- s only drives the STA reaching term, and the -m*Lambda*e_v
+    // feedforward is a separate term left untouched -- so the singularity
+    // cannot reach the control. The floor below bounds the term anyway, at
+    // Gamma*eps^(gamma-1), so no operating point can produce a large gain from
+    // a small error.
+    //
+    // XY only: z has no wind term, and the rotational pair is where ct and tau
+    // act, where more gain is measured to make things WORSE.
+    Eigen::Vector3d s = e_v + Lambda.cwiseProduct(e_p_surface);
+    px4_offboard::addTerminalSurface(s, e_p_surface, sta_term_gamma_, sta_term_gain_);
 
     // Composite control (§05): the observer cancels the slow, large part of the
     // disturbance so the super-twisting law is left with only the fast residual.
@@ -308,5 +343,9 @@ void StSmcController::calculateControllerOutput(
     }
 
     // Output the wrench
+    // The split prices yaw in torque, so it needs the demand the law just made.
+    // This is an INPUT to allocation, never an output, so reading it back next
+    // cycle closes no loop through the plant.
+    last_tau_z_ = tau(2);
     *controller_torque_thrust << tau, thrust;
 }

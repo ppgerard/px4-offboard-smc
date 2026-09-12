@@ -84,6 +84,17 @@
       # allocator quietly delivered 0.12 N less -- which lands nowhere, because
       # the attitude had already been told to serve the remainder.
       qp_tilt_yaw_reserve_deg: 2.0
+      # Torque per radian of DIFFERENTIAL tilt, so the split can price yaw in the
+      # same units as force. ~3.36 N.m/rad at hover. With this set, the reserve
+      # above becomes a FLOOR and the real reserve tracks the yaw torque the law
+      # is actually asking for -- so the tilt gets its full range when yaw is
+      # quiet and yields when yaw is working, instead of a constant guess that
+      # measured 1.99 deg against a 2.4 deg hover demand.
+      qp_yaw_tilt_effectiveness: 3.36
+      # Slew the split may assume the tilt can deliver; 0 removes the rate
+      # constraint. Makes the split a FREQUENCY split too -- the rate-limited
+      # tilt takes the slow part of the demand, the attitude the fast remainder.
+      qp_tilt_split_rate_dps: 90.0
     landing_parameters:
       # ===== Reference generation (roadmap item 11) =====
       # Bandwidth [rad/s] of the third-order reference model. 0.0 keeps the old
@@ -188,6 +199,30 @@
       # 1.67 s and the phase only lasts ~1.45 s, so commit_descent_rate is inert
       # above ~0.45 m/s. This is what actually sets the blind-descent exposure.
       phase2_max_acceleration_z: 0.3
+      # COMMIT-ONLY vertical ramp cap; 0.0 = use phase2_max_acceleration_z, which
+      # is bit-exact the old behaviour. The two phases want OPPOSITE things --
+      # Phase 2 faster descent costs correction time, Phase 3 has almost no
+      # correction to lose -- and one shared parameter conflated them.
+      commit_max_acceleration_z: 0.0
+      # LOOKAHEAD COMMIT GATE [m]; 0.0 disables it. Refuses to start the terminal
+      # descent when the PREDICTED final miss already exceeds this:
+      #
+      #   t_blind   = (altitude - 0.105) / commit_descent_rate
+      #   miss_pred = xy_error + 0.5 * (|f_ext_xy| / mass) * t_blind^2
+      #
+      # Every other commit guard asks whether the aircraft is well placed NOW.
+      # This one asks what the wind will do while it cannot correct. Measured
+      # 11 Sep over the 7.5 m/s block: runs keeping the tag below 0.18 m of
+      # altitude succeeded 19/30, runs losing it above 0.18 m succeeded 2/15 --
+      # the split is arriving blind and far out, not authority.
+      #
+      # It waits out a gust without being told to (high f_ext -> high predicted
+      # drift -> hold), and it commits LOWER in rough air because t_blind shrinks
+      # with altitude -- which is where the 0.091 m marker is still readable.
+      commit_lookahead_max: 0.0
+      # Altitude below which to stop waiting: the remaining descent is then too
+      # short for the prediction to matter and holding only spends tag life.
+      commit_lookahead_floor: 0.0
       # Sustained-alignment filter on the descent throttle. An oscillating aircraft
       # crosses the cone axis every swing; instantaneously that unlocks the full
       # descent rate at the worst moment. 0.0 = instantaneous = previous law.
